@@ -419,6 +419,30 @@ def parse_numeric_input(value, default=0.0):
     return float(default)
 
 
+def display_value(value):
+    """
+    UI-safe display formatter.
+    Missing values should look blank in the analyst-facing reliability matrix,
+    not like Python/debug values such as None, nan, or NaN.
+    """
+    if value is None:
+        return ""
+
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned.lower() in ["none", "nan", "null", "n/a"]:
+            return ""
+        return cleaned
+
+    return value
+
+
 
 
 def add_approved_input(
@@ -585,12 +609,12 @@ def build_data_reliability_matrix():
                 "scorecard_key": key,
                 "status": status,
                 "status_icon": STATUS_OPTIONS.get(status, {}).get("icon", ""),
-                "current_value": value,
-                "source_method": source_method,
-                "source_document": source_document,
-                "confidence": confidence,
+                "current_value": display_value(value),
+                "source_method": display_value(source_method),
+                "source_document": display_value(source_document),
+                "confidence": display_value(confidence),
                 "required": field["required"],
-                "notes": notes,
+                "notes": display_value(notes),
             }
         )
 
@@ -610,11 +634,17 @@ def render_data_reliability_cards(matrix_df):
             with cols[idx % 2]:
                 icon = row["status_icon"]
                 status = row["status"]
-                value = row["current_value"]
-                source_method = row["source_method"] or "None"
+                value = display_value(row["current_value"])
+                source_method = display_value(row["source_method"])
                 confidence = row["confidence"]
 
-                confidence_text = "N/A" if confidence is None or pd.isna(confidence) else f"{float(confidence) * 100:.0f}%"
+                if confidence == "" or confidence is None:
+                    confidence_text = ""
+                else:
+                    try:
+                        confidence_text = f"{float(confidence) * 100:.0f}%"
+                    except Exception:
+                        confidence_text = ""
 
                 st.markdown(
                     f"""
@@ -1011,6 +1041,9 @@ with tab_deal:
 
 with tab_review:
     st.header("Reliability Review")
+    st.caption(
+        "Missing fields are intentionally left blank. Values only appear after they are auto-pulled, calculated, manually entered, or approved from AI candidates."
+    )
 
     matrix_df = build_data_reliability_matrix()
     render_data_reliability_cards(matrix_df)
@@ -1381,11 +1414,11 @@ with tab_sources:
                 "value": value,
                 "status": meta.get("status"),
                 "source_method": meta.get("source_method"),
-                "source_document": meta.get("source_document"),
-                "confidence": meta.get("confidence"),
-                "reviewed_by": meta.get("reviewed_by"),
-                "review_timestamp": meta.get("review_timestamp"),
-                "notes": meta.get("notes"),
+                "source_document": display_value(meta.get("source_document")),
+                "confidence": display_value(meta.get("confidence")),
+                "reviewed_by": display_value(meta.get("reviewed_by")),
+                "review_timestamp": display_value(meta.get("review_timestamp")),
+                "notes": display_value(meta.get("notes")),
             }
         )
     st.dataframe(pd.DataFrame(approved_rows), use_container_width=True)
