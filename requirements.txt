@@ -4,3 +4,5 @@ numpy
 openpyxl
 xlsxwriter
 plotly
+openai>=1.0.0
+requests
