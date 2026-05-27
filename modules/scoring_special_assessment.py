@@ -2,7 +2,7 @@
 """
 Special Assessment Debt Scorecard Engine
 
-Document-first platform version.
+Unified workflow version.
 
 This module handles:
 1. Special Assessment Debt scoring
@@ -131,15 +131,10 @@ def apply_rating_cap(rating: str, cap: Optional[str]) -> str:
 
 
 # =============================================================================
-# Analytical calculators
+# Analytical Calculators
 # =============================================================================
 
 def calculate_taxpayer_concentration(taxpayer_df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Expected columns:
-    - taxpayer_name
-    - levy_percent
-    """
     if taxpayer_df is None or taxpayer_df.empty:
         return {
             "largest_taxpayer_percent_of_total_levy": 0.0,
@@ -198,12 +193,6 @@ def calculate_mltm_from_cashflow(
     revenue_column: str = "special_tax_levy",
     debt_service_column: str = "annual_debt_service",
 ) -> Dict[str, Any]:
-    """
-    Simplified MLTM stress engine.
-
-    It estimates the maximum constant permanent revenue loss that still allows
-    aggregate revenues plus initial reserves to cover aggregate debt service.
-    """
     if cashflow_df is None or cashflow_df.empty:
         return {
             "maximum_loss_to_maturity_percent": 0.0,
@@ -547,10 +536,6 @@ def calculate_financial_profile_assessment(
         "financial_profile_assessment_category": assessment_to_category(numeric_assessment),
     }
 
-
-# =============================================================================
-# Overall Scorecard + Explanation
-# =============================================================================
 
 def calculate_factor_score_weighted_average(
     economic_fundamentals_assessment: float,
