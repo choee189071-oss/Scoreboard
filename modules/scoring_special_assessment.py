@@ -14,7 +14,7 @@ Important:
 This is a prototype analyst-support tool. It is not an official S&P model.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 import pandas as pd
 
 
@@ -146,11 +146,6 @@ def calculate_taxpayer_concentration(taxpayer_df: pd.DataFrame) -> Dict[str, Any
     Expected columns:
     - taxpayer_name
     - levy_percent
-
-    Returns:
-    - largest_taxpayer_percent_of_total_levy
-    - top10_taxpayers_percent_of_total_levy
-    - ranked taxpayer table
     """
     if taxpayer_df is None or taxpayer_df.empty:
         return {
@@ -191,14 +186,6 @@ def calculate_value_to_lien(
     overlapping_debt: Any = 0.0,
     include_overlapping_debt: bool = True,
 ) -> Dict[str, Any]:
-    """
-    VTL = Assessed Value / Debt.
-
-    If include_overlapping_debt is True:
-        debt base = direct debt + overlapping debt
-    Otherwise:
-        debt base = direct debt
-    """
     assessed_value = safe_float(assessed_value, default=0.0)
     direct_debt = safe_float(direct_debt, default=0.0)
     overlapping_debt = safe_float(overlapping_debt, default=0.0)
@@ -227,19 +214,7 @@ def calculate_mltm_from_cashflow(
     debt_service_column: str = "annual_debt_service",
 ) -> Dict[str, Any]:
     """
-    Estimate Maximum Loss-to-Maturity (MLTM) from a simple annual cashflow table.
-
-    Expected columns:
-    - year
-    - special_tax_levy
-    - annual_debt_service
-
-    Logic:
-    We find the maximum constant revenue loss percentage that can be applied
-    to each year's special tax levy while still keeping cumulative excess
-    nonnegative through maturity, after considering initial reserve funds.
-
-    This is a simplified stress engine for analyst support.
+    Simplified MLTM stress engine.
     """
     if cashflow_df is None or cashflow_df.empty:
         return {
@@ -265,7 +240,13 @@ def calculate_mltm_from_cashflow(
     if total_revenue <= 0:
         mltm = 0.0
     else:
-        mltm = max(0.0, min(100.0, ((total_revenue + initial_reserve - total_debt_service) / total_revenue) * 100))
+        mltm = max(
+            0.0,
+            min(
+                100.0,
+                ((total_revenue + initial_reserve - total_debt_service) / total_revenue) * 100,
+            ),
+        )
 
     stressed_revenue = df[revenue_column] * (1 - mltm / 100)
     df["stressed_special_tax_levy"] = stressed_revenue
@@ -334,23 +315,17 @@ def assess_msa_participation(msa_participation: Any) -> int:
 def assess_real_estate_market_volatility(real_estate_market_volatility: Any) -> int:
     status = normalize_text(real_estate_market_volatility)
     mapping = {
-        # Sample-style default: this label appears in the Strong column in the sample workbook.
         "low_volatility_stable_prices_low_distress": 2,
         "stable_moderate": 2,
         "stable": 2,
-
-        # Optional explicit Very Strong aliases.
         "very_strong_low_volatility_stable_prices_low_distress": 1,
         "very_strong_low_volatility": 1,
         "stable_low_volatility": 1,
-
         "elevated_volatility_stable_prices_affordability_worse_than_national_figures": 3,
         "elevated_volatility": 3,
         "average": 3,
-
         "falling_local_home_prices_high_price_volatility_low_affordability_rising_distress": 4,
         "falling_prices": 4,
-
         "falling_local_home_prices_high_price_volatility_significantly_worse_affordability_rising_distress": 5,
         "distressed": 5,
         "high_distress": 5,
@@ -432,19 +407,15 @@ def assess_conveyance_to_homeowners(conveyance_to_homeowners: Any) -> int:
         "all_or_nearly_all_conveyed": 1,
         "all_nearly_all_conveyed": 1,
         "built_out_all_end_users": 1,
-
         "most_conveyed": 2,
         "built_out_most_end_users": 2,
-
         "fairly_developed_with_significant_conveyance_some_developer_concentration": 3,
         "fairly_developed": 3,
         "mature_some_developer_concentration": 3,
         "some_developer_concentration": 3,
-
         "developed_significant_undeveloped_parcels_comprise_minority_large_developer_concentration": 4,
         "majority_developed_significant_undeveloped": 4,
         "large_developer_concentration": 4,
-
         "undeveloped_with_limited_vertical_construction_high_concentration": 5,
         "new_majority_undeveloped": 5,
         "undeveloped": 5,
