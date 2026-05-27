@@ -11,6 +11,7 @@ from modules.scoring_special_assessment import (
 from modules.auto_data_sources import (
     auto_pull_structured_data,
     auto_data_results_to_dataframe,
+    build_auto_data_debug_table,
 )
 
 from modules.document_ai_extraction import (
@@ -279,15 +280,25 @@ with tab_auto:
         auto_df = auto_data_results_to_dataframe(st.session_state["auto_data_results"])
         st.dataframe(auto_df, use_container_width=True)
 
+        debug_df = build_auto_data_debug_table(st.session_state["auto_data_results"])
+        if not debug_df.empty:
+            with st.expander("Census Debug / Fallback Attempts"):
+                st.dataframe(debug_df, use_container_width=True)
+
+        st.caption(
+            "Status guide: success = pulled correctly; setup_needed = API key/config needed; "
+            "manual_required = intentionally left for analyst upload/input; failed = connector needs debugging."
+        )
+
     st.markdown("### Connector Strategy")
     st.dataframe(
         pd.DataFrame(
             [
-                ["Census / ACS", "Income, population", "Auto connector"],
-                ["BLS / LAUS", "Local unemployment", "Next connector; currently placeholder"],
-                ["FRED", "Macro rates / national unemployment", "Optional API key"],
-                ["County Open Data", "Assessed value", "County-specific connector later"],
-                ["Housing Data", "Trend / distress proxy", "Source decision later"],
+                ["Census / ACS", "Income, population, EBI % of U.S.", "Live connector with fallback years"],
+                ["FRED", "UNRATE, DGS10, CPIAUCSL, FEDFUNDS", "Live connector if FRED_API_KEY exists"],
+                ["BLS / LAUS", "Local unemployment", "Manual required until LAUS series mapping is added"],
+                ["County Open Data", "Assessed value", "Manual upload or county-specific connector later"],
+                ["Housing Data", "Trend / distress proxy", "Manual review or selected source later"],
                 ["EMMA / OS", "Deal-specific PDF/tables", "Upload + document extraction"],
             ],
             columns=["Source", "Target Data", "Current Treatment"],
