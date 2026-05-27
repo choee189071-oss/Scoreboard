@@ -8,12 +8,11 @@ from modules.scoring_special_assessment import (
     calculate_mltm_from_cashflow,
 )
 
-st.set_page_config(page_title="Special Assessment Credit Workstation", layout="wide")
+st.set_page_config(page_title="Municipal Credit Analytics Platform", layout="wide")
 
-st.title("Special Assessment Debt Credit Workstation")
-
+st.title("Municipal Credit Analytics Platform")
 st.caption(
-    "Prototype analyst-support tool: scorecard, concentration builder, VTL calculator, MLTM workspace, and explanation engine."
+    "Scoreboards + analytical calculators + future AI-assisted data pull workflow."
 )
 
 # =============================================================================
@@ -25,6 +24,7 @@ defaults = {
     "largest_taxpayer_percent_of_total_levy": 6.1,
     "est_value_to_lien": 15.5,
     "maximum_loss_to_maturity_percent": 13.9,
+    "last_scorecard_results": None,
 }
 
 for key, value in defaults.items():
@@ -33,27 +33,68 @@ for key, value in defaults.items():
 
 
 # =============================================================================
-# Sidebar Navigation
+# Sidebar: Platform Structure
 # =============================================================================
 
-page = st.sidebar.radio(
-    "Workspace",
+st.sidebar.header("1. Scoreboard Type")
+
+scoreboard_type = st.sidebar.selectbox(
+    "Select Scoreboard",
     [
-        "Main Scorecard",
-        "Top 10 Concentration Builder",
+        "Special Assessment Debt",
+        "General Obligation / General Fund",
+        "Water / Wastewater",
+    ],
+)
+
+st.sidebar.header("2. Analysis Mode")
+
+analysis_mode = st.sidebar.radio(
+    "Select Mode",
+    [
+        "Manual Input",
+        "Upload File",
+        "AI-Assisted Data Pull",
+    ],
+)
+
+st.sidebar.header("3. Analytical Workspace")
+
+workspace = st.sidebar.selectbox(
+    "Select Workspace",
+    [
+        "Main Scoreboard",
+        "Taxpayer Concentration Builder",
         "Value-to-Lien Calculator",
-        "MLTM Workspace",
+        "MLTM Stress Test",
+        "Source / Evidence Manager",
         "Explanation View",
     ],
 )
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Not an official S&P model.")
+st.sidebar.caption("Prototype analyst-support platform. Not an official S&P model.")
 
 
 # =============================================================================
-# Shared Result Renderer
+# General Render Helpers
 # =============================================================================
+
+def read_uploaded_csv(file):
+    encodings = ["utf-8", "utf-8-sig", "latin1", "cp1252"]
+    separators = [",", "\t", ";", "|"]
+
+    last_error = None
+    for encoding in encodings:
+        for sep in separators:
+            try:
+                file.seek(0)
+                return pd.read_csv(file, encoding=encoding, sep=sep, engine="python")
+            except Exception as e:
+                last_error = e
+
+    raise last_error
+
 
 def render_scorecard_results(results: dict):
     st.subheader("Scorecard Summary")
@@ -70,17 +111,32 @@ def render_scorecard_results(results: dict):
 
     factor_df = pd.DataFrame(
         [
-            ["Economic Fundamentals Assessment", "15%", results.get("economic_fundamentals_assessment"), results.get("economic_fundamentals_assessment_category")],
-            ["District Characteristics Assessment", "35%", results.get("district_characteristics_assessment"), results.get("district_characteristics_assessment_category")],
-            ["Financial Profile Assessment", "50%", results.get("financial_profile_assessment"), results.get("financial_profile_assessment_category")],
+            [
+                "Economic Fundamentals Assessment",
+                "15%",
+                results.get("economic_fundamentals_assessment"),
+                results.get("economic_fundamentals_assessment_category"),
+            ],
+            [
+                "District Characteristics Assessment",
+                "35%",
+                results.get("district_characteristics_assessment"),
+                results.get("district_characteristics_assessment_category"),
+            ],
+            [
+                "Financial Profile Assessment",
+                "50%",
+                results.get("financial_profile_assessment"),
+                results.get("financial_profile_assessment_category"),
+            ],
         ],
         columns=["Key Credit Factor", "Weight", "Numeric Assessment", "Assessment Category"],
     )
 
     st.dataframe(factor_df, use_container_width=True)
 
-    with st.expander("Show Explanation"):
-        st.markdown(results.get("scorecard_explanation", ""))
+    st.markdown("### Explanation")
+    st.markdown(results.get("scorecard_explanation", ""))
 
     with st.expander("Raw Results JSON"):
         st.json(results)
@@ -93,11 +149,133 @@ def calculate_current_scorecard(inputs: dict):
 
 
 # =============================================================================
-# Page 1: Main Scorecard
+# Non-Special Assessment Placeholders
 # =============================================================================
 
-if page == "Main Scorecard":
-    st.header("Main Special Assessment Debt Scorecard")
+if scoreboard_type != "Special Assessment Debt":
+    st.header(scoreboard_type)
+    st.info(
+        "This scoreboard type is reserved for the next build. "
+        "The platform layout is ready; scoring logic can be added in separate modules."
+    )
+
+    st.markdown(
+        """
+### Future structure
+
+- **General Obligation / General Fund**
+  - economy
+  - budgetary performance
+  - liquidity
+  - debt and long-term liabilities
+  - institutional framework
+
+- **Water / Wastewater**
+  - enterprise risk profile
+  - financial risk profile
+  - debt service coverage
+  - liquidity
+  - rate-setting flexibility
+"""
+    )
+    st.stop()
+
+
+# =============================================================================
+# AI-Assisted Data Pull Placeholder
+# =============================================================================
+
+if analysis_mode == "AI-Assisted Data Pull":
+    st.header("AI-Assisted Data Pull")
+    st.warning(
+        "This mode is a structured placeholder. The UI is ready for future API integration, "
+        "but it is not yet connected to live data sources."
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        issuer_name = st.text_input("Issuer / District Name", value="Laguna Ridge CFD")
+        state = st.text_input("State", value="CA")
+        county = st.text_input("County / Region", value="Sacramento County")
+        bond_type = st.selectbox(
+            "Bond Type",
+            ["Special Assessment Debt", "CFD / Mello-Roos", "Special Tax Bonds"],
+        )
+
+    with col2:
+        os_link = st.text_input("Official Statement / EMMA Link")
+        data_targets = st.multiselect(
+            "Data to Search For",
+            [
+                "Median Household EBI",
+                "Unemployment Rate",
+                "MSA Participation",
+                "Real Estate Market Volatility",
+                "Population Growth",
+                "Top 10 Taxpayers",
+                "Assessed Value",
+                "Direct Debt",
+                "Overlapping Debt",
+                "MLTM Inputs",
+            ],
+            default=[
+                "Median Household EBI",
+                "Top 10 Taxpayers",
+                "Assessed Value",
+                "MLTM Inputs",
+            ],
+        )
+
+    st.markdown("### Intended AI/Data Workflow")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                ["Census / ACS", "Income, population", "Pending API integration"],
+                ["BLS / FRED", "Unemployment", "Pending API integration"],
+                ["EMMA / OS", "levy, taxpayer concentration, debt service", "Pending parser"],
+                ["County Assessor", "assessed value", "Pending web/API integration"],
+                ["Real Estate Sources", "housing market trend/distress", "Pending source manager"],
+            ],
+            columns=["Source Type", "Target Data", "Status"],
+        ),
+        use_container_width=True,
+    )
+
+    st.info(
+        "Next coding step: connect this page to OpenAI API + selected public data APIs, "
+        "then return source links, extracted values, confidence scores, and analyst review controls."
+    )
+    st.stop()
+
+
+# =============================================================================
+# Workspace: Main Scoreboard
+# =============================================================================
+
+if workspace == "Main Scoreboard":
+    st.header("Special Assessment Debt Scoreboard")
+
+    if analysis_mode == "Upload File":
+        st.subheader("Upload Scorecard Inputs")
+
+        uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
+
+        st.caption(
+            "CSV should include fields such as median_household_ebi_percent_of_us, "
+            "top10_taxpayers_percent_of_total_levy, est_value_to_lien, maximum_loss_to_maturity_percent, etc."
+        )
+
+        if uploaded_file is not None:
+            df = read_uploaded_csv(uploaded_file)
+            st.dataframe(df, use_container_width=True)
+
+            if not df.empty:
+                inputs = df.iloc[0].to_dict()
+                results = calculate_current_scorecard(inputs)
+                render_scorecard_results(results)
+
+        st.stop()
 
     st.subheader("A. Economic Fundamentals Assessment")
 
@@ -254,15 +432,15 @@ if page == "Main Scorecard":
 
 
 # =============================================================================
-# Page 2: Top 10 Concentration Builder
+# Workspace: Taxpayer Concentration Builder
 # =============================================================================
 
-elif page == "Top 10 Concentration Builder":
-    st.header("Top 10 Concentration Builder")
+elif workspace == "Taxpayer Concentration Builder":
+    st.header("Taxpayer Concentration Builder")
 
     st.write(
-        "Enter or upload taxpayer concentration data. The module calculates "
-        "Top 10 Taxpayers as % of Total Levy and Largest Taxpayer as % of Total Levy."
+        "This tool calculates **Top 10 Taxpayers as % of Total Levy** and "
+        "**Largest Taxpayer as % of Total Levy**, then saves the results to the Main Scorecard."
     )
 
     mode = st.radio("Input Mode", ["Manual Table", "Upload CSV"])
@@ -295,7 +473,7 @@ elif page == "Top 10 Concentration Builder":
     else:
         uploaded = st.file_uploader("Upload taxpayer CSV", type=["csv"])
         if uploaded is not None:
-            taxpayer_df = pd.read_csv(uploaded)
+            taxpayer_df = read_uploaded_csv(uploaded)
             st.dataframe(taxpayer_df, use_container_width=True)
         else:
             taxpayer_df = pd.DataFrame()
@@ -313,15 +491,20 @@ elif page == "Top 10 Concentration Builder":
         st.markdown("### Ranked Taxpayer Table")
         st.dataframe(concentration["taxpayer_table"], use_container_width=True)
 
-        st.success("Values saved into session state for the Main Scorecard.")
+        st.success("Values saved to the Main Scorecard session.")
 
 
 # =============================================================================
-# Page 3: Value-to-Lien Calculator
+# Workspace: Value-to-Lien Calculator
 # =============================================================================
 
-elif page == "Value-to-Lien Calculator":
+elif workspace == "Value-to-Lien Calculator":
     st.header("Value-to-Lien Calculator")
+
+    st.write(
+        "This tool calculates **Est. Value-to-Lien** from assessed value and debt base, "
+        "then saves the result to the Main Scorecard."
+    )
 
     col1, col2 = st.columns(2)
 
@@ -353,7 +536,7 @@ elif page == "Value-to-Lien Calculator":
             value=True,
         )
 
-    if st.button("Calculate VTL"):
+    if st.button("Calculate Value-to-Lien"):
         vtl_results = calculate_value_to_lien(
             assessed_value,
             direct_debt,
@@ -366,22 +549,21 @@ elif page == "Value-to-Lien Calculator":
         c1, c2, c3 = st.columns(3)
         c1.metric("Debt Base for VTL", f"{vtl_results['debt_base_for_vtl']:,.0f}")
         c2.metric("Est. Value-to-Lien", vtl_results["estimated_value_to_lien"])
-        c3.metric("Saved to Scorecard", "Yes")
+        c3.metric("Saved to Main Scorecard", "Yes")
 
         st.json(vtl_results)
 
 
 # =============================================================================
-# Page 4: MLTM Workspace
+# Workspace: MLTM Stress Test
 # =============================================================================
 
-elif page == "MLTM Workspace":
-    st.header("Maximum Loss-to-Maturity (MLTM) Workspace")
+elif workspace == "MLTM Stress Test":
+    st.header("Maximum Loss-to-Maturity (MLTM) Stress Test")
 
     st.write(
-        "This simplified module estimates the maximum permanent revenue loss "
-        "that can be applied to the projected levy while still covering debt service "
-        "through maturity, after considering an initial reserve fund."
+        "This simplified tool estimates the maximum permanent revenue loss that can be applied "
+        "to projected special tax levy while still covering debt service through maturity."
     )
 
     initial_reserve_fund = st.number_input(
@@ -391,25 +573,36 @@ elif page == "MLTM Workspace":
         step=100000.0,
     )
 
-    default_cashflow = pd.DataFrame(
-        {
-            "year": list(range(2027, 2037)),
-            "special_tax_levy": [
-                12191803, 12460759, 12710019, 12959939, 13219518,
-                13492483, 13758628, 14025653, 14138513, 14239823
-            ],
-            "annual_debt_service": [
-                11108912, 11327963, 11554563, 11781763, 12017744,
-                12265894, 12507844, 12750594, 12853194, 12945294
-            ],
-        }
-    )
+    mode = st.radio("Input Mode", ["Manual Table", "Upload CSV"])
 
-    cashflow_df = st.data_editor(
-        default_cashflow,
-        num_rows="dynamic",
-        use_container_width=True,
-    )
+    if mode == "Manual Table":
+        default_cashflow = pd.DataFrame(
+            {
+                "year": list(range(2027, 2037)),
+                "special_tax_levy": [
+                    12191803, 12460759, 12710019, 12959939, 13219518,
+                    13492483, 13758628, 14025653, 14138513, 14239823
+                ],
+                "annual_debt_service": [
+                    11108912, 11327963, 11554563, 11781763, 12017744,
+                    12265894, 12507844, 12750594, 12853194, 12945294
+                ],
+            }
+        )
+
+        cashflow_df = st.data_editor(
+            default_cashflow,
+            num_rows="dynamic",
+            use_container_width=True,
+        )
+
+    else:
+        uploaded = st.file_uploader("Upload MLTM cashflow CSV", type=["csv"])
+        if uploaded is not None:
+            cashflow_df = read_uploaded_csv(uploaded)
+            st.dataframe(cashflow_df, use_container_width=True)
+        else:
+            cashflow_df = pd.DataFrame()
 
     if st.button("Calculate MLTM"):
         mltm_results = calculate_mltm_from_cashflow(
@@ -427,17 +620,55 @@ elif page == "MLTM Workspace":
         st.markdown("### Stress Cashflow Table")
         st.dataframe(mltm_results["mltm_cashflow_table"], use_container_width=True)
 
-        st.success("MLTM value saved into session state for the Main Scorecard.")
+        st.success("MLTM value saved to the Main Scorecard session.")
 
 
 # =============================================================================
-# Page 5: Explanation View
+# Workspace: Source / Evidence Manager
 # =============================================================================
 
-elif page == "Explanation View":
+elif workspace == "Source / Evidence Manager":
+    st.header("Source / Evidence Manager")
+
+    st.write(
+        "This workspace is designed for tracking source evidence for each scorecard input. "
+        "It is ready for future AI/API extraction."
+    )
+
+    source_df = pd.DataFrame(
+        [
+            ["Median Household EBI", "Census / ACS", "", "Pending"],
+            ["Unemployment Rate", "BLS / FRED", "", "Pending"],
+            ["MSA Participation", "Census / OMB MSA data", "", "Pending"],
+            ["Real Estate Market Volatility", "Real estate market source", "", "Pending"],
+            ["Population Growth", "Census / ACS", "", "Pending"],
+            ["Top 10 Taxpayers", "Official Statement / Levy report", "", "Pending"],
+            ["Est. Value-to-Lien", "Assessed value + debt schedule", "", "Pending"],
+            ["MLTM Inputs", "Debt service + levy forecast", "", "Pending"],
+        ],
+        columns=["Scorecard Field", "Preferred Source Type", "Source Link / Note", "Status"],
+    )
+
+    edited_sources = st.data_editor(
+        source_df,
+        num_rows="dynamic",
+        use_container_width=True,
+    )
+
+    st.info(
+        "Future AI-assisted workflow: the system will populate extracted value, source URL, "
+        "confidence score, and analyst approval status here."
+    )
+
+
+# =============================================================================
+# Workspace: Explanation View
+# =============================================================================
+
+elif workspace == "Explanation View":
     st.header("Explanation View")
 
-    if "last_scorecard_results" not in st.session_state:
+    if not st.session_state.get("last_scorecard_results"):
         st.info("Run the Main Scorecard first to generate an explanation.")
     else:
         results = st.session_state["last_scorecard_results"]
