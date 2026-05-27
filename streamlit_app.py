@@ -405,6 +405,11 @@ with tab_docs:
     )
 
     def classify_uploaded_file(file_name: str) -> str:
+        """
+        Fast filename-based first pass.
+        EMMA files often have opaque names, so this is only a weak initial guess.
+        The stronger classifier below uses parsed document text.
+        """
         name = file_name.lower()
 
         if any(term in name for term in ["os", "official", "statement", "appendix", "appx", "offering"]):
@@ -424,15 +429,146 @@ with tab_docs:
 
         return "Unclassified Source Document"
 
+
+    def classify_document_from_text(file_name: str, parsed_text: str, tables=None) -> str:
+        """
+        Strong content-based document classifier.
+
+        Why this matters:
+        EMMA downloads often have filenames like ER514463-ER398524.pdf.
+        The platform should classify by document content, not just filename.
+        """
+        name_guess = classify_uploaded_file(file_name)
+        text = (parsed_text or "").lower()
+        tables = tables or []
+
+        # Restrict to first section for title-page signals, but also scan full text for core terms.
+        front_text = text[:8000]
+
+        official_statement_signals = [
+            "official statement",
+            "new issue",
+            "book entry only",
+            "special tax bonds",
+            "special tax refunding bonds",
+            "community facilities district",
+            "limited obligation bonds",
+            "bond counsel",
+            "underwriter",
+            "security for the bonds",
+            "the bonds are payable",
+        ]
+
+        appendix_signals = [
+            "appendix a",
+            "appendix b",
+            "assessed valuation",
+            "value-to-lien",
+            "value to lien",
+            "top ten taxpayers",
+            "top 10 taxpayers",
+            "debt service schedule",
+            "direct and overlapping debt",
+        ]
+
+        annual_report_signals = [
+            "annual report",
+            "fiscal year ended",
+            "continuing disclosure",
+            "annual continuing disclosure",
+        ]
+
+        mltm_signals = [
+            "maximum loss-to-maturity",
+            "maximum loss to maturity",
+            "mltm",
+            "loss to maturity",
+        ]
+
+        vtl_signals = [
+            "value-to-lien",
+            "value to lien",
+            "assessed value",
+            "direct and overlapping debt",
+        ]
+
+        debt_service_signals = [
+            "debt service schedule",
+            "annual debt service",
+            "principal",
+            "interest",
+            "maturity date",
+        ]
+
+        assessor_signals = [
+            "assessor",
+            "parcel",
+            "apn",
+            "assessed value roll",
+            "secured tax roll",
+        ]
+
+        official_score = sum(signal in front_text or signal in text for signal in official_statement_signals)
+        appendix_score = sum(signal in text for signal in appendix_signals)
+        annual_score = sum(signal in front_text for signal in annual_report_signals)
+        mltm_score = sum(signal in text for signal in mltm_signals)
+        vtl_score = sum(signal in text for signal in vtl_signals)
+        debt_service_score = sum(signal in text for signal in debt_service_signals)
+        assessor_score = sum(signal in text for signal in assessor_signals)
+
+        # Official Statement / Appendix gets priority when title-page bond language is present.
+        if official_score >= 2:
+            return "OS / Appendix PDF"
+
+        # Annual reports are also valuable source documents, but not always original OS.
+        # For scorecard evidence purposes, treat annual reports as OS/Appendix if they contain core tables.
+        if annual_score >= 1 and appendix_score >= 1:
+            return "OS / Appendix PDF"
+
+        if mltm_score >= 1:
+            return "MLTM Table"
+
+        if vtl_score >= 2:
+            return "VTL Workbook"
+
+        if debt_service_score >= 2:
+            return "Debt Service Excel / Schedule"
+
+        if assessor_score >= 2:
+            return "Assessor Export / County Data"
+
+        # If filename already gave a better guess, keep it.
+        return name_guess
+
     if uploaded_files:
+        parsed_docs = []
+
+        with st.spinner("Parsing uploaded documents and classifying evidence type..."):
+            for uploaded_file in uploaded_files:
+                parsed_doc = read_uploaded_file_to_context(uploaded_file)
+
+                detected_type = classify_document_from_text(
+                    file_name=uploaded_file.name,
+                    parsed_text=parsed_doc.get("text", ""),
+                    tables=parsed_doc.get("tables", []),
+                )
+
+                parsed_doc["detected_document_type"] = detected_type
+                parsed_doc["filename_guess_document_type"] = classify_uploaded_file(uploaded_file.name)
+                parsed_docs.append(parsed_doc)
+
+        st.session_state["parsed_documents"] = parsed_docs
+
         uploaded_summary = pd.DataFrame(
             [
                 {
-                    "File Name": uploaded_file.name,
-                    "Detected Document Type": classify_uploaded_file(uploaded_file.name),
-                    "Size KB": round(uploaded_file.size / 1024, 1),
+                    "File Name": doc.get("file_name"),
+                    "Filename Guess": doc.get("filename_guess_document_type"),
+                    "Detected Document Type": doc.get("detected_document_type"),
+                    "Parsed Text Length": len(doc.get("text", "")),
+                    "Tables Detected": len(doc.get("tables", [])),
                 }
-                for uploaded_file in uploaded_files
+                for doc in parsed_docs
             ]
         )
 
@@ -479,14 +615,6 @@ with tab_docs:
         else:
             st.success("Core evidence detected: OS / Appendix PDF is available.")
 
-        parsed_docs = []
-        with st.spinner("Parsing uploaded documents..."):
-            for uploaded_file in uploaded_files:
-                parsed_doc = read_uploaded_file_to_context(uploaded_file)
-                parsed_doc["detected_document_type"] = classify_uploaded_file(uploaded_file.name)
-                parsed_docs.append(parsed_doc)
-
-        st.session_state["parsed_documents"] = parsed_docs
         st.success(f"Parsed {len(parsed_docs)} document(s).")
 
     parsed_docs = st.session_state.get("parsed_documents", [])
