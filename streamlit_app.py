@@ -29,11 +29,11 @@ from modules.reliability_layer import (
     build_reliability_summary,
 )
 
-st.set_page_config(page_title="Municipal Credit Analytics Platform", layout="wide")
+st.set_page_config(page_title="Municipal Credit Deal Workspace", layout="wide")
 
-st.title("Municipal Credit Analytics Platform")
+st.title("Municipal Credit Deal Workspace")
 st.caption(
-    "Unified workflow with source reliability layer: Auto data pull + document extraction + analyst review + scorecard."
+    "Deal-first workflow: setup → auto context → document evidence → AI extraction → reliability review → scorecard."
 )
 
 
@@ -52,6 +52,17 @@ defaults = {
     "largest_taxpayer_percent_of_total_levy": 6.1,
     "est_value_to_lien": 15.5,
     "maximum_loss_to_maturity_percent": 13.9,
+    "deal_setup": {
+        "issuer_name": "Mission Viejo CFD No. 92-1",
+        "state": "CA",
+        "state_fips": "06",
+        "geography_type": "county",
+        "county_or_place_fips": "059",
+        "county_name": "Orange County",
+        "location_name": "Los Angeles-Long Beach-Anaheim",
+        "bond_type": "Special Assessment Debt",
+        "census_year": 2023,
+    },
 }
 
 for key, value in defaults.items():
@@ -60,35 +71,243 @@ for key, value in defaults.items():
 
 
 # =============================================================================
-# Sidebar
-# =============================================================================
-
-st.sidebar.header("Scoreboard")
-scoreboard_type = st.sidebar.selectbox(
-    "Scoreboard Type",
-    [
-        "Special Assessment Debt",
-        "General Obligation / General Fund",
-        "Water / Wastewater",
-    ],
-)
-
-st.sidebar.header("Workflow")
-workflow_mode = st.sidebar.radio(
-    "Mode",
-    [
-        "Integrated Analyst Workflow",
-        "Manual Input Only",
-    ],
-)
-
-st.sidebar.markdown("---")
-st.sidebar.caption("Prototype analyst-support platform. Not an official S&P model.")
-
-
-# =============================================================================
 # Helper Functions
 # =============================================================================
+
+def classify_uploaded_file(file_name: str) -> str:
+    """
+    Fast filename-based first pass.
+    EMMA files often have opaque names, so this is only a weak initial guess.
+    """
+    name = file_name.lower()
+
+    if any(term in name for term in ["os", "official", "statement", "appendix", "appx", "offering"]):
+        return "OS / Appendix PDF"
+
+    if any(term in name for term in ["debt service", "debt_service", "ds", "amort", "amortization"]):
+        return "Debt Service Excel / Schedule"
+
+    if any(term in name for term in ["mltm", "maximum loss", "loss to maturity", "stress"]):
+        return "MLTM Table"
+
+    if any(term in name for term in ["vtl", "value to lien", "value-to-lien", "lien"]):
+        return "VTL Workbook"
+
+    if any(term in name for term in ["assessor", "parcel", "county", "assessed value", "av"]):
+        return "Assessor Export / County Data"
+
+    return "Unclassified Source Document"
+
+
+def classify_document_from_text(file_name: str, parsed_text: str, tables=None) -> str:
+    """
+    Strong content-based document classifier.
+
+    EMMA downloads often have filenames like ER514463-ER398524.pdf.
+    The platform should classify by document content, not just filename.
+    """
+    name_guess = classify_uploaded_file(file_name)
+    text = (parsed_text or "").lower()
+    tables = tables or []
+    front_text = text[:8000]
+
+    official_statement_signals = [
+        "official statement",
+        "new issue",
+        "book entry only",
+        "special tax bonds",
+        "special tax refunding bonds",
+        "community facilities district",
+        "limited obligation bonds",
+        "bond counsel",
+        "underwriter",
+        "security for the bonds",
+        "the bonds are payable",
+    ]
+
+    appendix_signals = [
+        "appendix a",
+        "appendix b",
+        "assessed valuation",
+        "value-to-lien",
+        "value to lien",
+        "top ten taxpayers",
+        "top 10 taxpayers",
+        "debt service schedule",
+        "direct and overlapping debt",
+    ]
+
+    annual_report_signals = [
+        "annual report",
+        "fiscal year ended",
+        "continuing disclosure",
+        "annual continuing disclosure",
+    ]
+
+    mltm_signals = [
+        "maximum loss-to-maturity",
+        "maximum loss to maturity",
+        "mltm",
+        "loss to maturity",
+    ]
+
+    vtl_signals = [
+        "value-to-lien",
+        "value to lien",
+        "assessed value",
+        "direct and overlapping debt",
+    ]
+
+    debt_service_signals = [
+        "debt service schedule",
+        "annual debt service",
+        "principal",
+        "interest",
+        "maturity date",
+    ]
+
+    assessor_signals = [
+        "assessor",
+        "parcel",
+        "apn",
+        "assessed value roll",
+        "secured tax roll",
+    ]
+
+    official_score = sum(signal in front_text or signal in text for signal in official_statement_signals)
+    appendix_score = sum(signal in text for signal in appendix_signals)
+    annual_score = sum(signal in front_text for signal in annual_report_signals)
+    mltm_score = sum(signal in text for signal in mltm_signals)
+    vtl_score = sum(signal in text for signal in vtl_signals)
+    debt_service_score = sum(signal in text for signal in debt_service_signals)
+    assessor_score = sum(signal in text for signal in assessor_signals)
+
+    if official_score >= 2:
+        return "OS / Appendix PDF"
+
+    if annual_score >= 1 and appendix_score >= 1:
+        return "OS / Appendix PDF"
+
+    if mltm_score >= 1:
+        return "MLTM Table"
+
+    if vtl_score >= 2:
+        return "VTL Workbook"
+
+    if debt_service_score >= 2:
+        return "Debt Service Excel / Schedule"
+
+    if assessor_score >= 2:
+        return "Assessor Export / County Data"
+
+    return name_guess
+
+
+def evidence_guidance_table():
+    return pd.DataFrame(
+        [
+            {
+                "Priority": "Required",
+                "Document Type": "OS / Appendix PDF",
+                "Why It Matters": "Usually contains core deal facts, taxpayer tables, assessed value, district description, debt service, and disclosures.",
+                "Typical File Types": "PDF",
+                "Workflow Treatment": "Upload first; AI extraction can use it as the main evidence source.",
+            },
+            {
+                "Priority": "Recommended",
+                "Document Type": "Debt Service Excel / Schedule",
+                "Why It Matters": "Useful for MLTM stress testing, amortization review, and cash flow analysis.",
+                "Typical File Types": "XLSX, XLS, CSV",
+                "Workflow Treatment": "Upload when doing formal financial profile work.",
+            },
+            {
+                "Priority": "Optional",
+                "Document Type": "MLTM Table",
+                "Why It Matters": "Supports maximum loss-to-maturity assumptions and stress test review.",
+                "Typical File Types": "XLSX, XLS, CSV, PDF",
+                "Workflow Treatment": "Upload if available; otherwise use the MLTM calculator tab.",
+            },
+            {
+                "Priority": "Optional",
+                "Document Type": "VTL Workbook",
+                "Why It Matters": "Supports value-to-lien calculation and debt burden review.",
+                "Typical File Types": "XLSX, XLS, CSV",
+                "Workflow Treatment": "Upload if available; otherwise use the Value-to-Lien calculator tab.",
+            },
+            {
+                "Priority": "Advanced",
+                "Document Type": "Assessor Export / County Data",
+                "Why It Matters": "Useful for deep-dive parcel, assessed value, or ownership analysis.",
+                "Typical File Types": "CSV, XLSX, XLS",
+                "Workflow Treatment": "Not needed for quick review; useful for advanced issuer/deal analysis.",
+            },
+        ]
+    )
+
+
+def build_evidence_checklist(parsed_docs):
+    detected_types = set([doc.get("detected_document_type") for doc in parsed_docs or []])
+
+    checklist_rows = []
+    required_items = [
+        ("Required", "OS / Appendix PDF"),
+        ("Recommended", "Debt Service Excel / Schedule"),
+        ("Optional", "MLTM Table"),
+        ("Optional", "VTL Workbook"),
+        ("Advanced", "Assessor Export / County Data"),
+    ]
+
+    for priority, doc_type in required_items:
+        if doc_type in detected_types:
+            status = "Available"
+        elif priority == "Required":
+            status = "Missing — upload if possible"
+        elif priority == "Recommended":
+            status = "Not uploaded — recommended for formal review"
+        else:
+            status = "Not uploaded — optional"
+
+        checklist_rows.append(
+            {
+                "Priority": priority,
+                "Document Type": doc_type,
+                "Status": status,
+            }
+        )
+
+    return pd.DataFrame(checklist_rows)
+
+
+def uploaded_summary_table(parsed_docs):
+    return pd.DataFrame(
+        [
+            {
+                "File Name": doc.get("file_name"),
+                "Filename Guess": doc.get("filename_guess_document_type"),
+                "Detected Document Type": doc.get("detected_document_type"),
+                "Parsed Text Length": len(doc.get("text", "")),
+                "Tables Detected": len(doc.get("tables", [])),
+            }
+            for doc in parsed_docs or []
+        ]
+    )
+
+
+def parse_uploaded_documents(uploaded_files):
+    parsed_docs = []
+    for uploaded_file in uploaded_files:
+        parsed_doc = read_uploaded_file_to_context(uploaded_file)
+        detected_type = classify_document_from_text(
+            file_name=uploaded_file.name,
+            parsed_text=parsed_doc.get("text", ""),
+            tables=parsed_doc.get("tables", []),
+        )
+        parsed_doc["detected_document_type"] = detected_type
+        parsed_doc["filename_guess_document_type"] = classify_uploaded_file(uploaded_file.name)
+        parsed_docs.append(parsed_doc)
+
+    return parsed_docs
+
 
 def render_metric_row(results: dict):
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -204,7 +423,7 @@ def source_status_cards():
     candidate_count = 0 if candidates is None or candidates.empty else len(candidates)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Auto Data Sources", auto_count)
+    c1.metric("Auto Context Sources", auto_count)
     c2.metric("Parsed Documents", doc_count)
     c3.metric("Candidate Inputs", candidate_count)
     c4.metric("Approved Inputs", approved_count)
@@ -222,62 +441,188 @@ def show_reliability_dashboard():
     c4.metric("Missing Required", summary["missing_required_fields"])
 
 
+def run_auto_context_pull(deal_setup, census_api_key=None, fred_api_key=None):
+    bundle = auto_pull_structured_data(
+        state_fips=deal_setup["state_fips"],
+        place_or_county=deal_setup["county_or_place_fips"],
+        geography_type=deal_setup["geography_type"],
+        county_name=deal_setup["county_name"],
+        location_name=deal_setup["location_name"],
+        census_year=int(deal_setup["census_year"]),
+        census_api_key=census_api_key,
+        fred_api_key=fred_api_key,
+    )
+    st.session_state["auto_data_results"] = bundle.get("results", [])
+    merge_approved_inputs(bundle.get("approved_inputs", {}))
+    refresh_candidates()
+
+
+def run_document_extraction_pipeline(deal_setup, selected_targets, api_key, model):
+    parsed_docs = st.session_state.get("parsed_documents", [])
+    if not parsed_docs:
+        return {"ok": False, "error": "No parsed documents. Upload source files first."}
+
+    result = run_document_ai_extraction(
+        issuer_name=deal_setup["issuer_name"],
+        state=deal_setup["state"],
+        county_or_region=deal_setup["county_name"],
+        bond_type=deal_setup["bond_type"],
+        selected_targets=selected_targets,
+        parsed_docs=parsed_docs,
+        api_key=api_key,
+        model=model,
+    )
+    st.session_state["last_document_ai_result"] = result
+    refresh_candidates()
+    return result
+
+
 # =============================================================================
-# Placeholder for other scoreboards
+# Sidebar
 # =============================================================================
+
+st.sidebar.header("Scoreboard")
+scoreboard_type = st.sidebar.selectbox(
+    "Scoreboard Type",
+    [
+        "Special Assessment Debt",
+        "General Obligation / General Fund",
+        "Water / Wastewater",
+    ],
+)
+
+st.sidebar.markdown("---")
+st.sidebar.caption("Prototype analyst-support platform. Not an official S&P model.")
 
 if scoreboard_type != "Special Assessment Debt":
     st.header(scoreboard_type)
-    st.info("This scoreboard type is reserved for the next build. The reliability workflow shell is ready.")
+    st.info("This scoreboard type is reserved for the next build. The deal workspace shell is ready.")
     st.stop()
 
 
 # =============================================================================
-# Main Unified Page
+# Main Layout
 # =============================================================================
 
 source_status_cards()
 
-tab_auto, tab_docs, tab_review, tab_scorecard, tab_calcs, tab_sources = st.tabs(
+tab_deal, tab_review, tab_scorecard, tab_calcs, tab_sources = st.tabs(
     [
-        "1 Auto Data Pull",
-        "2 Documents",
-        "3 Reliability Review",
-        "4 Scorecard",
-        "5 Calculators",
-        "6 Sources & Evidence",
+        "1 Deal Workspace",
+        "2 Reliability Review",
+        "3 Scorecard",
+        "4 Calculators",
+        "5 Sources & Evidence",
     ]
 )
 
 
 # =============================================================================
-# Tab 1: Auto Data Pull
+# Tab 1: Deal Workspace
 # =============================================================================
 
-with tab_auto:
-    st.header("Auto Data Pull")
+with tab_deal:
+    st.header("Deal Workspace")
     st.write(
-        "Use automatic connectors for stable and structured data. "
-        "Complex PDF-heavy deal data should still be uploaded in the Documents tab."
+        "Set up the deal once, then run the full context pipeline: structured public data + uploaded evidence + AI extraction."
     )
 
-    col1, col2, col3 = st.columns(3)
+    st.subheader("A. Deal Setup")
 
-    with col1:
-        state_fips = st.text_input("State FIPS", value="06", help="California = 06")
-        geography_type = st.selectbox("Geography Type", ["county", "place"])
-        place_or_county = st.text_input(
-            "County / Place FIPS",
-            value="067",
-            help="Sacramento County = 067. If using place, use 5-digit place FIPS.",
+    setup = st.session_state.get("deal_setup", defaults["deal_setup"]).copy()
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        issuer_name = st.text_input("Issuer / District Name", value=setup.get("issuer_name", ""))
+        state = st.text_input("State", value=setup.get("state", "CA"))
+        bond_type = st.selectbox(
+            "Bond Type",
+            ["Special Assessment Debt", "CFD / Mello-Roos", "Special Tax Bonds"],
+            index=0,
         )
 
-    with col2:
-        county_name = st.text_input("County Name", value="Sacramento County")
-        location_name = st.text_input("Location / MSA Name", value="Sacramento-Roseville-Arden")
-        census_year = st.number_input("ACS Year", min_value=2018, max_value=2024, value=2023, step=1)
+    with c2:
+        state_fips = st.text_input("State FIPS", value=setup.get("state_fips", "06"))
+        geography_type = st.selectbox(
+            "Geography Type",
+            ["county", "place"],
+            index=0 if setup.get("geography_type", "county") == "county" else 1,
+        )
+        county_or_place_fips = st.text_input(
+            "County / Place FIPS",
+            value=setup.get("county_or_place_fips", "059"),
+            help="County FIPS is 3 digits. Place FIPS is usually 5 digits.",
+        )
 
-    with col3:
+    with c3:
+        county_name = st.text_input("County Name", value=setup.get("county_name", "Orange County"))
+        location_name = st.text_input("Location / MSA Name", value=setup.get("location_name", "Los Angeles-Long Beach-Anaheim"))
+        census_year = st.number_input("ACS Year", min_value=2018, max_value=2024, value=int(setup.get("census_year", 2023)), step=1)
+
+    deal_setup = {
+        "issuer_name": issuer_name,
+        "state": state,
+        "state_fips": state_fips,
+        "geography_type": geography_type,
+        "county_or_place_fips": county_or_place_fips,
+        "county_name": county_name,
+        "location_name": location_name,
+        "bond_type": bond_type,
+        "census_year": census_year,
+    }
+    st.session_state["deal_setup"] = deal_setup
+
+    st.markdown("---")
+    st.subheader("B. Minimum Viable Evidence")
+
+    st.dataframe(evidence_guidance_table(), use_container_width=True, hide_index=True)
+    st.info(
+        "Quick review: upload only the OS / Appendix PDF. "
+        "Formal review: add debt service and MLTM/VTL support if available."
+    )
+
+    uploaded_files = st.file_uploader(
+        "Upload source files",
+        type=["pdf", "csv", "xlsx", "xls", "txt"],
+        accept_multiple_files=True,
+    )
+
+    if uploaded_files:
+        with st.spinner("Parsing uploaded documents and classifying evidence type..."):
+            parsed_docs = parse_uploaded_documents(uploaded_files)
+        st.session_state["parsed_documents"] = parsed_docs
+
+        st.subheader("Uploaded Evidence Summary")
+        st.dataframe(uploaded_summary_table(parsed_docs), use_container_width=True, hide_index=True)
+
+        st.subheader("Evidence Completeness")
+        checklist_df = build_evidence_checklist(parsed_docs)
+        st.dataframe(checklist_df, use_container_width=True, hide_index=True)
+
+        detected_types = set([doc.get("detected_document_type") for doc in parsed_docs])
+        if "OS / Appendix PDF" not in detected_types:
+            st.warning("No OS / Appendix PDF detected. You can still proceed, but AI extraction may have limited context.")
+        else:
+            st.success("Core evidence detected: OS / Appendix PDF is available.")
+
+    elif st.session_state.get("parsed_documents"):
+        parsed_docs = st.session_state.get("parsed_documents")
+        st.subheader("Uploaded Evidence Summary")
+        st.dataframe(uploaded_summary_table(parsed_docs), use_container_width=True, hide_index=True)
+
+        st.subheader("Evidence Completeness")
+        st.dataframe(build_evidence_checklist(parsed_docs), use_container_width=True, hide_index=True)
+
+    else:
+        st.info("No parsed documents yet.")
+
+    st.markdown("---")
+    st.subheader("C. Run Deal Intelligence Pipeline")
+
+    p1, p2 = st.columns(2)
+
+    with p1:
         try:
             default_census_key = st.secrets.get("CENSUS_API_KEY", "")
         except Exception:
@@ -290,338 +635,77 @@ with tab_auto:
         census_api_key = st.text_input("Census API Key Override", type="password", value="")
         fred_api_key = st.text_input("FRED API Key Override", type="password", value="")
 
-    if st.button("Run Structured Auto Pull", type="primary"):
-        with st.spinner("Pulling structured data..."):
-            bundle = auto_pull_structured_data(
-                state_fips=state_fips,
-                place_or_county=place_or_county,
-                geography_type=geography_type,
-                county_name=county_name,
-                location_name=location_name,
-                census_year=int(census_year),
+    with p2:
+        try:
+            default_openai_key = st.secrets.get("OPENAI_API_KEY", "")
+        except Exception:
+            default_openai_key = ""
+
+        openai_api_key = st.text_input("OpenAI API Key Override", type="password", value="")
+        model = st.selectbox("OpenAI Model", ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"], index=0)
+
+    selected_targets = st.multiselect(
+        "Fields to Extract from Uploaded Documents",
+        DEFAULT_TARGETS,
+        default=DEFAULT_TARGETS,
+    )
+
+    run_col1, run_col2, run_col3 = st.columns([1.1, 1.1, 2])
+
+    with run_col1:
+        run_auto_only = st.button("Run Auto Context Only")
+
+    with run_col2:
+        run_full = st.button("Run Deal Intelligence Pipeline", type="primary")
+
+    with run_col3:
+        st.caption(
+            "Pipeline = public data context + uploaded document extraction + candidate reliability review."
+        )
+
+    if run_auto_only:
+        with st.spinner("Pulling structured public data..."):
+            run_auto_context_pull(
+                deal_setup,
+                census_api_key=census_api_key or default_census_key or None,
+                fred_api_key=fred_api_key or default_fred_key or None,
+            )
+        st.success("Auto context pull completed.")
+
+    if run_full:
+        with st.spinner("Step 1/2: Pulling structured public data..."):
+            run_auto_context_pull(
+                deal_setup,
                 census_api_key=census_api_key or default_census_key or None,
                 fred_api_key=fred_api_key or default_fred_key or None,
             )
 
-        st.session_state["auto_data_results"] = bundle.get("results", [])
-        merge_approved_inputs(bundle.get("approved_inputs", {}))
-        refresh_candidates()
-        st.success("Auto data pull completed. Candidate inputs were added to Reliability Review.")
-
-    if st.session_state.get("auto_data_results"):
-        st.subheader("Auto Data Results")
-        auto_df = auto_data_results_to_dataframe(st.session_state["auto_data_results"])
-        st.dataframe(auto_df, use_container_width=True)
-
-        st.caption(
-            "Status guide: success = pulled correctly; setup_needed = API key/config needed; "
-            "manual_required = intentionally left for analyst upload/input; failed/error = connector needs debugging."
-        )
-
-        with st.expander("Raw Auto Data Results"):
-            st.json(st.session_state["auto_data_results"])
-
-    st.markdown("### Connector Strategy")
-    st.dataframe(
-        pd.DataFrame(
-            [
-                ["Census / ACS", "Income, population, EBI % of U.S.", "Live connector"],
-                ["FRED", "UNRATE, DGS10, CPIAUCSL, FEDFUNDS", "Live connector if FRED_API_KEY exists"],
-                ["BLS / LAUS", "Local unemployment", "Manual required until LAUS series mapping is added"],
-                ["County Open Data", "Assessed value", "Manual upload or county-specific connector later"],
-                ["Housing Data", "Trend / distress proxy", "Manual review or selected source later"],
-                ["EMMA / OS", "Deal-specific PDF/tables", "Upload + document extraction"],
-            ],
-            columns=["Source", "Target Data", "Current Treatment"],
-        ),
-        use_container_width=True,
-    )
-
-
-# =============================================================================
-# Tab 2: Documents
-# =============================================================================
-
-with tab_docs:
-    st.header("Document Upload & Parsing")
-    st.write(
-        "Upload the strongest available source documents first. "
-        "Not every file is required; the platform works best with a minimum viable evidence package."
-    )
-
-    st.subheader("Minimum Viable Evidence Checklist")
-
-    evidence_guidance = pd.DataFrame(
-        [
-            {
-                "Priority": "Required",
-                "Document Type": "OS / Appendix PDF",
-                "Why It Matters": "Usually contains core deal facts, taxpayer tables, assessed value, district description, debt service, and disclosures.",
-                "Typical File Types": "PDF",
-                "Workflow Treatment": "Upload first; AI extraction can use it as the main evidence source.",
-            },
-            {
-                "Priority": "Recommended",
-                "Document Type": "Debt Service Excel / Schedule",
-                "Why It Matters": "Useful for MLTM stress testing, amortization review, and cash flow analysis.",
-                "Typical File Types": "XLSX, XLS, CSV",
-                "Workflow Treatment": "Upload when doing formal financial profile work.",
-            },
-            {
-                "Priority": "Optional",
-                "Document Type": "MLTM Table",
-                "Why It Matters": "Supports maximum loss-to-maturity assumptions and stress test review.",
-                "Typical File Types": "XLSX, XLS, CSV, PDF",
-                "Workflow Treatment": "Upload if available; otherwise use the MLTM calculator tab.",
-            },
-            {
-                "Priority": "Optional",
-                "Document Type": "VTL Workbook",
-                "Why It Matters": "Supports value-to-lien calculation and debt burden review.",
-                "Typical File Types": "XLSX, XLS, CSV",
-                "Workflow Treatment": "Upload if available; otherwise use the Value-to-Lien calculator tab.",
-            },
-            {
-                "Priority": "Advanced",
-                "Document Type": "Assessor Export / County Data",
-                "Why It Matters": "Useful for deep-dive parcel, assessed value, or ownership analysis.",
-                "Typical File Types": "CSV, XLSX, XLS",
-                "Workflow Treatment": "Not needed for quick review; useful for advanced issuer/deal analysis.",
-            },
-        ]
-    )
-
-    st.dataframe(evidence_guidance, use_container_width=True, hide_index=True)
-
-    st.info(
-        "Quick-review mode: upload only the OS / Appendix PDF. "
-        "Formal-analysis mode: add debt service and MLTM/VTL support if available."
-    )
-
-    uploaded_files = st.file_uploader(
-        "Upload source files",
-        type=["pdf", "csv", "xlsx", "xls", "txt"],
-        accept_multiple_files=True,
-    )
-
-    def classify_uploaded_file(file_name: str) -> str:
-        """
-        Fast filename-based first pass.
-        EMMA files often have opaque names, so this is only a weak initial guess.
-        The stronger classifier below uses parsed document text.
-        """
-        name = file_name.lower()
-
-        if any(term in name for term in ["os", "official", "statement", "appendix", "appx", "offering"]):
-            return "OS / Appendix PDF"
-
-        if any(term in name for term in ["debt service", "debt_service", "ds", "amort", "amortization"]):
-            return "Debt Service Excel / Schedule"
-
-        if any(term in name for term in ["mltm", "maximum loss", "loss to maturity", "stress"]):
-            return "MLTM Table"
-
-        if any(term in name for term in ["vtl", "value to lien", "value-to-lien", "lien"]):
-            return "VTL Workbook"
-
-        if any(term in name for term in ["assessor", "parcel", "county", "assessed value", "av"]):
-            return "Assessor Export / County Data"
-
-        return "Unclassified Source Document"
-
-
-    def classify_document_from_text(file_name: str, parsed_text: str, tables=None) -> str:
-        """
-        Strong content-based document classifier.
-
-        Why this matters:
-        EMMA downloads often have filenames like ER514463-ER398524.pdf.
-        The platform should classify by document content, not just filename.
-        """
-        name_guess = classify_uploaded_file(file_name)
-        text = (parsed_text or "").lower()
-        tables = tables or []
-
-        # Restrict to first section for title-page signals, but also scan full text for core terms.
-        front_text = text[:8000]
-
-        official_statement_signals = [
-            "official statement",
-            "new issue",
-            "book entry only",
-            "special tax bonds",
-            "special tax refunding bonds",
-            "community facilities district",
-            "limited obligation bonds",
-            "bond counsel",
-            "underwriter",
-            "security for the bonds",
-            "the bonds are payable",
-        ]
-
-        appendix_signals = [
-            "appendix a",
-            "appendix b",
-            "assessed valuation",
-            "value-to-lien",
-            "value to lien",
-            "top ten taxpayers",
-            "top 10 taxpayers",
-            "debt service schedule",
-            "direct and overlapping debt",
-        ]
-
-        annual_report_signals = [
-            "annual report",
-            "fiscal year ended",
-            "continuing disclosure",
-            "annual continuing disclosure",
-        ]
-
-        mltm_signals = [
-            "maximum loss-to-maturity",
-            "maximum loss to maturity",
-            "mltm",
-            "loss to maturity",
-        ]
-
-        vtl_signals = [
-            "value-to-lien",
-            "value to lien",
-            "assessed value",
-            "direct and overlapping debt",
-        ]
-
-        debt_service_signals = [
-            "debt service schedule",
-            "annual debt service",
-            "principal",
-            "interest",
-            "maturity date",
-        ]
-
-        assessor_signals = [
-            "assessor",
-            "parcel",
-            "apn",
-            "assessed value roll",
-            "secured tax roll",
-        ]
-
-        official_score = sum(signal in front_text or signal in text for signal in official_statement_signals)
-        appendix_score = sum(signal in text for signal in appendix_signals)
-        annual_score = sum(signal in front_text for signal in annual_report_signals)
-        mltm_score = sum(signal in text for signal in mltm_signals)
-        vtl_score = sum(signal in text for signal in vtl_signals)
-        debt_service_score = sum(signal in text for signal in debt_service_signals)
-        assessor_score = sum(signal in text for signal in assessor_signals)
-
-        # Official Statement / Appendix gets priority when title-page bond language is present.
-        if official_score >= 2:
-            return "OS / Appendix PDF"
-
-        # Annual reports are also valuable source documents, but not always original OS.
-        # For scorecard evidence purposes, treat annual reports as OS/Appendix if they contain core tables.
-        if annual_score >= 1 and appendix_score >= 1:
-            return "OS / Appendix PDF"
-
-        if mltm_score >= 1:
-            return "MLTM Table"
-
-        if vtl_score >= 2:
-            return "VTL Workbook"
-
-        if debt_service_score >= 2:
-            return "Debt Service Excel / Schedule"
-
-        if assessor_score >= 2:
-            return "Assessor Export / County Data"
-
-        # If filename already gave a better guess, keep it.
-        return name_guess
-
-    if uploaded_files:
-        parsed_docs = []
-
-        with st.spinner("Parsing uploaded documents and classifying evidence type..."):
-            for uploaded_file in uploaded_files:
-                parsed_doc = read_uploaded_file_to_context(uploaded_file)
-
-                detected_type = classify_document_from_text(
-                    file_name=uploaded_file.name,
-                    parsed_text=parsed_doc.get("text", ""),
-                    tables=parsed_doc.get("tables", []),
+        if st.session_state.get("parsed_documents"):
+            with st.spinner("Step 2/2: Running document AI extraction..."):
+                result = run_document_extraction_pipeline(
+                    deal_setup=deal_setup,
+                    selected_targets=selected_targets,
+                    api_key=openai_api_key or default_openai_key,
+                    model=model,
                 )
 
-                parsed_doc["detected_document_type"] = detected_type
-                parsed_doc["filename_guess_document_type"] = classify_uploaded_file(uploaded_file.name)
-                parsed_docs.append(parsed_doc)
-
-        st.session_state["parsed_documents"] = parsed_docs
-
-        uploaded_summary = pd.DataFrame(
-            [
-                {
-                    "File Name": doc.get("file_name"),
-                    "Filename Guess": doc.get("filename_guess_document_type"),
-                    "Detected Document Type": doc.get("detected_document_type"),
-                    "Parsed Text Length": len(doc.get("text", "")),
-                    "Tables Detected": len(doc.get("tables", [])),
-                }
-                for doc in parsed_docs
-            ]
-        )
-
-        st.subheader("Uploaded Evidence Summary")
-        st.dataframe(uploaded_summary, use_container_width=True, hide_index=True)
-
-        detected_types = set(uploaded_summary["Detected Document Type"].tolist())
-
-        checklist_rows = []
-        required_items = [
-            ("Required", "OS / Appendix PDF"),
-            ("Recommended", "Debt Service Excel / Schedule"),
-            ("Optional", "MLTM Table"),
-            ("Optional", "VTL Workbook"),
-            ("Advanced", "Assessor Export / County Data"),
-        ]
-
-        for priority, doc_type in required_items:
-            if doc_type in detected_types:
-                status = "Available"
-            elif priority == "Required":
-                status = "Missing — upload if possible"
-            elif priority == "Recommended":
-                status = "Not uploaded — recommended for formal review"
+            if result.get("ok", False):
+                st.success("Deal intelligence pipeline completed.")
             else:
-                status = "Not uploaded — optional"
-
-            checklist_rows.append(
-                {
-                    "Priority": priority,
-                    "Document Type": doc_type,
-                    "Status": status,
-                }
-            )
-
-        st.subheader("Evidence Completeness")
-        checklist_df = pd.DataFrame(checklist_rows)
-        st.dataframe(checklist_df, use_container_width=True, hide_index=True)
-
-        if "OS / Appendix PDF" not in detected_types:
-            st.warning(
-                "No OS / Appendix PDF detected. You can still proceed, but AI extraction may have limited context."
-            )
+                st.warning(result.get("error", "Document extraction did not complete. Auto context was still pulled."))
         else:
-            st.success("Core evidence detected: OS / Appendix PDF is available.")
+            st.warning("Auto context completed. No documents uploaded, so document extraction was skipped.")
 
-        st.success(f"Parsed {len(parsed_docs)} document(s).")
+    if st.session_state.get("auto_data_results"):
+        st.subheader("Auto Context Results")
+        st.dataframe(auto_data_results_to_dataframe(st.session_state["auto_data_results"]), use_container_width=True)
 
-    parsed_docs = st.session_state.get("parsed_documents", [])
+        with st.expander("Raw Auto Context Results"):
+            st.json(st.session_state["auto_data_results"])
 
-    if parsed_docs:
+    if st.session_state.get("parsed_documents"):
         st.subheader("Parsed Document Preview")
-        for doc in parsed_docs:
+        for doc in st.session_state.get("parsed_documents", []):
             title = f"{doc.get('file_name')} — {doc.get('detected_document_type', 'Unclassified')}"
             with st.expander(title, expanded=False):
                 if doc.get("warnings"):
@@ -633,12 +717,10 @@ with tab_docs:
                 for table in doc.get("tables", []):
                     st.write(table.get("table_name"))
                     st.dataframe(pd.DataFrame(table.get("preview", [])), use_container_width=True)
-    else:
-        st.info("No parsed documents yet.")
 
 
 # =============================================================================
-# Tab 3: Reliability Review
+# Tab 2: Reliability Review
 # =============================================================================
 
 with tab_review:
@@ -649,56 +731,6 @@ with tab_review:
     )
 
     show_reliability_dashboard()
-
-    parsed_docs = st.session_state.get("parsed_documents", [])
-
-    with st.expander("Run Document AI Extraction", expanded=False):
-        try:
-            default_openai_key = st.secrets.get("OPENAI_API_KEY", "")
-        except Exception:
-            default_openai_key = ""
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            issuer_name = st.text_input("Issuer / District Name", value="Laguna Ridge CFD")
-            state = st.text_input("State", value="CA")
-            county_or_region = st.text_input("County / Region", value="Sacramento County")
-            bond_type = st.selectbox("Bond Type", ["Special Assessment Debt", "CFD / Mello-Roos", "Special Tax Bonds"])
-
-        with col2:
-            model = st.selectbox("OpenAI Model", ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"], index=0)
-            api_key_input = st.text_input("OpenAI API Key Override", type="password", value="")
-
-        selected_targets = st.multiselect(
-            "Fields to Extract from Uploaded Documents",
-            DEFAULT_TARGETS,
-            default=DEFAULT_TARGETS,
-        )
-
-        if not parsed_docs:
-            st.warning("Upload documents first in Tab 2.")
-
-        if st.button("Run Document Extraction", type="primary", disabled=not parsed_docs):
-            with st.spinner("Extracting scorecard candidates from uploaded documents..."):
-                result = run_document_ai_extraction(
-                    issuer_name=issuer_name,
-                    state=state,
-                    county_or_region=county_or_region,
-                    bond_type=bond_type,
-                    selected_targets=selected_targets,
-                    parsed_docs=parsed_docs,
-                    api_key=api_key_input or default_openai_key,
-                    model=model,
-                )
-
-            st.session_state["last_document_ai_result"] = result
-            refresh_candidates()
-
-            if not result.get("ok", False):
-                st.error(result.get("error", "Document extraction failed."))
-            else:
-                st.success("Document extraction completed. Candidate inputs added below.")
 
     if st.button("Refresh Candidate Inputs"):
         refresh_candidates()
@@ -771,7 +803,7 @@ with tab_review:
 
 
 # =============================================================================
-# Tab 4: Scorecard
+# Tab 3: Scorecard
 # =============================================================================
 
 with tab_scorecard:
@@ -779,10 +811,7 @@ with tab_scorecard:
 
     defaults = get_default_scorecard_inputs()
 
-    if workflow_mode == "Manual Input Only":
-        st.info("Manual mode: edit values directly below.")
-    else:
-        st.info("Integrated mode: values below may be prefilled from approved Reliability Review inputs.")
+    st.info("Values below may be prefilled from approved Reliability Review inputs. You can still manually override them.")
 
     with st.expander("A. Economic Fundamentals Assessment", expanded=True):
         col1, col2 = st.columns(2)
@@ -919,7 +948,7 @@ with tab_scorecard:
 
 
 # =============================================================================
-# Tab 5: Calculators
+# Tab 4: Calculators
 # =============================================================================
 
 with tab_calcs:
@@ -1030,7 +1059,7 @@ with tab_calcs:
 
 
 # =============================================================================
-# Tab 6: Sources & Evidence
+# Tab 5: Sources & Evidence
 # =============================================================================
 
 with tab_sources:
@@ -1051,11 +1080,19 @@ with tab_sources:
     candidates = normalize_candidate_dataframe(st.session_state.get("review_candidates", pd.DataFrame()))
     st.dataframe(candidates, use_container_width=True)
 
-    st.subheader("Auto Data Results")
+    st.subheader("Auto Context Results")
     if st.session_state.get("auto_data_results"):
         st.dataframe(auto_data_results_to_dataframe(st.session_state["auto_data_results"]), use_container_width=True)
     else:
-        st.info("No auto data results yet.")
+        st.info("No auto context results yet.")
+
+    st.subheader("Parsed Document Inventory")
+    parsed_docs = st.session_state.get("parsed_documents", [])
+    if parsed_docs:
+        st.dataframe(uploaded_summary_table(parsed_docs), use_container_width=True, hide_index=True)
+        st.dataframe(build_evidence_checklist(parsed_docs), use_container_width=True, hide_index=True)
+    else:
+        st.info("No documents parsed yet.")
 
     if st.session_state.get("last_scorecard_results"):
         st.subheader("Latest Scorecard Explanation")
