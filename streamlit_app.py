@@ -11,7 +11,6 @@ from modules.scoring_special_assessment import (
 from modules.auto_data_sources import (
     auto_pull_structured_data,
     auto_data_results_to_dataframe,
-    build_auto_data_debug_table,
 )
 
 from modules.document_ai_extraction import (
@@ -106,9 +105,24 @@ def render_scorecard_results(results: dict):
 
     factor_df = pd.DataFrame(
         [
-            ["Economic Fundamentals Assessment", "15%", results.get("economic_fundamentals_assessment"), results.get("economic_fundamentals_assessment_category")],
-            ["District Characteristics Assessment", "35%", results.get("district_characteristics_assessment"), results.get("district_characteristics_assessment_category")],
-            ["Financial Profile Assessment", "50%", results.get("financial_profile_assessment"), results.get("financial_profile_assessment_category")],
+            [
+                "Economic Fundamentals Assessment",
+                "15%",
+                results.get("economic_fundamentals_assessment"),
+                results.get("economic_fundamentals_assessment_category"),
+            ],
+            [
+                "District Characteristics Assessment",
+                "35%",
+                results.get("district_characteristics_assessment"),
+                results.get("district_characteristics_assessment_category"),
+            ],
+            [
+                "Financial Profile Assessment",
+                "50%",
+                results.get("financial_profile_assessment"),
+                results.get("financial_profile_assessment_category"),
+            ],
         ],
         columns=["Key Credit Factor", "Weight", "Numeric Assessment", "Category"],
     )
@@ -143,14 +157,29 @@ def get_default_scorecard_inputs():
         "median_household_ebi_percent_of_us": approved.get("median_household_ebi_percent_of_us", 144.0),
         "unemployment_rate_difference_vs_us": approved.get("unemployment_rate_difference_vs_us", -0.3),
         "msa_participation": approved.get("msa_participation", "Yes; Broad & Diverse"),
-        "real_estate_market_volatility": approved.get("real_estate_market_volatility", "Low Volatility; Stable Prices; Low Distress"),
+        "real_estate_market_volatility": approved.get(
+            "real_estate_market_volatility",
+            "Low Volatility; Stable Prices; Low Distress",
+        ),
         "population_growth_difference_vs_us": approved.get("population_growth_difference_vs_us", 0.5),
-        "top10_taxpayers_percent_of_total_levy": approved.get("top10_taxpayers_percent_of_total_levy", st.session_state.get("top10_taxpayers_percent_of_total_levy", 16.1)),
-        "largest_taxpayer_percent_of_total_levy": approved.get("largest_taxpayer_percent_of_total_levy", st.session_state.get("largest_taxpayer_percent_of_total_levy", 6.1)),
+        "top10_taxpayers_percent_of_total_levy": approved.get(
+            "top10_taxpayers_percent_of_total_levy",
+            st.session_state.get("top10_taxpayers_percent_of_total_levy", 16.1),
+        ),
+        "largest_taxpayer_percent_of_total_levy": approved.get(
+            "largest_taxpayer_percent_of_total_levy",
+            st.session_state.get("largest_taxpayer_percent_of_total_levy", 6.1),
+        ),
         "district_size_parcels": approved.get("district_size_parcels", 5900),
-        "conveyance_to_homeowners": approved.get("conveyance_to_homeowners", "Fairly Developed with Significant Conveyance (Some Developer Concentration)"),
+        "conveyance_to_homeowners": approved.get(
+            "conveyance_to_homeowners",
+            "Fairly Developed with Significant Conveyance (Some Developer Concentration)",
+        ),
         "est_value_to_lien": approved.get("est_value_to_lien", st.session_state.get("est_value_to_lien", 15.5)),
-        "maximum_loss_to_maturity_percent": approved.get("maximum_loss_to_maturity_percent", st.session_state.get("maximum_loss_to_maturity_percent", 13.9)),
+        "maximum_loss_to_maturity_percent": approved.get(
+            "maximum_loss_to_maturity_percent",
+            st.session_state.get("maximum_loss_to_maturity_percent", 13.9),
+        ),
         "negative_override_notches": approved.get("negative_override_notches", 0),
         "holistic_adjustment_notches": approved.get("holistic_adjustment_notches", 0),
         "rating_cap": approved.get("rating_cap", "None"),
@@ -237,7 +266,11 @@ with tab_auto:
     with col1:
         state_fips = st.text_input("State FIPS", value="06", help="California = 06")
         geography_type = st.selectbox("Geography Type", ["county", "place"])
-        place_or_county = st.text_input("County / Place FIPS", value="067", help="Sacramento County = 067")
+        place_or_county = st.text_input(
+            "County / Place FIPS",
+            value="067",
+            help="Sacramento County = 067. If using place, use 5-digit place FIPS.",
+        )
 
     with col2:
         county_name = st.text_input("County Name", value="Sacramento County")
@@ -280,21 +313,19 @@ with tab_auto:
         auto_df = auto_data_results_to_dataframe(st.session_state["auto_data_results"])
         st.dataframe(auto_df, use_container_width=True)
 
-        debug_df = build_auto_data_debug_table(st.session_state["auto_data_results"])
-        if not debug_df.empty:
-            with st.expander("Census Debug / Fallback Attempts"):
-                st.dataframe(debug_df, use_container_width=True)
-
         st.caption(
             "Status guide: success = pulled correctly; setup_needed = API key/config needed; "
-            "manual_required = intentionally left for analyst upload/input; failed = connector needs debugging."
+            "manual_required = intentionally left for analyst upload/input; failed/error = connector needs debugging."
         )
+
+        with st.expander("Raw Auto Data Results"):
+            st.json(st.session_state["auto_data_results"])
 
     st.markdown("### Connector Strategy")
     st.dataframe(
         pd.DataFrame(
             [
-                ["Census / ACS", "Income, population, EBI % of U.S.", "Live connector with fallback years"],
+                ["Census / ACS", "Income, population, EBI % of U.S.", "Live connector"],
                 ["FRED", "UNRATE, DGS10, CPIAUCSL, FEDFUNDS", "Live connector if FRED_API_KEY exists"],
                 ["BLS / LAUS", "Local unemployment", "Manual required until LAUS series mapping is added"],
                 ["County Open Data", "Assessed value", "Manual upload or county-specific connector later"],
@@ -384,7 +415,11 @@ with tab_review:
             model = st.selectbox("OpenAI Model", ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"], index=0)
             api_key_input = st.text_input("OpenAI API Key Override", type="password", value="")
 
-        selected_targets = st.multiselect("Fields to Extract from Uploaded Documents", DEFAULT_TARGETS, default=DEFAULT_TARGETS)
+        selected_targets = st.multiselect(
+            "Fields to Extract from Uploaded Documents",
+            DEFAULT_TARGETS,
+            default=DEFAULT_TARGETS,
+        )
 
         if not parsed_docs:
             st.warning("Upload documents first in Tab 2.")
@@ -588,9 +623,21 @@ with tab_scorecard:
     with st.expander("D. Overriding Factors / Caps / Holistic Analysis", expanded=False):
         col5, col6, col7 = st.columns(3)
         with col5:
-            negative_override_notches = st.number_input("Negative Overriding Factors (Notches)", min_value=0, max_value=5, value=0, step=1)
+            negative_override_notches = st.number_input(
+                "Negative Overriding Factors (Notches)",
+                min_value=0,
+                max_value=5,
+                value=0,
+                step=1,
+            )
         with col6:
-            holistic_adjustment_notches = st.number_input("Holistic Analysis Adjustment (Notches)", min_value=-1, max_value=1, value=0, step=1)
+            holistic_adjustment_notches = st.number_input(
+                "Holistic Analysis Adjustment (Notches)",
+                min_value=-1,
+                max_value=1,
+                value=0,
+                step=1,
+            )
         with col7:
             rating_cap = st.selectbox("Rating Cap", ["None", "bbb", "bb", "b category"])
 
@@ -632,9 +679,16 @@ with tab_calcs:
         default_taxpayers = pd.DataFrame(
             {
                 "taxpayer_name": [
-                    "Lennar Landbank", "Lennar", "Risewell Landbank", "Risewell",
-                    "Beazer Landbank", "Beazer", "Dignity Community Care",
-                    "Ridge EG West LP", "PF Portfolio 2 LP", "EGBL 15 LLC",
+                    "Lennar Landbank",
+                    "Lennar",
+                    "Risewell Landbank",
+                    "Risewell",
+                    "Beazer Landbank",
+                    "Beazer",
+                    "Dignity Community Care",
+                    "Ridge EG West LP",
+                    "PF Portfolio 2 LP",
+                    "EGBL 15 LLC",
                 ],
                 "levy_percent": [6.1, 0.0, 4.0, 0.0, 1.5, 0.0, 1.5, 1.4, 0.9, 0.7],
             }
@@ -681,8 +735,30 @@ with tab_calcs:
         default_cashflow = pd.DataFrame(
             {
                 "year": list(range(2027, 2037)),
-                "special_tax_levy": [12191803, 12460759, 12710019, 12959939, 13219518, 13492483, 13758628, 14025653, 14138513, 14239823],
-                "annual_debt_service": [11108912, 11327963, 11554563, 11781763, 12017744, 12265894, 12507844, 12750594, 12853194, 12945294],
+                "special_tax_levy": [
+                    12191803,
+                    12460759,
+                    12710019,
+                    12959939,
+                    13219518,
+                    13492483,
+                    13758628,
+                    14025653,
+                    14138513,
+                    14239823,
+                ],
+                "annual_debt_service": [
+                    11108912,
+                    11327963,
+                    11554563,
+                    11781763,
+                    12017744,
+                    12265894,
+                    12507844,
+                    12750594,
+                    12853194,
+                    12945294,
+                ],
             }
         )
 
