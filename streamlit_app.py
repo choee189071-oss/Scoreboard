@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import re
 from datetime import datetime
 
 from modules.scoring_special_assessment import (
@@ -372,6 +373,52 @@ def safe_value(value):
         pass
 
     return value
+
+
+def parse_numeric_input(value, default=0.0):
+    """
+    Converts common muni-credit extracted strings into float-safe values.
+    Examples:
+    - ">16:1" -> 16.0
+    - "16-to-1" -> 16.0
+    - "16x" -> 16.0
+    - "13.9%" -> 13.9
+    - "$1,234,000" -> 1234000.0
+    """
+    if value is None:
+        return float(default)
+
+    if isinstance(value, (int, float)):
+        try:
+            if pd.isna(value):
+                return float(default)
+        except Exception:
+            pass
+        return float(value)
+
+    text = str(value).strip()
+
+    if text in ["", "None", "nan", "NaN"]:
+        return float(default)
+
+    text = text.replace(",", "")
+    text = text.replace("$", "")
+    text = text.replace("%", "")
+    text = text.replace("x", "")
+    text = text.replace("X", "")
+    text = text.replace("to-1", ":1")
+    text = text.replace("-to-1", ":1")
+    text = text.replace(" to 1", ":1")
+    text = text.replace("to 1", ":1")
+
+    # For ratio strings like >16:1 or 16:1, use the numerator.
+    ratio_match = re.search(r"[-+]?\d*\.?\d+", text)
+    if ratio_match:
+        return float(ratio_match.group())
+
+    return float(default)
+
+
 
 
 def add_approved_input(
@@ -1051,17 +1098,17 @@ with tab_scorecard:
                 "Median Household EBI (% of U.S.)",
                 min_value=0.0,
                 max_value=500.0,
-                value=float(defaults_for_scorecard["median_household_ebi_percent_of_us"]),
+                value=parse_numeric_input(defaults_for_scorecard["median_household_ebi_percent_of_us"], 144.0),
                 step=1.0,
             )
             unemployment_rate_difference_vs_us = st.number_input(
                 "Unemployment Rate Difference vs U.S. (%)",
-                value=float(defaults_for_scorecard["unemployment_rate_difference_vs_us"]),
+                value=parse_numeric_input(defaults_for_scorecard["unemployment_rate_difference_vs_us"], -0.3),
                 step=0.1,
             )
             population_growth_difference_vs_us = st.number_input(
                 "Population Growth Difference vs U.S. (%)",
-                value=float(defaults_for_scorecard["population_growth_difference_vs_us"]),
+                value=parse_numeric_input(defaults_for_scorecard["population_growth_difference_vs_us"], 0.5),
                 step=0.1,
             )
 
@@ -1089,20 +1136,20 @@ with tab_scorecard:
                 "Top 10 Taxpayers as % of Total Levy",
                 min_value=0.0,
                 max_value=100.0,
-                value=float(defaults_for_scorecard["top10_taxpayers_percent_of_total_levy"]),
+                value=parse_numeric_input(defaults_for_scorecard["top10_taxpayers_percent_of_total_levy"], 16.1),
                 step=0.1,
             )
             largest_taxpayer_percent_of_total_levy = st.number_input(
                 "Largest Taxpayer as % of Total Levy",
                 min_value=0.0,
                 max_value=100.0,
-                value=float(defaults_for_scorecard["largest_taxpayer_percent_of_total_levy"]),
+                value=parse_numeric_input(defaults_for_scorecard["largest_taxpayer_percent_of_total_levy"], 6.1),
                 step=0.1,
             )
             district_size_parcels = st.number_input(
                 "District Size (Parcels)",
                 min_value=0,
-                value=int(float(defaults_for_scorecard["district_size_parcels"])),
+                value=int(parse_numeric_input(defaults_for_scorecard["district_size_parcels"], 5900)),
                 step=100,
             )
 
@@ -1121,7 +1168,7 @@ with tab_scorecard:
             est_value_to_lien = st.number_input(
                 "Est. Value-to-Lien",
                 min_value=0.0,
-                value=float(defaults_for_scorecard["est_value_to_lien"]),
+                value=parse_numeric_input(defaults_for_scorecard["est_value_to_lien"], 15.5),
                 step=0.1,
             )
 
@@ -1130,7 +1177,7 @@ with tab_scorecard:
             "Maximum Loss-to-Maturity (MLTM) %",
             min_value=0.0,
             max_value=100.0,
-            value=float(defaults_for_scorecard["maximum_loss_to_maturity_percent"]),
+            value=parse_numeric_input(defaults_for_scorecard["maximum_loss_to_maturity_percent"], 13.9),
             step=0.1,
         )
 
