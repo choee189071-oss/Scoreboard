@@ -345,8 +345,57 @@ with tab_auto:
 with tab_docs:
     st.header("Document Upload & Parsing")
     st.write(
-        "Upload OS, appendices, taxpayer tables, debt service schedules, MLTM tables, or VTL workbooks. "
-        "AI extraction will only use these uploaded files."
+        "Upload the strongest available source documents first. "
+        "Not every file is required; the platform works best with a minimum viable evidence package."
+    )
+
+    st.subheader("Minimum Viable Evidence Checklist")
+
+    evidence_guidance = pd.DataFrame(
+        [
+            {
+                "Priority": "Required",
+                "Document Type": "OS / Appendix PDF",
+                "Why It Matters": "Usually contains core deal facts, taxpayer tables, assessed value, district description, debt service, and disclosures.",
+                "Typical File Types": "PDF",
+                "Workflow Treatment": "Upload first; AI extraction can use it as the main evidence source.",
+            },
+            {
+                "Priority": "Recommended",
+                "Document Type": "Debt Service Excel / Schedule",
+                "Why It Matters": "Useful for MLTM stress testing, amortization review, and cash flow analysis.",
+                "Typical File Types": "XLSX, XLS, CSV",
+                "Workflow Treatment": "Upload when doing formal financial profile work.",
+            },
+            {
+                "Priority": "Optional",
+                "Document Type": "MLTM Table",
+                "Why It Matters": "Supports maximum loss-to-maturity assumptions and stress test review.",
+                "Typical File Types": "XLSX, XLS, CSV, PDF",
+                "Workflow Treatment": "Upload if available; otherwise use the MLTM calculator tab.",
+            },
+            {
+                "Priority": "Optional",
+                "Document Type": "VTL Workbook",
+                "Why It Matters": "Supports value-to-lien calculation and debt burden review.",
+                "Typical File Types": "XLSX, XLS, CSV",
+                "Workflow Treatment": "Upload if available; otherwise use the Value-to-Lien calculator tab.",
+            },
+            {
+                "Priority": "Advanced",
+                "Document Type": "Assessor Export / County Data",
+                "Why It Matters": "Useful for deep-dive parcel, assessed value, or ownership analysis.",
+                "Typical File Types": "CSV, XLSX, XLS",
+                "Workflow Treatment": "Not needed for quick review; useful for advanced issuer/deal analysis.",
+            },
+        ]
+    )
+
+    st.dataframe(evidence_guidance, use_container_width=True, hide_index=True)
+
+    st.info(
+        "Quick-review mode: upload only the OS / Appendix PDF. "
+        "Formal-analysis mode: add debt service and MLTM/VTL support if available."
     )
 
     uploaded_files = st.file_uploader(
@@ -355,11 +404,87 @@ with tab_docs:
         accept_multiple_files=True,
     )
 
+    def classify_uploaded_file(file_name: str) -> str:
+        name = file_name.lower()
+
+        if any(term in name for term in ["os", "official", "statement", "appendix", "appx", "offering"]):
+            return "OS / Appendix PDF"
+
+        if any(term in name for term in ["debt service", "debt_service", "ds", "amort", "amortization"]):
+            return "Debt Service Excel / Schedule"
+
+        if any(term in name for term in ["mltm", "maximum loss", "loss to maturity", "stress"]):
+            return "MLTM Table"
+
+        if any(term in name for term in ["vtl", "value to lien", "value-to-lien", "lien"]):
+            return "VTL Workbook"
+
+        if any(term in name for term in ["assessor", "parcel", "county", "assessed value", "av"]):
+            return "Assessor Export / County Data"
+
+        return "Unclassified Source Document"
+
     if uploaded_files:
+        uploaded_summary = pd.DataFrame(
+            [
+                {
+                    "File Name": uploaded_file.name,
+                    "Detected Document Type": classify_uploaded_file(uploaded_file.name),
+                    "Size KB": round(uploaded_file.size / 1024, 1),
+                }
+                for uploaded_file in uploaded_files
+            ]
+        )
+
+        st.subheader("Uploaded Evidence Summary")
+        st.dataframe(uploaded_summary, use_container_width=True, hide_index=True)
+
+        detected_types = set(uploaded_summary["Detected Document Type"].tolist())
+
+        checklist_rows = []
+        required_items = [
+            ("Required", "OS / Appendix PDF"),
+            ("Recommended", "Debt Service Excel / Schedule"),
+            ("Optional", "MLTM Table"),
+            ("Optional", "VTL Workbook"),
+            ("Advanced", "Assessor Export / County Data"),
+        ]
+
+        for priority, doc_type in required_items:
+            if doc_type in detected_types:
+                status = "Available"
+            elif priority == "Required":
+                status = "Missing — upload if possible"
+            elif priority == "Recommended":
+                status = "Not uploaded — recommended for formal review"
+            else:
+                status = "Not uploaded — optional"
+
+            checklist_rows.append(
+                {
+                    "Priority": priority,
+                    "Document Type": doc_type,
+                    "Status": status,
+                }
+            )
+
+        st.subheader("Evidence Completeness")
+        checklist_df = pd.DataFrame(checklist_rows)
+        st.dataframe(checklist_df, use_container_width=True, hide_index=True)
+
+        if "OS / Appendix PDF" not in detected_types:
+            st.warning(
+                "No OS / Appendix PDF detected. You can still proceed, but AI extraction may have limited context."
+            )
+        else:
+            st.success("Core evidence detected: OS / Appendix PDF is available.")
+
         parsed_docs = []
         with st.spinner("Parsing uploaded documents..."):
             for uploaded_file in uploaded_files:
-                parsed_docs.append(read_uploaded_file_to_context(uploaded_file))
+                parsed_doc = read_uploaded_file_to_context(uploaded_file)
+                parsed_doc["detected_document_type"] = classify_uploaded_file(uploaded_file.name)
+                parsed_docs.append(parsed_doc)
 
         st.session_state["parsed_documents"] = parsed_docs
         st.success(f"Parsed {len(parsed_docs)} document(s).")
@@ -367,8 +492,10 @@ with tab_docs:
     parsed_docs = st.session_state.get("parsed_documents", [])
 
     if parsed_docs:
+        st.subheader("Parsed Document Preview")
         for doc in parsed_docs:
-            with st.expander(doc.get("file_name"), expanded=False):
+            title = f"{doc.get('file_name')} — {doc.get('detected_document_type', 'Unclassified')}"
+            with st.expander(title, expanded=False):
                 if doc.get("warnings"):
                     for warning in doc.get("warnings"):
                         st.warning(warning)
