@@ -17,6 +17,11 @@ criteria_type = st.sidebar.selectbox(
     ["General Fund", "Special Assessment", "Water / Wastewater"],
 )
 
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    "Prototype analytical tool. This is not an official S&P model."
+)
+
 st.write(f"Currently Selected: {criteria_type}")
 
 if criteria_type != "Special Assessment":
@@ -52,6 +57,7 @@ else:
                 "Population Growth Difference vs U.S. (%)",
                 value=0.0,
                 step=0.1,
+                help="Local population growth minus U.S. population growth.",
             )
 
         with col2:
@@ -125,12 +131,13 @@ else:
 
         st.subheader("C. Financial Profile")
 
-        financial_profile_score = st.number_input(
-            "Financial Profile Score",
-            min_value=1.0,
-            max_value=5.0,
-            value=3.0,
+        maximum_loss_to_maturity_percent = st.number_input(
+            "Maximum Loss to Maturity / MLTM (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=15.0,
             step=0.5,
+            help="Stress-test estimate of the maximum permanent revenue loss that can be sustained through maturity.",
         )
 
         inputs = {
@@ -144,22 +151,63 @@ else:
             "largest_taxpayer_percent_of_levy": largest_taxpayer_percent_of_levy,
             "number_of_parcels": number_of_parcels,
             "value_to_lien_ratio": value_to_lien_ratio,
-            "financial_profile_score": financial_profile_score,
+            "maximum_loss_to_maturity_percent": maximum_loss_to_maturity_percent,
         }
 
-        if st.button("Calculate Scorecard"):
+        if st.button("Calculate Scorecard", type="primary"):
             results = calculate_special_assessment_scorecard(inputs)
 
             st.subheader("Scorecard Results")
 
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3, m4, m5 = st.columns(5)
 
             m1.metric("Economic Fundamentals", results["economic_fundamentals_score"])
             m2.metric("District Characteristics", results["district_characteristics_score"])
             m3.metric("Financial Profile", results["financial_profile_score"])
-            m4.metric("Indicative Rating", results["final_indicative_rating"])
+            m4.metric("Weighted Score", results["weighted_score"])
+            m5.metric("Indicative Rating", results["final_indicative_rating"])
 
-            st.json(results)
+            st.markdown("### Factor Breakdown")
+
+            economic_df = pd.DataFrame(
+                [
+                    ["Income", results["income_score"]],
+                    ["Unemployment", results["unemployment_score"]],
+                    ["MSA", results["msa_score"]],
+                    ["Real Estate Market", results["real_estate_score"]],
+                    ["Population Trend", results["population_score"]],
+                ],
+                columns=["Economic Subfactor", "Score"],
+            )
+
+            district_df = pd.DataFrame(
+                [
+                    ["Top 10 Taxpayer Concentration", results["top10_taxpayer_concentration_score"]],
+                    ["Development Status", results["development_status_score"]],
+                    ["Largest Taxpayer Exposure", results["largest_taxpayer_exposure_score"]],
+                    ["District Size", results["district_size_score"]],
+                    ["Value To Lien", results["value_to_lien_score"]],
+                ],
+                columns=["District Subfactor", "Score"],
+            )
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.dataframe(economic_df, use_container_width=True)
+            with c2:
+                st.dataframe(district_df, use_container_width=True)
+
+            st.markdown("### Financial Profile Matrix Inputs")
+            st.write(
+                {
+                    "Top 10 taxpayer bucket": results["financial_top10_taxpayer_bucket"],
+                    "MLTM bucket": results["mltm_bucket"],
+                    "MLTM %": results["maximum_loss_to_maturity_percent"],
+                }
+            )
+
+            with st.expander("Raw Results JSON"):
+                st.json(results)
 
     else:
         st.subheader("Upload Financial Data")
@@ -191,7 +239,7 @@ else:
             df = read_uploaded_csv(uploaded_file)
 
             st.subheader("Preview Data")
-            st.dataframe(df)
+            st.dataframe(df, use_container_width=True)
 
             st.success("File uploaded successfully.")
 
@@ -199,4 +247,14 @@ else:
             results = calculate_special_assessment_scorecard(inputs)
 
             st.subheader("Scorecard Results")
-            st.json(results)
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+
+            m1.metric("Economic Fundamentals", results["economic_fundamentals_score"])
+            m2.metric("District Characteristics", results["district_characteristics_score"])
+            m3.metric("Financial Profile", results["financial_profile_score"])
+            m4.metric("Weighted Score", results["weighted_score"])
+            m5.metric("Indicative Rating", results["final_indicative_rating"])
+
+            with st.expander("Raw Results JSON"):
+                st.json(results)
