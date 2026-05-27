@@ -1,14 +1,15 @@
 # modules/scoring_special_assessment.py
 """
-Special Assessment Debt Credit Workstation Engine
+Special Assessment Debt Scorecard Engine
 
-This module supports a Streamlit-based Special Assessment Debt workstation with:
+Document-first platform version.
 
-1. Top 10 Taxpayer Concentration Builder
-2. Value-to-Lien Calculator
-3. Maximum Loss-to-Maturity (MLTM) Workspace
-4. Special Assessment Debt Scorecard
-5. Explanation Engine
+This module handles:
+1. Special Assessment Debt scoring
+2. Taxpayer concentration calculation
+3. Value-to-Lien calculation
+4. Simplified MLTM calculation
+5. Scorecard explanation generation
 
 Important:
 This is a prototype analyst-support tool. It is not an official S&P model.
@@ -17,10 +18,6 @@ This is a prototype analyst-support tool. It is not an official S&P model.
 from typing import Any, Dict, Optional
 import pandas as pd
 
-
-# =============================================================================
-# Core Framework
-# =============================================================================
 
 SPECIAL_ASSESSMENT_FACTOR_WEIGHTS = {
     "Economic Fundamentals Assessment": 0.15,
@@ -66,10 +63,6 @@ RATING_LADDER = [
     "bbb+", "bbb", "bbb-", "bb+", "bb", "bb-", "b category"
 ]
 
-
-# =============================================================================
-# Utility Functions
-# =============================================================================
 
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -138,7 +131,7 @@ def apply_rating_cap(rating: str, cap: Optional[str]) -> str:
 
 
 # =============================================================================
-# Analytical Workspace 1: Top 10 Taxpayer Concentration Builder
+# Analytical calculators
 # =============================================================================
 
 def calculate_taxpayer_concentration(taxpayer_df: pd.DataFrame) -> Dict[str, Any]:
@@ -176,10 +169,6 @@ def calculate_taxpayer_concentration(taxpayer_df: pd.DataFrame) -> Dict[str, Any
     }
 
 
-# =============================================================================
-# Analytical Workspace 2: Value-to-Lien Calculator
-# =============================================================================
-
 def calculate_value_to_lien(
     assessed_value: Any,
     direct_debt: Any,
@@ -203,10 +192,6 @@ def calculate_value_to_lien(
     }
 
 
-# =============================================================================
-# Analytical Workspace 3: MLTM Calculator
-# =============================================================================
-
 def calculate_mltm_from_cashflow(
     cashflow_df: pd.DataFrame,
     initial_reserve_fund: Any = 0.0,
@@ -215,6 +200,9 @@ def calculate_mltm_from_cashflow(
 ) -> Dict[str, Any]:
     """
     Simplified MLTM stress engine.
+
+    It estimates the maximum constant permanent revenue loss that still allows
+    aggregate revenues plus initial reserves to cover aggregate debt service.
     """
     if cashflow_df is None or cashflow_df.empty:
         return {
@@ -248,8 +236,7 @@ def calculate_mltm_from_cashflow(
             ),
         )
 
-    stressed_revenue = df[revenue_column] * (1 - mltm / 100)
-    df["stressed_special_tax_levy"] = stressed_revenue
+    df["stressed_special_tax_levy"] = df[revenue_column] * (1 - mltm / 100)
     df["annual_surplus_after_stress"] = df["stressed_special_tax_levy"] - df[debt_service_column]
     df["cumulative_surplus_after_stress"] = df["annual_surplus_after_stress"].cumsum() + initial_reserve
 
@@ -263,7 +250,7 @@ def calculate_mltm_from_cashflow(
 
 
 # =============================================================================
-# A. Economic Fundamentals Assessment
+# Economic Fundamentals
 # =============================================================================
 
 def assess_median_household_ebi(median_household_ebi_percent_of_us: Any) -> int:
@@ -385,7 +372,7 @@ def calculate_economic_fundamentals_assessment(inputs: Dict[str, Any]) -> Dict[s
 
 
 # =============================================================================
-# B. District Characteristics Assessment
+# District Characteristics
 # =============================================================================
 
 def assess_top10_taxpayers_percent_of_total_levy(top10_taxpayers_percent_of_total_levy: Any) -> int:
@@ -502,7 +489,7 @@ def calculate_district_characteristics_assessment(inputs: Dict[str, Any]) -> Dic
 
 
 # =============================================================================
-# C. Financial Profile Assessment
+# Financial Profile
 # =============================================================================
 
 def calculate_financial_profile_assessment(
@@ -562,7 +549,7 @@ def calculate_financial_profile_assessment(
 
 
 # =============================================================================
-# Overall Scorecard + Explanation Engine
+# Overall Scorecard + Explanation
 # =============================================================================
 
 def calculate_factor_score_weighted_average(
@@ -592,7 +579,7 @@ def build_scorecard_explanation(results: Dict[str, Any]) -> str:
     weighted = results["factor_score_weighted_average"]
     rating = results["indicative_rating"]
 
-    explanation = f"""
+    return f"""
 ### Why the Indicative Rating is {rating}
 
 The scorecard produces a **Factor Score Weighted Average of {weighted}**, which maps to an **Initial Indicative Rating of {results['initial_indicative_rating']}**.
@@ -625,7 +612,6 @@ The scorecard produces a **Factor Score Weighted Average of {weighted}**, which 
 - Rating cap: {results['rating_cap']}
 - Final indicative rating: **{rating}**
 """
-    return explanation
 
 
 def calculate_special_assessment_scorecard(inputs: Dict[str, Any]) -> Dict[str, Any]:
