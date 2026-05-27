@@ -17,15 +17,24 @@ from modules.document_ai_extraction import (
     DEFAULT_TARGETS,
     read_uploaded_file_to_context,
     run_document_ai_extraction,
-    extracted_fields_to_dataframe,
     derived_calculations_to_dataframe,
-    approved_fields_to_scorecard_inputs,
+)
+
+from modules.reliability_layer import (
+    combine_candidate_sources,
+    normalize_candidate_dataframe,
+    approved_candidates_to_scorecard_inputs,
+    missing_data_tracker,
+    source_priority_table,
+    build_reliability_summary,
 )
 
 st.set_page_config(page_title="Municipal Credit Analytics Platform", layout="wide")
 
 st.title("Municipal Credit Analytics Platform")
-st.caption("Unified workflow: Auto data pull + document extraction + analyst review + scorecard.")
+st.caption(
+    "Unified workflow with source reliability layer: Auto data pull + document extraction + analyst review + scorecard."
+)
 
 
 # =============================================================================
@@ -38,6 +47,7 @@ defaults = {
     "parsed_documents": [],
     "last_document_ai_result": None,
     "last_scorecard_results": None,
+    "review_candidates": pd.DataFrame(),
     "top10_taxpayers_percent_of_total_levy": 16.1,
     "largest_taxpayer_percent_of_total_levy": 6.1,
     "est_value_to_lien": 15.5,
@@ -50,7 +60,7 @@ for key, value in defaults.items():
 
 
 # =============================================================================
-# Sidebar: Clean Platform Control
+# Sidebar
 # =============================================================================
 
 st.sidebar.header("Scoreboard")
@@ -121,7 +131,6 @@ def merge_approved_inputs(new_inputs: dict):
     current.update(new_inputs)
     st.session_state["approved_inputs"] = current
 
-    # mirror key values into session state
     for key, value in new_inputs.items():
         st.session_state[key] = value
 
@@ -147,15 +156,40 @@ def get_default_scorecard_inputs():
     }
 
 
+def refresh_candidates():
+    candidates = combine_candidate_sources(
+        auto_results=st.session_state.get("auto_data_results", []),
+        document_ai_result=st.session_state.get("last_document_ai_result"),
+        manual_candidates=None,
+    )
+    st.session_state["review_candidates"] = candidates
+    return candidates
+
+
 def source_status_cards():
     auto_count = len(st.session_state.get("auto_data_results", []) or [])
     doc_count = len(st.session_state.get("parsed_documents", []) or [])
     approved_count = len(st.session_state.get("approved_inputs", {}) or {})
+    candidates = st.session_state.get("review_candidates", pd.DataFrame())
+    candidate_count = 0 if candidates is None or candidates.empty else len(candidates)
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Auto Data Sources Pulled", auto_count)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Auto Data Sources", auto_count)
     c2.metric("Parsed Documents", doc_count)
-    c3.metric("Approved Inputs", approved_count)
+    c3.metric("Candidate Inputs", candidate_count)
+    c4.metric("Approved Inputs", approved_count)
+
+
+def show_reliability_dashboard():
+    candidates = st.session_state.get("review_candidates", pd.DataFrame())
+    approved = st.session_state.get("approved_inputs", {}) or {}
+    summary = build_reliability_summary(candidates, approved)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Candidates", summary["total_candidates"])
+    c2.metric("Approved", summary["approved_candidates"])
+    c3.metric("High Confidence", summary["high_confidence_candidates"])
+    c4.metric("Missing Required", summary["missing_required_fields"])
 
 
 # =============================================================================
@@ -164,7 +198,7 @@ def source_status_cards():
 
 if scoreboard_type != "Special Assessment Debt":
     st.header(scoreboard_type)
-    st.info("This scoreboard type is reserved for the next build. The unified workflow shell is ready.")
+    st.info("This scoreboard type is reserved for the next build. The reliability workflow shell is ready.")
     st.stop()
 
 
@@ -178,10 +212,10 @@ tab_auto, tab_docs, tab_review, tab_scorecard, tab_calcs, tab_sources = st.tabs(
     [
         "1 Auto Data Pull",
         "2 Documents",
-        "3 Analyst Review",
+        "3 Reliability Review",
         "4 Scorecard",
         "5 Calculators",
-        "6 Sources",
+        "6 Sources & Evidence",
     ]
 )
 
@@ -237,15 +271,13 @@ with tab_auto:
 
         st.session_state["auto_data_results"] = bundle.get("results", [])
         merge_approved_inputs(bundle.get("approved_inputs", {}))
-        st.success("Auto data pull completed. Any scorecard-ready fields were saved for review.")
+        refresh_candidates()
+        st.success("Auto data pull completed. Candidate inputs were added to Reliability Review.")
 
     if st.session_state.get("auto_data_results"):
         st.subheader("Auto Data Results")
         auto_df = auto_data_results_to_dataframe(st.session_state["auto_data_results"])
         st.dataframe(auto_df, use_container_width=True)
-
-        with st.expander("Auto-approved scorecard inputs"):
-            st.json(st.session_state.get("approved_inputs", {}))
 
     st.markdown("### Connector Strategy")
     st.dataframe(
@@ -309,87 +341,132 @@ with tab_docs:
 
 
 # =============================================================================
-# Tab 3: Analyst Review
+# Tab 3: Reliability Review
 # =============================================================================
 
 with tab_review:
-    st.header("AI Extraction + Analyst Review")
+    st.header("Reliability Review")
+    st.write(
+        "Candidate values from auto connectors and document AI extraction are reviewed here. "
+        "Only approved final values feed the scorecard."
+    )
+
+    show_reliability_dashboard()
 
     parsed_docs = st.session_state.get("parsed_documents", [])
 
-    try:
-        default_openai_key = st.secrets.get("OPENAI_API_KEY", "")
-    except Exception:
-        default_openai_key = ""
+    with st.expander("Run Document AI Extraction", expanded=False):
+        try:
+            default_openai_key = st.secrets.get("OPENAI_API_KEY", "")
+        except Exception:
+            default_openai_key = ""
 
-    col1, col2 = st.columns(2)
+        col1, col2 = st.columns(2)
 
-    with col1:
-        issuer_name = st.text_input("Issuer / District Name", value="Laguna Ridge CFD")
-        state = st.text_input("State", value="CA")
-        county_or_region = st.text_input("County / Region", value="Sacramento County")
-        bond_type = st.selectbox("Bond Type", ["Special Assessment Debt", "CFD / Mello-Roos", "Special Tax Bonds"])
+        with col1:
+            issuer_name = st.text_input("Issuer / District Name", value="Laguna Ridge CFD")
+            state = st.text_input("State", value="CA")
+            county_or_region = st.text_input("County / Region", value="Sacramento County")
+            bond_type = st.selectbox("Bond Type", ["Special Assessment Debt", "CFD / Mello-Roos", "Special Tax Bonds"])
 
-    with col2:
-        model = st.selectbox("OpenAI Model", ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"], index=0)
-        api_key_input = st.text_input("OpenAI API Key Override", type="password", value="")
-        use_ai = st.checkbox("Use AI extraction", value=True)
+        with col2:
+            model = st.selectbox("OpenAI Model", ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"], index=0)
+            api_key_input = st.text_input("OpenAI API Key Override", type="password", value="")
 
-    selected_targets = st.multiselect("Fields to Extract from Uploaded Documents", DEFAULT_TARGETS, default=DEFAULT_TARGETS)
+        selected_targets = st.multiselect("Fields to Extract from Uploaded Documents", DEFAULT_TARGETS, default=DEFAULT_TARGETS)
 
-    if not parsed_docs:
-        st.warning("Upload documents first in Tab 2. You can still review auto-pulled fields below.")
+        if not parsed_docs:
+            st.warning("Upload documents first in Tab 2.")
 
-    if st.button("Run Document Extraction", type="primary", disabled=not parsed_docs or not use_ai):
-        with st.spinner("Extracting scorecard candidates from uploaded documents..."):
-            result = run_document_ai_extraction(
-                issuer_name=issuer_name,
-                state=state,
-                county_or_region=county_or_region,
-                bond_type=bond_type,
-                selected_targets=selected_targets,
-                parsed_docs=parsed_docs,
-                api_key=api_key_input or default_openai_key,
-                model=model,
-            )
+        if st.button("Run Document Extraction", type="primary", disabled=not parsed_docs):
+            with st.spinner("Extracting scorecard candidates from uploaded documents..."):
+                result = run_document_ai_extraction(
+                    issuer_name=issuer_name,
+                    state=state,
+                    county_or_region=county_or_region,
+                    bond_type=bond_type,
+                    selected_targets=selected_targets,
+                    parsed_docs=parsed_docs,
+                    api_key=api_key_input or default_openai_key,
+                    model=model,
+                )
 
-        st.session_state["last_document_ai_result"] = result
+            st.session_state["last_document_ai_result"] = result
+            refresh_candidates()
 
-    result = st.session_state.get("last_document_ai_result")
+            if not result.get("ok", False):
+                st.error(result.get("error", "Document extraction failed."))
+            else:
+                st.success("Document extraction completed. Candidate inputs added below.")
 
-    if result:
-        if not result.get("ok", False):
-            st.error(result.get("error", "Document extraction failed."))
-            if "raw_response" in result:
-                with st.expander("Raw AI Response"):
-                    st.write(result["raw_response"])
-        else:
-            st.success("Document extraction completed.")
+    if st.button("Refresh Candidate Inputs"):
+        refresh_candidates()
+        st.success("Candidates refreshed.")
 
-        st.markdown("### Candidate Extracted Values")
-        extracted_df = extracted_fields_to_dataframe(result)
+    candidates = st.session_state.get("review_candidates", pd.DataFrame())
+    candidates = normalize_candidate_dataframe(candidates)
 
-        reviewed_df = st.data_editor(
-            extracted_df,
-            use_container_width=True,
-            num_rows="dynamic",
-            key="review_extracted_values",
-        )
-
-        st.markdown("### Derived Calculations")
-        derived_df = derived_calculations_to_dataframe(result)
-        st.dataframe(derived_df, use_container_width=True)
-
-        if st.button("Approve Selected Extracted Values"):
-            approved_inputs = approved_fields_to_scorecard_inputs(reviewed_df)
-            merge_approved_inputs(approved_inputs)
-            st.success("Approved extracted values saved to scorecard inputs.")
-
-    st.markdown("### Current Approved Inputs")
-    approved_df = pd.DataFrame(
-        [{"scorecard_key": k, "value": v} for k, v in (st.session_state.get("approved_inputs", {}) or {}).items()]
+    st.markdown("### Candidate Input Review Table")
+    st.caption(
+        "Edit approve/reject, analyst override fields, and notes. "
+        "The final value uses analyst override first, then extracted numeric value, then extracted raw value."
     )
-    st.dataframe(approved_df, use_container_width=True)
+
+    reviewed_df = st.data_editor(
+        candidates,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="reliability_review_table",
+        column_config={
+            "source_excerpt": st.column_config.TextColumn("source_excerpt", width="large"),
+            "notes": st.column_config.TextColumn("notes", width="large"),
+            "confidence": st.column_config.NumberColumn("confidence", min_value=0.0, max_value=1.0, step=0.05),
+            "source_priority": st.column_config.NumberColumn("source_priority", disabled=True),
+            "confidence_label": st.column_config.TextColumn("confidence_label", disabled=True),
+            "review_status": st.column_config.TextColumn("review_status", disabled=True),
+            "final_value": st.column_config.TextColumn("final_value", disabled=True),
+        },
+    )
+
+    reviewed_df = normalize_candidate_dataframe(reviewed_df)
+    st.session_state["review_candidates"] = reviewed_df
+
+    if st.button("Approve Reviewed Values to Scorecard", type="primary"):
+        approved_inputs = approved_candidates_to_scorecard_inputs(reviewed_df)
+        merge_approved_inputs(approved_inputs)
+        st.success("Approved reviewed values saved to scorecard inputs.")
+
+    st.markdown("### Missing Data Tracker")
+    missing_df = missing_data_tracker(st.session_state.get("approved_inputs", {}))
+    st.dataframe(missing_df, use_container_width=True)
+
+    st.markdown("### Evidence Viewer")
+    if reviewed_df.empty:
+        st.info("No candidate evidence available yet.")
+    else:
+        candidate_labels = [
+            f"{idx}: {row['scorecard_field']} | {row['value']} | {row['source_document']}"
+            for idx, row in reviewed_df.iterrows()
+        ]
+        selected_label = st.selectbox("Select Evidence Item", candidate_labels)
+        selected_idx = int(selected_label.split(":")[0])
+        selected = reviewed_df.loc[selected_idx].to_dict()
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("**Field:**", selected.get("scorecard_field"))
+            st.write("**Extracted Value:**", selected.get("value"))
+            st.write("**Final Value:**", selected.get("final_value"))
+            st.write("**Confidence:**", selected.get("confidence_label"), selected.get("confidence"))
+            st.write("**Source Priority:**", selected.get("source_priority"))
+        with c2:
+            st.write("**Source Type:**", selected.get("source_type"))
+            st.write("**Source Document:**", selected.get("source_document"))
+            st.write("**Source URL:**", selected.get("source_url"))
+            st.write("**Review Status:**", selected.get("review_status"))
+
+        st.text_area("Source Excerpt", selected.get("source_excerpt", ""), height=180)
+        st.text_area("Analyst Notes", selected.get("notes", ""), height=120)
 
 
 # =============================================================================
@@ -404,7 +481,7 @@ with tab_scorecard:
     if workflow_mode == "Manual Input Only":
         st.info("Manual mode: edit values directly below.")
     else:
-        st.info("Integrated mode: values below may be prefilled from Auto Data Pull or approved document extraction.")
+        st.info("Integrated mode: values below may be prefilled from approved Reliability Review inputs.")
 
     with st.expander("A. Economic Fundamentals Assessment", expanded=True):
         col1, col2 = st.columns(2)
@@ -556,12 +633,11 @@ with tab_calcs:
 
         if st.button("Calculate Taxpayer Concentration"):
             concentration = calculate_taxpayer_concentration(taxpayer_df)
-            merge_approved_inputs(
-                {
-                    "top10_taxpayers_percent_of_total_levy": concentration["top10_taxpayers_percent_of_total_levy"],
-                    "largest_taxpayer_percent_of_total_levy": concentration["largest_taxpayer_percent_of_total_levy"],
-                }
-            )
+            new_inputs = {
+                "top10_taxpayers_percent_of_total_levy": concentration["top10_taxpayers_percent_of_total_levy"],
+                "largest_taxpayer_percent_of_total_levy": concentration["largest_taxpayer_percent_of_total_levy"],
+            }
+            merge_approved_inputs(new_inputs)
             c1, c2 = st.columns(2)
             c1.metric("Top 10 Taxpayers %", concentration["top10_taxpayers_percent_of_total_levy"])
             c2.metric("Largest Taxpayer %", concentration["largest_taxpayer_percent_of_total_levy"])
@@ -612,29 +688,32 @@ with tab_calcs:
 
 
 # =============================================================================
-# Tab 6: Sources
+# Tab 6: Sources & Evidence
 # =============================================================================
 
 with tab_sources:
-    st.header("Source / Evidence Manager")
+    st.header("Sources & Evidence")
+
+    st.subheader("Source Priority Engine")
+    st.dataframe(source_priority_table(), use_container_width=True)
+
+    st.subheader("Missing Data Tracker")
+    st.dataframe(missing_data_tracker(st.session_state.get("approved_inputs", {})), use_container_width=True)
 
     st.subheader("Approved Scorecard Inputs")
     approved = st.session_state.get("approved_inputs", {}) or {}
     approved_df = pd.DataFrame([{"scorecard_key": k, "value": v} for k, v in approved.items()])
     st.dataframe(approved_df, use_container_width=True)
 
+    st.subheader("Candidate Evidence")
+    candidates = normalize_candidate_dataframe(st.session_state.get("review_candidates", pd.DataFrame()))
+    st.dataframe(candidates, use_container_width=True)
+
     st.subheader("Auto Data Results")
     if st.session_state.get("auto_data_results"):
         st.dataframe(auto_data_results_to_dataframe(st.session_state["auto_data_results"]), use_container_width=True)
     else:
         st.info("No auto data results yet.")
-
-    st.subheader("Document Extraction Evidence")
-    result = st.session_state.get("last_document_ai_result")
-    if result:
-        st.dataframe(extracted_fields_to_dataframe(result), use_container_width=True)
-    else:
-        st.info("No document extraction results yet.")
 
     if st.session_state.get("last_scorecard_results"):
         st.subheader("Latest Scorecard Explanation")
