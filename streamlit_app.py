@@ -14,7 +14,6 @@ criteria_type = st.sidebar.selectbox(
 )
 st.write(f"Currently Selected: {criteria_type}")
 
-
 import pandas as pd
 st.subheader("Upload Financial Data")
 uploaded_file = st.file_uploader(
