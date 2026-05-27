@@ -2,21 +2,23 @@
 """
 Special Assessment Debt Scorecard Engine
 
-Structured analyst-support implementation of a Special Assessment Debt workflow:
+This file is designed to sit inside:
 
-1. Economic Fundamentals Assessment
-2. District Characteristics Assessment
-3. Financial Profile Assessment / Maximum Loss-to-Maturity (MLTM) Matrix
-4. Factor Score Weighted Average
-5. Initial Indicative Rating
-6. Overriding Factors / Caps / Holistic Analysis placeholders
+    modules/scoring_special_assessment.py
+
+It supports the Streamlit Special Assessment Debt scorecard workflow and uses
+terms aligned with the sample scorecard / S&P-style methodology language.
 
 Important:
-This is a prototype analytical tool. It is not an official S&P model.
+This is a prototype analyst-support tool. It is not an official S&P model.
 """
 
 from typing import Any, Dict, Optional
 
+
+# =============================================================================
+# Core Framework
+# =============================================================================
 
 SPECIAL_ASSESSMENT_FACTOR_WEIGHTS = {
     "Economic Fundamentals Assessment": 0.15,
@@ -25,19 +27,19 @@ SPECIAL_ASSESSMENT_FACTOR_WEIGHTS = {
 }
 
 ECONOMIC_FUNDAMENTALS_SUBFACTOR_WEIGHTS = {
-    "Household Income Levels": 0.20,
+    "Median Household EBI": 0.20,
     "Unemployment Rate": 0.20,
-    "Participation in Broad and Diverse MSA": 0.20,
-    "Real Estate Market Characteristics": 0.20,
-    "Population Trends": 0.20,
+    "MSA Participation": 0.20,
+    "Real Estate Market Volatility": 0.20,
+    "Population Growth": 0.20,
 }
 
 DISTRICT_CHARACTERISTICS_SUBFACTOR_WEIGHTS = {
     "Top 10 Taxpayers as % of Total Levy": 0.25,
-    "Conveyance to Homeowners / Development Status": 0.25,
+    "Conveyance to Homeowners": 0.25,
     "Largest Taxpayer as % of Total Levy": 0.20,
     "District Size (Parcels)": 0.15,
-    "Estimated Value-to-Lien Ratio": 0.15,
+    "Est. Value-to-Lien": 0.15,
 }
 
 INITIAL_INDICATIVE_RATING_SCALE = [
@@ -58,12 +60,29 @@ INITIAL_INDICATIVE_RATING_SCALE = [
 ]
 
 RATING_LADDER = [
-    "aaa", "aa+", "aa", "aa-", "a+", "a", "a-",
-    "bbb+", "bbb", "bbb-", "bb+", "bb", "bb-", "b category"
+    "aaa",
+    "aa+",
+    "aa",
+    "aa-",
+    "a+",
+    "a",
+    "a-",
+    "bbb+",
+    "bbb",
+    "bbb-",
+    "bb+",
+    "bb",
+    "bb-",
+    "b category",
 ]
 
 
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
 def safe_float(value: Any, default: float = 3.0) -> float:
+    """Safely convert values to float."""
     try:
         if value is None or value == "":
             return float(default)
@@ -73,10 +92,28 @@ def safe_float(value: Any, default: float = 3.0) -> float:
 
 
 def normalize_text(value: Any) -> str:
-    return str(value).lower().strip().replace(" ", "_").replace("-", "_").replace("/", "_")
+    """
+    Normalize labels from Streamlit dropdowns / CSV uploads.
+
+    This allows the function to accept both:
+    - human-readable scorecard terms
+    - machine-readable snake_case terms
+    """
+    text = str(value).lower().strip()
+    text = text.replace("&", "and")
+    text = text.replace("/", " ")
+    text = text.replace("-", " ")
+    text = text.replace(";", " ")
+    text = text.replace(",", " ")
+    text = text.replace("(", " ")
+    text = text.replace(")", " ")
+    text = text.replace("%", " percent ")
+    text = " ".join(text.split())
+    return text.replace(" ", "_")
 
 
 def assessment_to_category(numeric_assessment: float) -> str:
+    """Convert numeric assessment to descriptor."""
     if numeric_assessment <= 1.5:
         return "Very Strong"
     if numeric_assessment <= 2.5:
@@ -105,28 +142,41 @@ def notch_rating(rating: str, notches: int) -> str:
 def apply_rating_cap(rating: str, cap: Optional[str]) -> str:
     """
     Apply a rating cap by preventing the rating from being better than the cap.
-    Example: cap='bb' means aaa through bb+ are capped at bb.
+
+    Example:
+        rating = "a-"
+        cap = "bb"
+        output = "bb"
     """
     if not cap or cap == "None":
         return rating
+
     if rating not in RATING_LADDER or cap not in RATING_LADDER:
         return rating
 
     rating_index = RATING_LADDER.index(rating)
     cap_index = RATING_LADDER.index(cap)
 
+    # Larger index = weaker rating.
     if rating_index < cap_index:
         return cap
+
     return rating
 
 
-# ---------------------------------------------------------------------
+# =============================================================================
 # A. Economic Fundamentals Assessment
-# ---------------------------------------------------------------------
+# =============================================================================
 
-def assess_household_income_levels(median_household_ebi_percent_of_us: Any) -> int:
+def assess_median_household_ebi(median_household_ebi_percent_of_us: Any) -> int:
     """
-    Median household effective buying income as % of U.S.
+    Median Household EBI as % of U.S.
+
+    Very Strong: >150%
+    Strong: 110%-150%
+    Adequate: 85%-110%
+    Weak: 70%-85%
+    Very Weak: <70%
     """
     value = safe_float(median_household_ebi_percent_of_us, default=100)
 
@@ -144,7 +194,11 @@ def assess_household_income_levels(median_household_ebi_percent_of_us: Any) -> i
 def assess_unemployment_rate(unemployment_rate_difference_vs_us: Any) -> int:
     """
     Local unemployment rate minus national unemployment rate.
-    Example: local 3%, U.S. 5% => -2.
+
+    Example:
+        Local unemployment = 4.1%
+        U.S. unemployment = 4.4%
+        Difference = -0.3%
     """
     delta = safe_float(unemployment_rate_difference_vs_us, default=0)
 
@@ -161,51 +215,68 @@ def assess_unemployment_rate(unemployment_rate_difference_vs_us: Any) -> int:
 
 def assess_msa_participation(msa_participation: Any) -> int:
     """
-    Options:
-    - broad_diverse_msa
-    - moderate_msa
-    - not_broad_diverse_msa
-    - not_in_msa
+    MSA Participation.
+
+    Accepted labels include:
+    - Yes; Broad & Diverse
+    - Yes; Not Broad & Diverse
+    - No
     """
     status = normalize_text(msa_participation)
 
     mapping = {
-        "broad_diverse_msa": 1,
-        "broad_and_diverse_msa": 1,
+        "yes_broad_and_diverse": 1,
+        "broad_and_diverse": 1,
         "broad_diverse": 1,
-        "moderate_msa": 2,
+        "broad_diverse_msa": 1,
+
         "moderate": 2,
-        "not_broad_diverse_msa": 3,
-        "not_broad_and_diverse_msa": 3,
+        "moderate_msa": 2,
+
+        "yes_not_broad_and_diverse": 3,
+        "not_broad_and_diverse": 3,
         "not_broad_diverse": 3,
+        "not_broad_diverse_msa": 3,
+
+        "no": 4,
         "not_in_msa": 4,
         "not_part_of_msa": 4,
-        "not_part_of_an_msa": 4,
     }
 
     return mapping.get(status, 3)
 
 
-def assess_real_estate_market_characteristics(real_estate_market_characteristics: Any) -> int:
+def assess_real_estate_market_volatility(real_estate_market_volatility: Any) -> int:
     """
-    Options:
-    - stable_low_volatility
-    - stable_moderate
-    - elevated_volatility
-    - falling_prices
-    - distressed
+    Real Estate Market Volatility / Characteristics.
+
+    Accepted scorecard-style labels include:
+    - Low Volatility; Stable Prices; Low Distress
+    - Elevated Volatility; Stable Prices; Affordability Worse Than National Figures
+    - Falling Local Home Prices; High Price Volatility; Low Affordability; Rising Distress
+    - Falling Local Home Prices; High Price Volatility; Significantly Worse Affordability; Rising Distress
     """
-    status = normalize_text(real_estate_market_characteristics)
+    status = normalize_text(real_estate_market_volatility)
 
     mapping = {
+        "low_volatility_stable_prices_low_distress": 1,
         "stable_low_volatility": 1,
         "low_volatility": 1,
+
+        # In the sample matrix, the "Strong" real estate box can still describe
+        # low volatility / stable prices / low distress.
+        "low_volatility_stable_prices_low_distress_strong": 2,
         "stable_moderate": 2,
         "stable": 2,
+
+        "elevated_volatility_stable_prices_affordability_worse_than_national_figures": 3,
         "elevated_volatility": 3,
         "average": 3,
+
+        "falling_local_home_prices_high_price_volatility_low_affordability_rising_distress": 4,
         "falling_prices": 4,
-        "falling_local_home_prices": 4,
+
+        "falling_local_home_prices_high_price_volatility_significantly_worse_affordability_rising_distress": 5,
         "distressed": 5,
         "high_distress": 5,
     }
@@ -213,10 +284,11 @@ def assess_real_estate_market_characteristics(real_estate_market_characteristics
     return mapping.get(status, 3)
 
 
-def assess_population_trends(population_growth_difference_vs_us: Any) -> int:
+def assess_population_growth(population_growth_difference_vs_us: Any) -> int:
     """
-    Local population growth minus U.S. population growth.
-    Positive means growing faster than the U.S.
+    Population Growth relative to U.S. growth.
+
+    Positive = higher than national growth rate.
     """
     delta = safe_float(population_growth_difference_vs_us, default=0)
 
@@ -232,48 +304,64 @@ def assess_population_trends(population_growth_difference_vs_us: Any) -> int:
 
 
 def calculate_economic_fundamentals_assessment(inputs: Dict[str, Any]) -> Dict[str, Any]:
-    income_assessment = assess_household_income_levels(
+    median_household_ebi_assessment = assess_median_household_ebi(
         inputs.get("median_household_ebi_percent_of_us", inputs.get("ebi_percent_of_us", 100))
     )
-    unemployment_assessment = assess_unemployment_rate(
+
+    unemployment_rate_assessment = assess_unemployment_rate(
         inputs.get("unemployment_rate_difference_vs_us", inputs.get("unemployment_delta_vs_us", 0))
     )
-    msa_assessment = assess_msa_participation(
-        inputs.get("msa_participation", inputs.get("msa_status", "not_broad_diverse_msa"))
+
+    msa_participation_assessment = assess_msa_participation(
+        inputs.get("msa_participation", inputs.get("msa_status", "Yes; Not Broad & Diverse"))
     )
-    real_estate_assessment = assess_real_estate_market_characteristics(
-        inputs.get("real_estate_market_characteristics", inputs.get("real_estate_status", "stable_moderate"))
+
+    real_estate_market_volatility_assessment = assess_real_estate_market_volatility(
+        inputs.get(
+            "real_estate_market_volatility",
+            inputs.get("real_estate_market_characteristics", inputs.get("real_estate_status", "Stable")),
+        )
     )
-    population_assessment = assess_population_trends(
+
+    population_growth_assessment = assess_population_growth(
         inputs.get("population_growth_difference_vs_us", inputs.get("population_growth_vs_us", 0))
     )
 
     numeric_assessment = (
-        income_assessment * ECONOMIC_FUNDAMENTALS_SUBFACTOR_WEIGHTS["Household Income Levels"]
-        + unemployment_assessment * ECONOMIC_FUNDAMENTALS_SUBFACTOR_WEIGHTS["Unemployment Rate"]
-        + msa_assessment * ECONOMIC_FUNDAMENTALS_SUBFACTOR_WEIGHTS["Participation in Broad and Diverse MSA"]
-        + real_estate_assessment * ECONOMIC_FUNDAMENTALS_SUBFACTOR_WEIGHTS["Real Estate Market Characteristics"]
-        + population_assessment * ECONOMIC_FUNDAMENTALS_SUBFACTOR_WEIGHTS["Population Trends"]
+        median_household_ebi_assessment * ECONOMIC_FUNDAMENTALS_SUBFACTOR_WEIGHTS["Median Household EBI"]
+        + unemployment_rate_assessment * ECONOMIC_FUNDAMENTALS_SUBFACTOR_WEIGHTS["Unemployment Rate"]
+        + msa_participation_assessment * ECONOMIC_FUNDAMENTALS_SUBFACTOR_WEIGHTS["MSA Participation"]
+        + real_estate_market_volatility_assessment * ECONOMIC_FUNDAMENTALS_SUBFACTOR_WEIGHTS["Real Estate Market Volatility"]
+        + population_growth_assessment * ECONOMIC_FUNDAMENTALS_SUBFACTOR_WEIGHTS["Population Growth"]
     )
 
     numeric_assessment = round(numeric_assessment, 2)
 
     return {
-        "household_income_levels_assessment": income_assessment,
-        "unemployment_rate_assessment": unemployment_assessment,
-        "msa_participation_assessment": msa_assessment,
-        "real_estate_market_characteristics_assessment": real_estate_assessment,
-        "population_trends_assessment": population_assessment,
+        "median_household_ebi_assessment": median_household_ebi_assessment,
+        "unemployment_rate_assessment": unemployment_rate_assessment,
+        "msa_participation_assessment": msa_participation_assessment,
+        "real_estate_market_volatility_assessment": real_estate_market_volatility_assessment,
+        "population_growth_assessment": population_growth_assessment,
         "economic_fundamentals_assessment": numeric_assessment,
         "economic_fundamentals_assessment_category": assessment_to_category(numeric_assessment),
     }
 
 
-# ---------------------------------------------------------------------
+# =============================================================================
 # B. District Characteristics Assessment
-# ---------------------------------------------------------------------
+# =============================================================================
 
 def assess_top10_taxpayers_percent_of_total_levy(top10_taxpayers_percent_of_total_levy: Any) -> int:
+    """
+    Top 10 Taxpayers as % of Total Levy.
+
+    Very Strong: <5%
+    Strong: 5%-15%
+    Adequate: 15%-25%
+    Weak: 25%-40%
+    Very Weak: >40%
+    """
     value = safe_float(top10_taxpayers_percent_of_total_levy, default=25)
 
     if value < 5:
@@ -287,30 +375,55 @@ def assess_top10_taxpayers_percent_of_total_levy(top10_taxpayers_percent_of_tota
     return 5
 
 
-def assess_conveyance_to_homeowners_development_status(conveyance_development_status: Any) -> int:
-    status = normalize_text(conveyance_development_status)
+def assess_conveyance_to_homeowners(conveyance_to_homeowners: Any) -> int:
+    """
+    Conveyance to Homeowners / Developer Concentration.
+
+    Accepted scorecard-style labels:
+    - All or Nearly All Conveyed
+    - Most Conveyed
+    - Fairly Developed with Significant Conveyance (Some Developer Concentration)
+    - Developed; Significant Undeveloped Parcels Comprise Minority (Large Developer Concentration)
+    - Undeveloped with Limited Vertical Construction; High Concentration
+    """
+    status = normalize_text(conveyance_to_homeowners)
 
     mapping = {
-        "built_out_all_end_users": 1,
         "all_or_nearly_all_conveyed": 1,
-        "substantially_built_out": 1,
-        "built_out_most_end_users": 2,
+        "all_nearly_all_conveyed": 1,
+        "built_out_all_end_users": 1,
+
         "most_conveyed": 2,
-        "mostly_built_out": 2,
-        "mature_some_developer_concentration": 3,
+        "built_out_most_end_users": 2,
+
+        "fairly_developed_with_significant_conveyance_some_developer_concentration": 3,
         "fairly_developed": 3,
-        "mixed": 3,
+        "mature_some_developer_concentration": 3,
+        "some_developer_concentration": 3,
+
+        "developed_significant_undeveloped_parcels_comprise_minority_large_developer_concentration": 4,
         "majority_developed_significant_undeveloped": 4,
-        "developed_significant_undeveloped": 4,
+        "large_developer_concentration": 4,
+
+        "undeveloped_with_limited_vertical_construction_high_concentration": 5,
         "new_majority_undeveloped": 5,
         "undeveloped": 5,
-        "limited_vertical_construction": 5,
+        "high_concentration": 5,
     }
 
     return mapping.get(status, 3)
 
 
 def assess_largest_taxpayer_percent_of_total_levy(largest_taxpayer_percent_of_total_levy: Any) -> int:
+    """
+    Largest Taxpayer as % of Total Levy.
+
+    Very Strong: <1%
+    Strong: 1%-3%
+    Adequate: 3%-8%
+    Weak: 8%-15%
+    Very Weak: >15%
+    """
     value = safe_float(largest_taxpayer_percent_of_total_levy, default=8)
 
     if value <= 1:
@@ -325,6 +438,15 @@ def assess_largest_taxpayer_percent_of_total_levy(largest_taxpayer_percent_of_to
 
 
 def assess_district_size_parcels(district_size_parcels: Any) -> int:
+    """
+    District Size (Parcels).
+
+    Very Strong: 4,000+
+    Strong: 1,500-4,000
+    Adequate: 400-1,500
+    Weak: 200-400
+    Very Weak: <200
+    """
     parcels = safe_float(district_size_parcels, default=1000)
 
     if parcels > 4000:
@@ -338,8 +460,21 @@ def assess_district_size_parcels(district_size_parcels: Any) -> int:
     return 5
 
 
-def assess_estimated_value_to_lien_ratio(estimated_value_to_lien_ratio: Any) -> int:
-    ratio = safe_float(estimated_value_to_lien_ratio, default=10)
+def assess_est_value_to_lien(est_value_to_lien: Any) -> int:
+    """
+    Est. Value-to-Lien.
+
+    Very Strong: >40x
+    Strong: 20x-40x
+    Adequate: 10x-20x
+    Weak: <10x
+    Very Weak: <10x with significant portion of parcels carrying VTL <5x
+
+    Because the system currently only receives a single VTL ratio, this function maps:
+    5x-10x => Weak
+    <5x => Very Weak
+    """
+    ratio = safe_float(est_value_to_lien, default=10)
 
     if ratio > 40:
         return 1
@@ -356,55 +491,72 @@ def calculate_district_characteristics_assessment(inputs: Dict[str, Any]) -> Dic
     top10_assessment = assess_top10_taxpayers_percent_of_total_levy(
         inputs.get("top10_taxpayers_percent_of_total_levy", inputs.get("top10_taxpayer_percent_of_levy", 25))
     )
-    conveyance_assessment = assess_conveyance_to_homeowners_development_status(
-        inputs.get("conveyance_to_homeowners_development_status", inputs.get("development_status", "mature_some_developer_concentration"))
+
+    conveyance_assessment = assess_conveyance_to_homeowners(
+        inputs.get(
+            "conveyance_to_homeowners",
+            inputs.get(
+                "conveyance_to_homeowners_development_status",
+                inputs.get("development_status", "Fairly Developed with Significant Conveyance (Some Developer Concentration)"),
+            ),
+        )
     )
+
     largest_taxpayer_assessment = assess_largest_taxpayer_percent_of_total_levy(
         inputs.get("largest_taxpayer_percent_of_total_levy", inputs.get("largest_taxpayer_percent_of_levy", 8))
     )
+
     district_size_assessment = assess_district_size_parcels(
         inputs.get("district_size_parcels", inputs.get("number_of_parcels", 1000))
     )
-    value_to_lien_assessment = assess_estimated_value_to_lien_ratio(
-        inputs.get("estimated_value_to_lien_ratio", inputs.get("value_to_lien_ratio", 10))
+
+    est_value_to_lien_assessment = assess_est_value_to_lien(
+        inputs.get(
+            "est_value_to_lien",
+            inputs.get("estimated_value_to_lien_ratio", inputs.get("value_to_lien_ratio", 10)),
+        )
     )
 
     numeric_assessment = (
         top10_assessment * DISTRICT_CHARACTERISTICS_SUBFACTOR_WEIGHTS["Top 10 Taxpayers as % of Total Levy"]
-        + conveyance_assessment * DISTRICT_CHARACTERISTICS_SUBFACTOR_WEIGHTS["Conveyance to Homeowners / Development Status"]
+        + conveyance_assessment * DISTRICT_CHARACTERISTICS_SUBFACTOR_WEIGHTS["Conveyance to Homeowners"]
         + largest_taxpayer_assessment * DISTRICT_CHARACTERISTICS_SUBFACTOR_WEIGHTS["Largest Taxpayer as % of Total Levy"]
         + district_size_assessment * DISTRICT_CHARACTERISTICS_SUBFACTOR_WEIGHTS["District Size (Parcels)"]
-        + value_to_lien_assessment * DISTRICT_CHARACTERISTICS_SUBFACTOR_WEIGHTS["Estimated Value-to-Lien Ratio"]
+        + est_value_to_lien_assessment * DISTRICT_CHARACTERISTICS_SUBFACTOR_WEIGHTS["Est. Value-to-Lien"]
     )
 
     numeric_assessment = round(numeric_assessment, 2)
 
     return {
         "top10_taxpayers_percent_of_total_levy_assessment": top10_assessment,
-        "conveyance_to_homeowners_development_status_assessment": conveyance_assessment,
+        "conveyance_to_homeowners_assessment": conveyance_assessment,
         "largest_taxpayer_percent_of_total_levy_assessment": largest_taxpayer_assessment,
         "district_size_parcels_assessment": district_size_assessment,
-        "estimated_value_to_lien_ratio_assessment": value_to_lien_assessment,
+        "est_value_to_lien_assessment": est_value_to_lien_assessment,
         "district_characteristics_assessment": numeric_assessment,
         "district_characteristics_assessment_category": assessment_to_category(numeric_assessment),
     }
 
 
-# ---------------------------------------------------------------------
+# =============================================================================
 # C. Financial Profile Assessment
-# ---------------------------------------------------------------------
+# =============================================================================
 
 def calculate_financial_profile_assessment(
     top10_taxpayers_percent_of_total_levy: Any,
     maximum_loss_to_maturity_percent: Any,
 ) -> Dict[str, Any]:
     """
-    Financial Profile Assessment is coded as:
-    Top 10 Taxpayers as % of Total Levy x Maximum Loss-to-Maturity (MLTM).
+    Financial Profile Assessment Matrix.
+
+    Dimensions:
+    - Top 10 Taxpayers as % of Total Levy
+    - Maximum Loss-to-Maturity (MLTM) %
     """
     top10 = safe_float(top10_taxpayers_percent_of_total_levy, default=25)
     mltm = safe_float(maximum_loss_to_maturity_percent, default=15)
 
+    # MLTM bucket
     if mltm >= 40:
         mltm_bucket = ">=40%"
     elif mltm >= 35:
@@ -424,6 +576,7 @@ def calculate_financial_profile_assessment(
     else:
         mltm_bucket = "<=5%"
 
+    # Top 10 bucket
     if top10 <= 5:
         top10_bucket = "<=5%"
     elif top10 <= 15:
@@ -436,11 +589,61 @@ def calculate_financial_profile_assessment(
         top10_bucket = ">=40%"
 
     matrix = {
-        "<=5%":   {">=40%": 1,   "35%-40%": 1,   "30%-35%": 1,   "25%-30%": 1.5, "20%-25%": 2,   "15%-20%": 2.5, "10%-15%": 3,   "5%-10%": 3.5, "<=5%": 4.5},
-        "5%-15%":  {">=40%": 1.5, "35%-40%": 1.5, "30%-35%": 1.5, "25%-30%": 2,   "20%-25%": 2.5, "15%-20%": 3,   "10%-15%": 3.5, "5%-10%": 3.5, "<=5%": 4.5},
-        "15%-25%": {">=40%": 2.5, "35%-40%": 2.5, "30%-35%": 2.5, "25%-30%": 3,   "20%-25%": 3.5, "15%-20%": 3.5, "10%-15%": 4,   "5%-10%": 4.5, "<=5%": 4.5},
-        "25%-40%": {">=40%": 2.5, "35%-40%": 3.5, "30%-35%": 3.5, "25%-30%": 3.5, "20%-25%": 4,   "15%-20%": 4.5, "10%-15%": 4.5, "5%-10%": 4.5, "<=5%": 5},
-        ">=40%":  {">=40%": 3.5, "35%-40%": 4,   "30%-35%": 4,   "25%-30%": 4.5, "20%-25%": 4.5, "15%-20%": 5,   "10%-15%": 5,   "5%-10%": 5,   "<=5%": 5},
+        "<=5%": {
+            ">=40%": 1,
+            "35%-40%": 1,
+            "30%-35%": 1,
+            "25%-30%": 1.5,
+            "20%-25%": 2,
+            "15%-20%": 2.5,
+            "10%-15%": 3,
+            "5%-10%": 3.5,
+            "<=5%": 4.5,
+        },
+        "5%-15%": {
+            ">=40%": 1.5,
+            "35%-40%": 1.5,
+            "30%-35%": 1.5,
+            "25%-30%": 2,
+            "20%-25%": 2.5,
+            "15%-20%": 3,
+            "10%-15%": 3.5,
+            "5%-10%": 3.5,
+            "<=5%": 4.5,
+        },
+        "15%-25%": {
+            ">=40%": 2.5,
+            "35%-40%": 2.5,
+            "30%-35%": 2.5,
+            "25%-30%": 3,
+            "20%-25%": 3.5,
+            "15%-20%": 3.5,
+            "10%-15%": 4,
+            "5%-10%": 4.5,
+            "<=5%": 4.5,
+        },
+        "25%-40%": {
+            ">=40%": 2.5,
+            "35%-40%": 3.5,
+            "30%-35%": 3.5,
+            "25%-30%": 3.5,
+            "20%-25%": 4,
+            "15%-20%": 4.5,
+            "10%-15%": 4.5,
+            "5%-10%": 4.5,
+            "<=5%": 5,
+        },
+        ">=40%": {
+            ">=40%": 3.5,
+            "35%-40%": 4,
+            "30%-35%": 4,
+            "25%-30%": 4.5,
+            "20%-25%": 4.5,
+            "15%-20%": 5,
+            "10%-15%": 5,
+            "5%-10%": 5,
+            "<=5%": 5,
+        },
     }
 
     numeric_assessment = matrix[top10_bucket][mltm_bucket]
@@ -454,9 +657,9 @@ def calculate_financial_profile_assessment(
     }
 
 
-# ---------------------------------------------------------------------
+# =============================================================================
 # Overall Scorecard
-# ---------------------------------------------------------------------
+# =============================================================================
 
 def calculate_factor_score_weighted_average(
     economic_fundamentals_assessment: float,
@@ -479,6 +682,25 @@ def map_factor_score_to_initial_indicative_rating(factor_score_weighted_average:
 
 
 def calculate_special_assessment_scorecard(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Main function called by Streamlit.
+
+    Expected main inputs:
+    - median_household_ebi_percent_of_us
+    - unemployment_rate_difference_vs_us
+    - msa_participation
+    - real_estate_market_volatility
+    - population_growth_difference_vs_us
+    - top10_taxpayers_percent_of_total_levy
+    - conveyance_to_homeowners
+    - largest_taxpayer_percent_of_total_levy
+    - district_size_parcels
+    - est_value_to_lien
+    - maximum_loss_to_maturity_percent
+    - negative_override_notches
+    - holistic_adjustment_notches
+    - rating_cap
+    """
     economic_results = calculate_economic_fundamentals_assessment(inputs)
     district_results = calculate_district_characteristics_assessment(inputs)
 
@@ -486,6 +708,7 @@ def calculate_special_assessment_scorecard(inputs: Dict[str, Any]) -> Dict[str, 
         "top10_taxpayers_percent_of_total_levy",
         inputs.get("top10_taxpayer_percent_of_levy", 25),
     )
+
     financial_results = calculate_financial_profile_assessment(
         top10_value,
         inputs.get("maximum_loss_to_maturity_percent", 15),
@@ -513,16 +736,19 @@ def calculate_special_assessment_scorecard(inputs: Dict[str, Any]) -> Dict[str, 
         **economic_results,
         **district_results,
         **financial_results,
+
         "factor_score_weighted_average": factor_score_weighted_average,
         "initial_indicative_rating": initial_indicative_rating,
+
         "negative_override_notches": negative_override_notches,
         "holistic_adjustment_notches": holistic_adjustment_notches,
         "rating_cap": rating_cap,
+
         "rating_after_overriding_factors": rating_after_overriding_factors,
         "rating_after_holistic_analysis": rating_after_holistic_analysis,
         "indicative_rating": indicative_rating,
 
-        # Backward-compatible aliases for older UI/code
+        # Backward-compatible aliases
         "weighted_score": factor_score_weighted_average,
         "final_indicative_rating": indicative_rating,
         "economic_fundamentals_score": economic_results["economic_fundamentals_assessment"],
