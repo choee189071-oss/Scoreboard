@@ -25,3 +25,20 @@ if uploaded_file is not None:
     st.subheader("Preview Data")
     st.dataframe(df)
     st.success("File uploaded successfully.")
+
+from modules.scoring_special_assessment import (
+    calculate_special_assessment_scorecard
+)
+
+if uploaded_file is not None:
+    df = pd.read_csv(uploaded_file)
+
+    st.subheader("Preview Data")
+    st.dataframe(df)
+
+    inputs = df.iloc[0].to_dict()
+
+    results = calculate_special_assessment_scorecard(inputs)
+
+    st.subheader("Scorecard Results")
+    st.write(results)
