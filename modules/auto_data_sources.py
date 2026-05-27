@@ -1,22 +1,29 @@
 # modules/auto_data_sources.py
 """
-Auto data source connectors for the Municipal Credit Analytics Platform.
+Stable Auto Data Source Layer
 
-This module focuses on relatively stable / structured data sources:
+This module focuses on structured, relatively reliable data sources:
 - Census / ACS for income and population
-- BLS placeholder for unemployment
-- FRED placeholder for macro rates / unemployment proxy
-- County open data placeholder
-- Housing data placeholder
+- FRED for macro indicators
+- BLS / county / housing as manual-required placeholders until production connectors are configured
 
-The design goal:
-Use automatic connectors for stable, structured data.
-Use document upload + AI extraction for complex PDF-heavy deal-specific data.
+Major improvements:
+1. Better Census error handling
+2. URL debug output
+3. ACS year fallback
+4. County/place FIPS validation
+5. Expanded FRED series
+6. Cleaner statuses:
+   - success
+   - setup_needed
+   - manual_required
+   - failed
 """
 
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
@@ -24,36 +31,163 @@ import pandas as pd
 import requests
 
 
+# =============================================================================
+# Config
+# =============================================================================
+
+DEFAULT_FRED_SERIES = {
+    "UNRATE": {
+        "label": "U.S. Unemployment Rate",
+        "target_data": "National unemployment",
+        "unit": "%",
+    },
+    "DGS10": {
+        "label": "10-Year Treasury Constant Maturity",
+        "target_data": "Treasury rate",
+        "unit": "%",
+    },
+    "DGS2": {
+        "label": "2-Year Treasury Constant Maturity",
+        "target_data": "Treasury rate",
+        "unit": "%",
+    },
+    "DGS30": {
+        "label": "30-Year Treasury Constant Maturity",
+        "target_data": "Treasury rate",
+        "unit": "%",
+    },
+    "CPIAUCSL": {
+        "label": "Consumer Price Index",
+        "target_data": "Inflation proxy",
+        "unit": "index",
+    },
+    "FEDFUNDS": {
+        "label": "Effective Federal Funds Rate",
+        "target_data": "Policy rate",
+        "unit": "%",
+    },
+}
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
 def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         if value is None or value == "":
+            return default
+        if isinstance(value, str) and value.strip() == ".":
             return default
         return float(value)
     except Exception:
         return default
 
 
-def fetch_json(url: str, timeout: int = 20) -> Any:
-    response = requests.get(url, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
+def validate_fips(value: str, expected_length: int, label: str) -> Optional[str]:
+    value = str(value).strip()
+
+    if not re.fullmatch(r"\d+", value):
+        return f"{label} must contain digits only."
+
+    if len(value) != expected_length:
+        return f"{label} should be {expected_length} digits. Current value: {value}"
+
+    return None
 
 
-def get_census_acs_profile(
+def fetch_json_with_debug(url: str, timeout: int = 20) -> Dict[str, Any]:
+    """
+    Returns:
+    {
+      ok: bool,
+      json: Any,
+      status_code: int,
+      url: str,
+      text_preview: str,
+      error: str
+    }
+    """
+    try:
+        response = requests.get(url, timeout=timeout)
+        text_preview = response.text[:500]
+
+        if response.status_code != 200:
+            return {
+                "ok": False,
+                "json": None,
+                "status_code": response.status_code,
+                "url": url,
+                "text_preview": text_preview,
+                "error": f"HTTP {response.status_code}",
+            }
+
+        try:
+            data = response.json()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "json": None,
+                "status_code": response.status_code,
+                "url": url,
+                "text_preview": text_preview,
+                "error": f"Response was not valid JSON: {exc}",
+            }
+
+        return {
+            "ok": True,
+            "json": data,
+            "status_code": response.status_code,
+            "url": url,
+            "text_preview": text_preview,
+            "error": "",
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "json": None,
+            "status_code": None,
+            "url": url,
+            "text_preview": "",
+            "error": str(exc),
+        }
+
+
+def make_result(
+    data_source: str,
+    target_data: str,
+    status: str,
+    value: Any = None,
+    source_url: str = "",
+    notes: str = "",
+    **kwargs,
+) -> Dict[str, Any]:
+    out = {
+        "data_source": data_source,
+        "target_data": target_data,
+        "status": status,
+        "value": value,
+        "source_url": source_url,
+        "notes": notes,
+    }
+    out.update(kwargs)
+    return out
+
+
+# =============================================================================
+# Census / ACS
+# =============================================================================
+
+def build_census_acs_url(
     state_fips: str,
     place_or_county: str,
     geography_type: str = "county",
     year: int = 2023,
     api_key: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> str:
     """
-    Fetch ACS 5-year profile values.
-
-    geography_type:
-    - "county": place_or_county should be county FIPS, e.g. Sacramento County = "067"
-    - "place": place_or_county should be place FIPS
-
-    Variables:
+    ACS 5-year profile variables:
     - DP03_0062E: Median household income
     - DP05_0001E: Total population
     """
@@ -76,27 +210,10 @@ def get_census_acs_profile(
     if api_key:
         params["key"] = api_key
 
-    url = f"{base}?{urlencode(params)}"
-    data = fetch_json(url)
-
-    header = data[0]
-    row = data[1]
-    record = dict(zip(header, row))
-
-    return {
-        "source": "Census ACS 5-year Profile",
-        "source_url": url,
-        "name": record.get("NAME"),
-        "median_household_income": safe_float(record.get("DP03_0062E")),
-        "population": safe_float(record.get("DP05_0001E")),
-        "raw": record,
-    }
+    return f"{base}?{urlencode(params)}"
 
 
-def get_us_acs_profile(year: int = 2023, api_key: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Fetch U.S. ACS 5-year profile values for comparison.
-    """
+def build_us_acs_url(year: int = 2023, api_key: Optional[str] = None) -> str:
     base = f"https://api.census.gov/data/{year}/acs/acs5/profile"
     variables = "NAME,DP03_0062E,DP05_0001E"
 
@@ -108,20 +225,138 @@ def get_us_acs_profile(year: int = 2023, api_key: Optional[str] = None) -> Dict[
     if api_key:
         params["key"] = api_key
 
-    url = f"{base}?{urlencode(params)}"
-    data = fetch_json(url)
+    return f"{base}?{urlencode(params)}"
+
+
+def parse_census_profile_response(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, list) or len(data) < 2:
+        raise ValueError("Census response did not include a data row.")
 
     header = data[0]
     row = data[1]
     record = dict(zip(header, row))
 
     return {
-        "source": "Census ACS 5-year Profile",
-        "source_url": url,
         "name": record.get("NAME"),
         "median_household_income": safe_float(record.get("DP03_0062E")),
         "population": safe_float(record.get("DP05_0001E")),
         "raw": record,
+    }
+
+
+def get_census_acs_profile(
+    state_fips: str,
+    place_or_county: str,
+    geography_type: str = "county",
+    year: int = 2023,
+    api_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    state_error = validate_fips(state_fips, 2, "State FIPS")
+    if state_error:
+        return make_result(
+            data_source="Census / ACS",
+            target_data="Income, population",
+            status="failed",
+            notes=state_error,
+        )
+
+    geo_len = 3 if geography_type == "county" else 5
+    geo_error = validate_fips(place_or_county, geo_len, "County / Place FIPS")
+    if geo_error:
+        return make_result(
+            data_source="Census / ACS",
+            target_data="Income, population",
+            status="failed",
+            notes=geo_error,
+        )
+
+    url = build_census_acs_url(
+        state_fips=state_fips,
+        place_or_county=place_or_county,
+        geography_type=geography_type,
+        year=year,
+        api_key=api_key,
+    )
+
+    result = fetch_json_with_debug(url)
+
+    if not result["ok"]:
+        return make_result(
+            data_source="Census / ACS",
+            target_data="Income, population",
+            status="failed",
+            source_url=url,
+            notes=(
+                f"Census pull failed for ACS {year}. "
+                f"{result['error']}. Response preview: {result['text_preview'][:180]}"
+            ),
+            debug_url=url,
+            http_status=result.get("status_code"),
+        )
+
+    try:
+        parsed = parse_census_profile_response(result["json"])
+    except Exception as exc:
+        return make_result(
+            data_source="Census / ACS",
+            target_data="Income, population",
+            status="failed",
+            source_url=url,
+            notes=f"Census response parsed but did not contain expected fields: {exc}",
+            debug_url=url,
+        )
+
+    return {
+        "data_source": "Census / ACS",
+        "target_data": "Income, population",
+        "status": "success",
+        "source_url": url,
+        "notes": f"Pulled ACS {year} profile for {parsed.get('name')}.",
+        "name": parsed.get("name"),
+        "median_household_income": parsed.get("median_household_income"),
+        "population": parsed.get("population"),
+        "raw": parsed.get("raw"),
+        "acs_year": year,
+    }
+
+
+def get_us_acs_profile(year: int = 2023, api_key: Optional[str] = None) -> Dict[str, Any]:
+    url = build_us_acs_url(year=year, api_key=api_key)
+    result = fetch_json_with_debug(url)
+
+    if not result["ok"]:
+        return make_result(
+            data_source="Census / ACS",
+            target_data="U.S. income, population benchmark",
+            status="failed",
+            source_url=url,
+            notes=f"U.S. Census benchmark pull failed for ACS {year}: {result['error']}",
+            debug_url=url,
+        )
+
+    try:
+        parsed = parse_census_profile_response(result["json"])
+    except Exception as exc:
+        return make_result(
+            data_source="Census / ACS",
+            target_data="U.S. income, population benchmark",
+            status="failed",
+            source_url=url,
+            notes=f"U.S. Census response did not contain expected fields: {exc}",
+            debug_url=url,
+        )
+
+    return {
+        "data_source": "Census / ACS",
+        "target_data": "U.S. income, population benchmark",
+        "status": "success",
+        "source_url": url,
+        "notes": f"Pulled ACS {year} U.S. benchmark.",
+        "name": parsed.get("name"),
+        "median_household_income": parsed.get("median_household_income"),
+        "population": parsed.get("population"),
+        "raw": parsed.get("raw"),
+        "acs_year": year,
     }
 
 
@@ -141,39 +376,83 @@ def get_census_income_population_bundle(
     geography_type: str = "county",
     year: int = 2023,
     api_key: Optional[str] = None,
+    fallback_years: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """
-    Returns local income/population, U.S. benchmark, and local income as % of U.S.
+    Pull local and U.S. ACS profile data.
+
+    If selected year fails, try fallback years.
     """
-    local = get_census_acs_profile(
-        state_fips=state_fips,
-        place_or_county=place_or_county,
-        geography_type=geography_type,
-        year=year,
-        api_key=api_key,
-    )
+    if fallback_years is None:
+        fallback_years = [year, year - 1, year - 2, year - 3]
 
-    us = get_us_acs_profile(year=year, api_key=api_key)
+    attempted = []
 
-    ebi_percent = calculate_ebi_percent_of_us(
-        local.get("median_household_income"),
-        us.get("median_household_income"),
-    )
+    for candidate_year in fallback_years:
+        local = get_census_acs_profile(
+            state_fips=state_fips,
+            place_or_county=place_or_county,
+            geography_type=geography_type,
+            year=candidate_year,
+            api_key=api_key,
+        )
+        us = get_us_acs_profile(year=candidate_year, api_key=api_key)
+
+        attempted.append(
+            {
+                "year": candidate_year,
+                "local_status": local.get("status"),
+                "us_status": us.get("status"),
+                "local_notes": local.get("notes"),
+                "us_notes": us.get("notes"),
+                "local_url": local.get("source_url"),
+                "us_url": us.get("source_url"),
+            }
+        )
+
+        if local.get("status") == "success" and us.get("status") == "success":
+            ebi_percent = calculate_ebi_percent_of_us(
+                local.get("median_household_income"),
+                us.get("median_household_income"),
+            )
+
+            return {
+                "data_source": "Census / ACS",
+                "target_data": "Income, population",
+                "status": "success",
+                "median_household_ebi_percent_of_us": ebi_percent,
+                "local_median_household_income": local.get("median_household_income"),
+                "us_median_household_income": us.get("median_household_income"),
+                "local_population": local.get("population"),
+                "us_population": us.get("population"),
+                "local_name": local.get("name"),
+                "source_url": local.get("source_url"),
+                "us_source_url": us.get("source_url"),
+                "acs_year": candidate_year,
+                "notes": (
+                    f"ACS {candidate_year}: EBI proxy = local median household income "
+                    f"divided by U.S. median household income."
+                ),
+                "attempted_years": attempted,
+            }
 
     return {
         "data_source": "Census / ACS",
         "target_data": "Income, population",
-        "status": "success",
-        "median_household_ebi_percent_of_us": ebi_percent,
-        "local_median_household_income": local.get("median_household_income"),
-        "us_median_household_income": us.get("median_household_income"),
-        "local_population": local.get("population"),
-        "local_name": local.get("name"),
-        "source_url": local.get("source_url"),
-        "us_source_url": us.get("source_url"),
-        "notes": "EBI proxy calculated as local median household income divided by U.S. median household income.",
+        "status": "failed",
+        "median_household_ebi_percent_of_us": None,
+        "source_url": attempted[0].get("local_url") if attempted else "",
+        "notes": (
+            "Census ACS pull failed after fallback attempts. "
+            "Check State FIPS, County/Place FIPS, geography type, and ACS year."
+        ),
+        "attempted_years": attempted,
     }
 
+
+# =============================================================================
+# FRED
+# =============================================================================
 
 def get_fred_series_latest(series_id: str, api_key: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -182,16 +461,20 @@ def get_fred_series_latest(series_id: str, api_key: Optional[str] = None) -> Dic
     Requires FRED_API_KEY for live use.
     """
     api_key = api_key or os.getenv("FRED_API_KEY")
+    meta = DEFAULT_FRED_SERIES.get(series_id, {})
 
     if not api_key:
-        return {
-            "data_source": "FRED",
-            "series_id": series_id,
-            "status": "missing_api_key",
-            "value": None,
-            "source_url": f"https://fred.stlouisfed.org/series/{series_id}",
-            "notes": "Add FRED_API_KEY to enable live FRED pulls.",
-        }
+        return make_result(
+            data_source="FRED",
+            target_data=meta.get("target_data", series_id),
+            status="setup_needed",
+            value=None,
+            source_url=f"https://fred.stlouisfed.org/series/{series_id}",
+            notes="Add FRED_API_KEY to enable live FRED pulls.",
+            series_id=series_id,
+            label=meta.get("label", series_id),
+            unit=meta.get("unit", ""),
+        )
 
     url = "https://api.stlouisfed.org/fred/series/observations"
     params = {
@@ -199,66 +482,132 @@ def get_fred_series_latest(series_id: str, api_key: Optional[str] = None) -> Dic
         "api_key": api_key,
         "file_type": "json",
         "sort_order": "desc",
-        "limit": 1,
+        "limit": 5,
     }
 
-    response = requests.get(url, params=params, timeout=20)
-    response.raise_for_status()
-    data = response.json()
-    obs = data.get("observations", [{}])[0]
+    try:
+        response = requests.get(url, params=params, timeout=20)
+        text_preview = response.text[:300]
 
-    return {
-        "data_source": "FRED",
-        "series_id": series_id,
-        "status": "success",
-        "date": obs.get("date"),
-        "value": safe_float(obs.get("value")),
-        "source_url": f"https://fred.stlouisfed.org/series/{series_id}",
-        "notes": "Latest available FRED observation.",
-    }
+        if response.status_code != 200:
+            return make_result(
+                data_source="FRED",
+                target_data=meta.get("target_data", series_id),
+                status="failed",
+                source_url=f"https://fred.stlouisfed.org/series/{series_id}",
+                notes=f"FRED returned HTTP {response.status_code}. Preview: {text_preview}",
+                series_id=series_id,
+                label=meta.get("label", series_id),
+                unit=meta.get("unit", ""),
+            )
+
+        data = response.json()
+        observations = data.get("observations", [])
+
+        latest = None
+        for obs in observations:
+            value = safe_float(obs.get("value"))
+            if value is not None:
+                latest = obs
+                break
+
+        if latest is None:
+            return make_result(
+                data_source="FRED",
+                target_data=meta.get("target_data", series_id),
+                status="failed",
+                source_url=f"https://fred.stlouisfed.org/series/{series_id}",
+                notes="FRED returned observations, but no numeric value was available.",
+                series_id=series_id,
+                label=meta.get("label", series_id),
+                unit=meta.get("unit", ""),
+            )
+
+        return make_result(
+            data_source="FRED",
+            target_data=meta.get("target_data", series_id),
+            status="success",
+            value=safe_float(latest.get("value")),
+            source_url=f"https://fred.stlouisfed.org/series/{series_id}",
+            notes="Latest available FRED observation.",
+            series_id=series_id,
+            label=meta.get("label", series_id),
+            unit=meta.get("unit", ""),
+            date=latest.get("date"),
+        )
+
+    except Exception as exc:
+        return make_result(
+            data_source="FRED",
+            target_data=meta.get("target_data", series_id),
+            status="failed",
+            source_url=f"https://fred.stlouisfed.org/series/{series_id}",
+            notes=f"FRED pull failed: {exc}",
+            series_id=series_id,
+            label=meta.get("label", series_id),
+            unit=meta.get("unit", ""),
+        )
 
 
-def get_bls_unemployment_placeholder(local_area_name: str = "") -> Dict[str, Any]:
-    """
-    Placeholder for BLS LAUS integration.
+def get_fred_bundle(
+    series_ids: Optional[List[str]] = None,
+    api_key: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if series_ids is None:
+        series_ids = ["UNRATE", "DGS10", "DGS2", "DGS30", "CPIAUCSL", "FEDFUNDS"]
 
-    BLS local unemployment requires correct area series IDs.
-    This function makes the workflow explicit without pretending the connector is complete.
-    """
-    return {
-        "data_source": "BLS / LAUS",
-        "target_data": "Unemployment",
-        "status": "placeholder",
-        "local_area_name": local_area_name,
-        "unemployment_rate_difference_vs_us": None,
-        "source_url": "https://www.bls.gov/lau/",
-        "notes": "Needs LAUS series mapping. For now, enter local vs U.S. unemployment manually or upload appendix.",
-    }
+    return [get_fred_series_latest(series_id, api_key=api_key) for series_id in series_ids]
 
 
-def get_county_open_data_placeholder(county_name: str = "") -> Dict[str, Any]:
-    return {
-        "data_source": "County Open Data / Assessor",
-        "target_data": "Assessed value",
-        "status": "placeholder",
-        "county_name": county_name,
-        "assessed_value": None,
-        "source_url": "",
-        "notes": "County assessor data formats vary. Use document upload or configure county-specific connectors.",
-    }
+# =============================================================================
+# Manual-required placeholders
+# =============================================================================
+
+def get_bls_unemployment_manual_required(local_area_name: str = "") -> Dict[str, Any]:
+    return make_result(
+        data_source="BLS / LAUS",
+        target_data="Local unemployment",
+        status="manual_required",
+        source_url="https://www.bls.gov/lau/",
+        notes=(
+            "Local unemployment requires LAUS area series mapping. "
+            "For now, enter local vs U.S. unemployment manually or upload an economic appendix."
+        ),
+        local_area_name=local_area_name,
+    )
 
 
-def get_housing_data_placeholder(location_name: str = "") -> Dict[str, Any]:
-    return {
-        "data_source": "Housing Data",
-        "target_data": "Housing market trend / distress proxy",
-        "status": "placeholder",
-        "location_name": location_name,
-        "real_estate_market_volatility": None,
-        "source_url": "",
-        "notes": "Use manual review or document upload until a stable housing data source is selected.",
-    }
+def get_county_open_data_manual_required(county_name: str = "") -> Dict[str, Any]:
+    return make_result(
+        data_source="County Open Data / Assessor",
+        target_data="Assessed value",
+        status="manual_required",
+        source_url="",
+        notes=(
+            "County assessor data formats vary. "
+            "Use document upload for assessed value / VTL support, or configure a county-specific connector."
+        ),
+        county_name=county_name,
+    )
 
+
+def get_housing_data_manual_required(location_name: str = "") -> Dict[str, Any]:
+    return make_result(
+        data_source="Housing Data",
+        target_data="Housing market trend / distress proxy",
+        status="manual_required",
+        source_url="",
+        notes=(
+            "Housing market condition is partly qualitative. "
+            "Use manual analyst review or upload supporting housing data until a stable source is selected."
+        ),
+        location_name=location_name,
+    )
+
+
+# =============================================================================
+# Unified Auto Pull
+# =============================================================================
 
 def auto_pull_structured_data(
     state_fips: str,
@@ -269,43 +618,29 @@ def auto_pull_structured_data(
     census_year: int = 2023,
     census_api_key: Optional[str] = None,
     fred_api_key: Optional[str] = None,
+    fred_series_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """
-    Unified auto data pull for stable/structured sources.
-    """
     results: List[Dict[str, Any]] = []
     approved_inputs: Dict[str, Any] = {}
 
-    try:
-        census_bundle = get_census_income_population_bundle(
-            state_fips=state_fips,
-            place_or_county=place_or_county,
-            geography_type=geography_type,
-            year=census_year,
-            api_key=census_api_key,
-        )
-        results.append(census_bundle)
+    census_bundle = get_census_income_population_bundle(
+        state_fips=state_fips,
+        place_or_county=place_or_county,
+        geography_type=geography_type,
+        year=census_year,
+        api_key=census_api_key,
+    )
+    results.append(census_bundle)
 
+    if census_bundle.get("status") == "success":
         if census_bundle.get("median_household_ebi_percent_of_us") is not None:
             approved_inputs["median_household_ebi_percent_of_us"] = census_bundle["median_household_ebi_percent_of_us"]
 
-    except Exception as exc:
-        results.append(
-            {
-                "data_source": "Census / ACS",
-                "target_data": "Income, population",
-                "status": "error",
-                "notes": str(exc),
-            }
-        )
+    results.extend(get_fred_bundle(series_ids=fred_series_ids, api_key=fred_api_key))
 
-    # FRED examples: national unemployment and Treasury yield placeholders.
-    results.append(get_fred_series_latest("UNRATE", api_key=fred_api_key))
-    results.append(get_fred_series_latest("DGS10", api_key=fred_api_key))
-
-    results.append(get_bls_unemployment_placeholder(local_area_name=location_name))
-    results.append(get_county_open_data_placeholder(county_name=county_name))
-    results.append(get_housing_data_placeholder(location_name=location_name))
+    results.append(get_bls_unemployment_manual_required(local_area_name=location_name))
+    results.append(get_county_open_data_manual_required(county_name=county_name))
+    results.append(get_housing_data_manual_required(location_name=location_name))
 
     return {
         "results": results,
@@ -319,16 +654,26 @@ def auto_data_results_to_dataframe(results: List[Dict[str, Any]]) -> pd.DataFram
 
     rows = []
     for item in results:
+        extracted = None
+
+        if item.get("median_household_ebi_percent_of_us") is not None:
+            extracted = item.get("median_household_ebi_percent_of_us")
+        elif item.get("value") is not None:
+            extracted = item.get("value")
+
+        if item.get("unit") and extracted is not None:
+            extracted_display = f"{extracted} {item.get('unit')}"
+        else:
+            extracted_display = extracted
+
         rows.append(
             {
                 "Data Source": item.get("data_source"),
+                "Series / Label": item.get("label", item.get("series_id", "")),
                 "Target Data": item.get("target_data", item.get("series_id")),
                 "Status": item.get("status"),
-                "Extracted / Calculated Value": (
-                    item.get("median_household_ebi_percent_of_us")
-                    if item.get("median_household_ebi_percent_of_us") is not None
-                    else item.get("value")
-                ),
+                "Date / Year": item.get("date", item.get("acs_year", "")),
+                "Extracted / Calculated Value": extracted_display,
                 "Source URL": item.get("source_url"),
                 "Notes": item.get("notes"),
             }
