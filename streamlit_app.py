@@ -1,318 +1,202 @@
-# modules/scoring_special_assessment.py
+import streamlit as st
+import pandas as pd
 
-SPECIAL_ASSESSMENT_WEIGHTS = {
-    "Economic Fundamentals": 0.15,
-    "District Characteristics": 0.35,
-    "Financial Profile": 0.50,
-}
+from modules.scoring_special_assessment import (
+    calculate_special_assessment_scorecard,
+)
 
-ECONOMIC_SUBFACTOR_WEIGHTS = {
-    "Income": 0.20,
-    "Unemployment": 0.20,
-    "MSA": 0.20,
-    "Real Estate Market": 0.20,
-    "Population Trend": 0.20,
-}
+st.set_page_config(
+    page_title="S&P Scoreboard Automation",
+    layout="wide",
+)
 
-DISTRICT_SUBFACTOR_WEIGHTS = {
-    "Top 10 Taxpayer Concentration": 0.25,
-    "Development Status": 0.25,
-    "Largest Taxpayer Exposure": 0.20,
-    "District Size": 0.15,
-    "Value To Lien": 0.15,
-}
+st.title("S&P Scoreboard Automation")
 
-RATING_SCALE = [
-    (1.00, 1.30, "aaa"),
-    (1.30, 1.60, "aa+"),
-    (1.60, 1.90, "aa"),
-    (1.90, 2.20, "aa-"),
-    (2.20, 2.50, "a+"),
-    (2.50, 2.80, "a"),
-    (2.80, 3.10, "a-"),
-    (3.10, 3.40, "bbb+"),
-    (3.40, 3.70, "bbb"),
-    (3.70, 4.00, "bbb-"),
-    (4.00, 4.25, "bb+"),
-    (4.25, 4.50, "bb"),
-    (4.50, 4.75, "bb-"),
-    (4.75, 5.01, "b category"),
-]
+criteria_type = st.sidebar.selectbox(
+    "Select Criteria",
+    ["General Fund", "Special Assessment", "Water / Wastewater"],
+)
 
+st.write(f"Currently Selected: {criteria_type}")
 
-def safe_float(value, default=3):
-    try:
-        if value is None or value == "":
-            return default
-        return float(value)
-    except Exception:
-        return default
+if criteria_type != "Special Assessment":
+    st.info("Scoring engine for this criteria type has not been built yet.")
 
+else:
+    input_mode = st.sidebar.radio("Input Mode", ["Manual Input", "Upload CSV"])
 
-# -------------------------
-# A. Economic Fundamentals
-# -------------------------
+    st.header("Special Assessment Scorecard")
 
-def score_income(ebi_percent_of_us):
-    ebi = safe_float(ebi_percent_of_us, default=100)
+    if input_mode == "Manual Input":
+        st.subheader("A. Economic Fundamentals")
 
-    if ebi >= 150:
-        return 1
-    elif ebi >= 110:
-        return 2
-    elif ebi >= 85:
-        return 3
-    elif ebi >= 70:
-        return 4
+        col1, col2 = st.columns(2)
+
+        with col1:
+            ebi_percent_of_us = st.number_input(
+                "Median Household EBI (% of U.S.)",
+                min_value=0.0,
+                max_value=500.0,
+                value=100.0,
+                step=1.0,
+            )
+
+            unemployment_delta_vs_us = st.number_input(
+                "Unemployment Rate Difference vs U.S. (%)",
+                value=0.0,
+                step=0.1,
+                help="Local unemployment rate minus national unemployment rate. Example: local 3%, U.S. 5% = -2.",
+            )
+
+            population_growth_vs_us = st.number_input(
+                "Population Growth Difference vs U.S. (%)",
+                value=0.0,
+                step=0.1,
+            )
+
+        with col2:
+            msa_status = st.selectbox(
+                "MSA Status",
+                [
+                    "broad_diverse",
+                    "moderate",
+                    "not_broad_diverse",
+                    "not_in_msa",
+                ],
+            )
+
+            real_estate_status = st.selectbox(
+                "Real Estate Market Status",
+                [
+                    "stable_low_volatility",
+                    "stable_moderate",
+                    "elevated_volatility",
+                    "falling_prices",
+                    "distressed",
+                ],
+            )
+
+        st.subheader("B. District Characteristics")
+
+        col3, col4 = st.columns(2)
+
+        with col3:
+            top10_taxpayer_percent_of_levy = st.number_input(
+                "Top 10 Taxpayers (% of Levy)",
+                min_value=0.0,
+                max_value=100.0,
+                value=15.0,
+                step=0.5,
+            )
+
+            largest_taxpayer_percent_of_levy = st.number_input(
+                "Largest Taxpayer (% of Levy)",
+                min_value=0.0,
+                max_value=100.0,
+                value=3.0,
+                step=0.5,
+            )
+
+            number_of_parcels = st.number_input(
+                "Number of Parcels",
+                min_value=0,
+                value=1500,
+                step=100,
+            )
+
+        with col4:
+            development_status = st.selectbox(
+                "Development Status",
+                [
+                    "built_out_all_end_users",
+                    "built_out_most_end_users",
+                    "mature_some_developer_concentration",
+                    "majority_developed_significant_undeveloped",
+                    "new_majority_undeveloped",
+                ],
+            )
+
+            value_to_lien_ratio = st.number_input(
+                "Overall Value-to-Lien Ratio",
+                min_value=0.0,
+                value=20.0,
+                step=1.0,
+            )
+
+        st.subheader("C. Financial Profile")
+
+        financial_profile_score = st.number_input(
+            "Financial Profile Score",
+            min_value=1.0,
+            max_value=5.0,
+            value=3.0,
+            step=0.5,
+        )
+
+        inputs = {
+            "ebi_percent_of_us": ebi_percent_of_us,
+            "unemployment_delta_vs_us": unemployment_delta_vs_us,
+            "msa_status": msa_status,
+            "real_estate_status": real_estate_status,
+            "population_growth_vs_us": population_growth_vs_us,
+            "top10_taxpayer_percent_of_levy": top10_taxpayer_percent_of_levy,
+            "development_status": development_status,
+            "largest_taxpayer_percent_of_levy": largest_taxpayer_percent_of_levy,
+            "number_of_parcels": number_of_parcels,
+            "value_to_lien_ratio": value_to_lien_ratio,
+            "financial_profile_score": financial_profile_score,
+        }
+
+        if st.button("Calculate Scorecard"):
+            results = calculate_special_assessment_scorecard(inputs)
+
+            st.subheader("Scorecard Results")
+
+            m1, m2, m3, m4 = st.columns(4)
+
+            m1.metric("Economic Fundamentals", results["economic_fundamentals_score"])
+            m2.metric("District Characteristics", results["district_characteristics_score"])
+            m3.metric("Financial Profile", results["financial_profile_score"])
+            m4.metric("Indicative Rating", results["final_indicative_rating"])
+
+            st.json(results)
+
     else:
-        return 5
+        st.subheader("Upload Financial Data")
 
+        uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
 
-def score_unemployment(unemployment_delta_vs_us):
-    delta = safe_float(unemployment_delta_vs_us, default=0)
+        def read_uploaded_csv(file):
+            encodings = ["utf-8", "utf-8-sig", "latin1", "cp1252"]
+            separators = [",", "\t", ";", "|"]
 
-    if delta <= -2:
-        return 1
-    elif delta <= -1:
-        return 2
-    elif delta <= 1:
-        return 3
-    elif delta <= 2:
-        return 4
-    else:
-        return 5
+            last_error = None
 
+            for encoding in encodings:
+                for sep in separators:
+                    try:
+                        file.seek(0)
+                        return pd.read_csv(
+                            file,
+                            encoding=encoding,
+                            sep=sep,
+                            engine="python",
+                        )
+                    except Exception as e:
+                        last_error = e
 
-def score_msa(msa_status):
-    status = str(msa_status).lower().strip()
+            raise last_error
 
-    mapping = {
-        "broad_diverse": 1,
-        "moderate": 2,
-        "not_broad_diverse": 3,
-        "not_in_msa": 4,
-    }
+        if uploaded_file is not None:
+            df = read_uploaded_csv(uploaded_file)
 
-    return mapping.get(status, 3)
+            st.subheader("Preview Data")
+            st.dataframe(df)
 
+            st.success("File uploaded successfully.")
 
-def score_real_estate_market(real_estate_status):
-    status = str(real_estate_status).lower().strip()
+            inputs = df.iloc[0].to_dict()
+            results = calculate_special_assessment_scorecard(inputs)
 
-    mapping = {
-        "stable_low_volatility": 1,
-        "stable_moderate": 2,
-        "elevated_volatility": 3,
-        "falling_prices": 4,
-        "distressed": 5,
-    }
-
-    return mapping.get(status, 3)
-
-
-def score_population_trend(population_growth_vs_us):
-    growth_delta = safe_float(population_growth_vs_us, default=0)
-
-    if growth_delta > 0:
-        return 1
-    elif growth_delta == 0:
-        return 2
-    elif growth_delta > -2:
-        return 3
-    elif growth_delta > -5:
-        return 4
-    else:
-        return 5
-
-
-def calculate_economic_fundamentals_score(inputs):
-    income_score = score_income(inputs.get("ebi_percent_of_us", 100))
-    unemployment_score = score_unemployment(inputs.get("unemployment_delta_vs_us", 0))
-    msa_score = score_msa(inputs.get("msa_status", "not_broad_diverse"))
-    real_estate_score = score_real_estate_market(inputs.get("real_estate_status", "stable_moderate"))
-    population_score = score_population_trend(inputs.get("population_growth_vs_us", 0))
-
-    economic_score = (
-        income_score * ECONOMIC_SUBFACTOR_WEIGHTS["Income"]
-        + unemployment_score * ECONOMIC_SUBFACTOR_WEIGHTS["Unemployment"]
-        + msa_score * ECONOMIC_SUBFACTOR_WEIGHTS["MSA"]
-        + real_estate_score * ECONOMIC_SUBFACTOR_WEIGHTS["Real Estate Market"]
-        + population_score * ECONOMIC_SUBFACTOR_WEIGHTS["Population Trend"]
-    )
-
-    return {
-        "income_score": income_score,
-        "unemployment_score": unemployment_score,
-        "msa_score": msa_score,
-        "real_estate_score": real_estate_score,
-        "population_score": population_score,
-        "economic_fundamentals_score": round(economic_score, 2),
-    }
-
-
-# -----------------------------
-# B. District Characteristics
-# -----------------------------
-
-def score_top10_taxpayer_concentration(top10_percent_of_levy):
-    x = safe_float(top10_percent_of_levy, default=25)
-
-    if x < 5:
-        return 1
-    elif x <= 15:
-        return 2
-    elif x <= 25:
-        return 3
-    elif x <= 40:
-        return 4
-    else:
-        return 5
-
-
-def score_development_status(development_status):
-    status = str(development_status).lower().strip()
-
-    mapping = {
-        "built_out_all_end_users": 1,
-        "built_out_most_end_users": 2,
-        "mature_some_developer_concentration": 3,
-        "majority_developed_significant_undeveloped": 4,
-        "new_majority_undeveloped": 5,
-    }
-
-    return mapping.get(status, 3)
-
-
-def score_largest_taxpayer_exposure(largest_taxpayer_percent_of_levy):
-    x = safe_float(largest_taxpayer_percent_of_levy, default=8)
-
-    if x <= 1:
-        return 1
-    elif x <= 3:
-        return 2
-    elif x <= 8:
-        return 3
-    elif x <= 15:
-        return 4
-    else:
-        return 5
-
-
-def score_district_size(number_of_parcels):
-    parcels = safe_float(number_of_parcels, default=1000)
-
-    if parcels > 4000:
-        return 1
-    elif parcels >= 1500:
-        return 2
-    elif parcels >= 400:
-        return 3
-    elif parcels >= 200:
-        return 4
-    else:
-        return 5
-
-
-def score_value_to_lien(vtl_ratio):
-    vtl = safe_float(vtl_ratio, default=10)
-
-    if vtl > 40:
-        return 1
-    elif vtl >= 20:
-        return 2
-    elif vtl >= 10:
-        return 3
-    elif vtl >= 5:
-        return 4
-    else:
-        return 5
-
-
-def calculate_district_characteristics_score(inputs):
-    top10_score = score_top10_taxpayer_concentration(
-        inputs.get("top10_taxpayer_percent_of_levy", 25)
-    )
-
-    development_score = score_development_status(
-        inputs.get("development_status", "mature_some_developer_concentration")
-    )
-
-    largest_taxpayer_score = score_largest_taxpayer_exposure(
-        inputs.get("largest_taxpayer_percent_of_levy", 8)
-    )
-
-    district_size_score = score_district_size(
-        inputs.get("number_of_parcels", 1000)
-    )
-
-    vtl_score = score_value_to_lien(
-        inputs.get("value_to_lien_ratio", 10)
-    )
-
-    district_score = (
-        top10_score * DISTRICT_SUBFACTOR_WEIGHTS["Top 10 Taxpayer Concentration"]
-        + development_score * DISTRICT_SUBFACTOR_WEIGHTS["Development Status"]
-        + largest_taxpayer_score * DISTRICT_SUBFACTOR_WEIGHTS["Largest Taxpayer Exposure"]
-        + district_size_score * DISTRICT_SUBFACTOR_WEIGHTS["District Size"]
-        + vtl_score * DISTRICT_SUBFACTOR_WEIGHTS["Value To Lien"]
-    )
-
-    return {
-        "top10_taxpayer_concentration_score": top10_score,
-        "development_status_score": development_score,
-        "largest_taxpayer_exposure_score": largest_taxpayer_score,
-        "district_size_score": district_size_score,
-        "value_to_lien_score": vtl_score,
-        "district_characteristics_score": round(district_score, 2),
-    }
-
-
-# -------------------------
-# Overall Scorecard
-# -------------------------
-
-def calculate_weighted_score(
-    economic_fundamentals_score,
-    district_characteristics_score,
-    financial_profile_score,
-):
-    weighted_score = (
-        economic_fundamentals_score * SPECIAL_ASSESSMENT_WEIGHTS["Economic Fundamentals"]
-        + district_characteristics_score * SPECIAL_ASSESSMENT_WEIGHTS["District Characteristics"]
-        + financial_profile_score * SPECIAL_ASSESSMENT_WEIGHTS["Financial Profile"]
-    )
-
-    return round(weighted_score, 2)
-
-
-def map_score_to_initial_indicative_rating(weighted_score):
-    for low, high, rating in RATING_SCALE:
-        if low <= weighted_score < high:
-            return rating
-    return "Not Rated"
-
-
-def calculate_special_assessment_scorecard(inputs):
-    economic_results = calculate_economic_fundamentals_score(inputs)
-    district_results = calculate_district_characteristics_score(inputs)
-
-    economic_score = economic_results["economic_fundamentals_score"]
-    district_score = district_results["district_characteristics_score"]
-    financial_score = safe_float(inputs.get("financial_profile_score", 3), default=3)
-
-    weighted_score = calculate_weighted_score(
-        economic_score,
-        district_score,
-        financial_score,
-    )
-
-    initial_rating = map_score_to_initial_indicative_rating(weighted_score)
-
-    return {
-        **economic_results,
-        **district_results,
-        "financial_profile_score": financial_score,
-        "weighted_score": weighted_score,
-        "initial_indicative_rating": initial_rating,
-        "final_indicative_rating": initial_rating,
-    }
+            st.subheader("Scorecard Results")
+            st.json(results)
