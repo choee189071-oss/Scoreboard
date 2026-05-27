@@ -8,6 +8,14 @@ from modules.scoring_special_assessment import (
     calculate_mltm_from_cashflow,
 )
 
+from modules.ai_data_pull import (
+    run_openai_web_data_pull,
+    build_mock_ai_result,
+    extracted_fields_to_dataframe,
+    source_evidence_to_dataframe,
+    approved_fields_to_scorecard_inputs,
+)
+
 st.set_page_config(page_title="Municipal Credit Analytics Platform", layout="wide")
 
 st.title("Municipal Credit Analytics Platform")
@@ -187,10 +195,18 @@ if scoreboard_type != "Special Assessment Debt":
 
 if analysis_mode == "AI-Assisted Data Pull":
     st.header("AI-Assisted Data Pull")
-    st.warning(
-        "This mode is a structured placeholder. The UI is ready for future API integration, "
-        "but it is not yet connected to live data sources."
+
+    st.write(
+        "This workflow asks AI to search public sources, extract candidate values, "
+        "attach source evidence, and let the analyst approve values before sending them to the scorecard."
     )
+
+    # Try Streamlit secrets first. Do not print the key.
+    default_api_key = ""
+    try:
+        default_api_key = st.secrets.get("OPENAI_API_KEY", "")
+    except Exception:
+        default_api_key = ""
 
     col1, col2 = st.columns(2)
 
@@ -202,50 +218,169 @@ if analysis_mode == "AI-Assisted Data Pull":
             "Bond Type",
             ["Special Assessment Debt", "CFD / Mello-Roos", "Special Tax Bonds"],
         )
+        os_link = st.text_input("Official Statement / EMMA Link", value="")
 
     with col2:
-        os_link = st.text_input("Official Statement / EMMA Link")
-        data_targets = st.multiselect(
-            "Data to Search For",
-            [
-                "Median Household EBI",
-                "Unemployment Rate",
-                "MSA Participation",
-                "Real Estate Market Volatility",
-                "Population Growth",
-                "Top 10 Taxpayers",
-                "Assessed Value",
-                "Direct Debt",
-                "Overlapping Debt",
-                "MLTM Inputs",
-            ],
-            default=[
-                "Median Household EBI",
-                "Top 10 Taxpayers",
-                "Assessed Value",
-                "MLTM Inputs",
-            ],
+        model = st.selectbox(
+            "OpenAI Model",
+            ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"],
+            index=0,
         )
+        api_key_input = st.text_input(
+            "OpenAI API Key Override",
+            type="password",
+            value="",
+            help="Optional. Prefer using Streamlit secrets: OPENAI_API_KEY.",
+        )
+        use_mock_mode = st.checkbox(
+            "Use Mock Mode for Debugging",
+            value=True,
+            help="Use this to test the UI without API calls or API cost.",
+        )
+
+    data_targets = st.multiselect(
+        "Data to Search For / Estimate",
+        [
+            "Median Household EBI (% of U.S.)",
+            "Unemployment Rate Difference vs U.S. (%)",
+            "MSA Participation",
+            "Real Estate Market Volatility",
+            "Population Growth Difference vs U.S. (%)",
+            "Top 10 Taxpayers as % of Total Levy",
+            "Largest Taxpayer as % of Total Levy",
+            "District Size (Parcels)",
+            "Est. Value-to-Lien",
+            "Maximum Loss-to-Maturity (MLTM) %",
+            "Conveyance to Homeowners",
+        ],
+        default=[
+            "Median Household EBI (% of U.S.)",
+            "Unemployment Rate Difference vs U.S. (%)",
+            "MSA Participation",
+            "Real Estate Market Volatility",
+            "Population Growth Difference vs U.S. (%)",
+            "Top 10 Taxpayers as % of Total Levy",
+            "Largest Taxpayer as % of Total Levy",
+            "District Size (Parcels)",
+            "Est. Value-to-Lien",
+            "Maximum Loss-to-Maturity (MLTM) %",
+            "Conveyance to Homeowners",
+        ],
+    )
 
     st.markdown("### Intended AI/Data Workflow")
     st.dataframe(
         pd.DataFrame(
             [
-                ["Census / ACS", "Income, population", "Pending API integration"],
-                ["BLS / FRED", "Unemployment", "Pending API integration"],
-                ["EMMA / OS", "levy, taxpayer concentration, debt service", "Pending parser"],
-                ["County Assessor", "assessed value", "Pending web/API integration"],
-                ["Real Estate Sources", "housing market trend/distress", "Pending source manager"],
+                ["Census / ACS", "Income, population", "AI/web search now; deterministic API later"],
+                ["BLS / FRED", "Unemployment", "AI/web search now; deterministic API later"],
+                ["EMMA / OS", "levy, taxpayer concentration, debt service", "AI/web search now; parser later"],
+                ["County Assessor", "assessed value", "AI/web search now; county API/web parser later"],
+                ["Real Estate Sources", "housing market trend/distress", "AI/web search now; evidence manager later"],
             ],
             columns=["Source Type", "Target Data", "Status"],
         ),
         use_container_width=True,
     )
 
-    st.info(
-        "Next coding step: connect this page to OpenAI API + selected public data APIs, "
-        "then return source links, extracted values, confidence scores, and analyst review controls."
-    )
+    if st.button("Run AI/Data Pull", type="primary"):
+        with st.spinner("Searching sources and extracting candidate values..."):
+            if use_mock_mode:
+                ai_result = build_mock_ai_result(
+                    issuer_name=issuer_name,
+                    selected_targets=data_targets,
+                )
+            else:
+                ai_result = run_openai_web_data_pull(
+                    issuer_name=issuer_name,
+                    state=state,
+                    county_or_region=county,
+                    bond_type=bond_type,
+                    os_link=os_link,
+                    selected_targets=data_targets,
+                    api_key=api_key_input or default_api_key,
+                    model=model,
+                )
+
+        st.session_state["last_ai_data_pull_result"] = ai_result
+
+    if "last_ai_data_pull_result" in st.session_state:
+        ai_result = st.session_state["last_ai_data_pull_result"]
+
+        if not ai_result.get("ok", False):
+            st.error(ai_result.get("error", "AI data pull failed."))
+
+            if "raw_response" in ai_result:
+                with st.expander("Raw AI Response"):
+                    st.write(ai_result["raw_response"])
+
+        st.markdown("### AI Summary")
+        st.write(ai_result.get("summary", ""))
+
+        warnings = ai_result.get("warnings", [])
+        if warnings:
+            with st.expander("Warnings"):
+                for warning in warnings:
+                    st.warning(warning)
+
+        st.markdown("### Extracted Candidate Values")
+        extracted_df = extracted_fields_to_dataframe(ai_result)
+
+        reviewed_df = st.data_editor(
+            extracted_df,
+            use_container_width=True,
+            num_rows="dynamic",
+            key="ai_extracted_values_editor",
+        )
+
+        st.markdown("### Source Evidence")
+        evidence_df = source_evidence_to_dataframe(ai_result)
+        st.dataframe(evidence_df, use_container_width=True)
+
+        if st.button("Approve Selected Values and Save to Scorecard"):
+            approved_inputs = approved_fields_to_scorecard_inputs(reviewed_df)
+
+            for key, value in approved_inputs.items():
+                st.session_state[key] = value
+
+            # Map exact keys to fields already used as default values in main scorecard.
+            for scorecard_key in [
+                "top10_taxpayers_percent_of_total_levy",
+                "largest_taxpayer_percent_of_total_levy",
+                "est_value_to_lien",
+                "maximum_loss_to_maturity_percent",
+            ]:
+                if scorecard_key in approved_inputs:
+                    st.session_state[scorecard_key] = approved_inputs[scorecard_key]
+
+            st.session_state["ai_approved_scorecard_inputs"] = approved_inputs
+            st.success("Approved values saved. Switch to Main Scorecard to review and calculate.")
+
+        if st.button("Run Scorecard Using Approved AI Values"):
+            approved_inputs = st.session_state.get("ai_approved_scorecard_inputs", {})
+            if not approved_inputs:
+                st.warning("Approve values first.")
+            else:
+                fallback_inputs = {
+                    "median_household_ebi_percent_of_us": 144.0,
+                    "unemployment_rate_difference_vs_us": -0.3,
+                    "msa_participation": "Yes; Broad & Diverse",
+                    "real_estate_market_volatility": "Low Volatility; Stable Prices; Low Distress",
+                    "population_growth_difference_vs_us": 0.5,
+                    "top10_taxpayers_percent_of_total_levy": st.session_state.get("top10_taxpayers_percent_of_total_levy", 16.1),
+                    "largest_taxpayer_percent_of_total_levy": st.session_state.get("largest_taxpayer_percent_of_total_levy", 6.1),
+                    "district_size_parcels": 5900,
+                    "conveyance_to_homeowners": "Fairly Developed with Significant Conveyance (Some Developer Concentration)",
+                    "est_value_to_lien": st.session_state.get("est_value_to_lien", 15.5),
+                    "maximum_loss_to_maturity_percent": st.session_state.get("maximum_loss_to_maturity_percent", 13.9),
+                    "negative_override_notches": 0,
+                    "holistic_adjustment_notches": 0,
+                    "rating_cap": "None",
+                }
+                fallback_inputs.update(approved_inputs)
+                results = calculate_current_scorecard(fallback_inputs)
+                render_scorecard_results(results)
+
     st.stop()
 
 
