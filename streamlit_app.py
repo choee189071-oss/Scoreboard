@@ -1,6 +1,15 @@
 import streamlit as st
-
-st.title("🎈 My new app")
-st.write(
-    "Let's start building! For help and inspiration, head over to [docs.streamlit.io](https://docs.streamlit.io/)."
+st.set_page_config(
+    page_title="S&P Scoreboard Automation",
+    layout="wide"
 )
+st.title("S&P Scoreboard Automation")
+criteria_type = st.sidebar.selectbox(
+    "Select Criteria",
+    [
+        "General Fund",
+        "Special Assessment",
+        "Water / Wastewater"
+    ]
+)
+st.write(f"Currently Selected: {criteria_type}")
