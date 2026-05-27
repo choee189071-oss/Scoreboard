@@ -255,19 +255,23 @@ def assess_real_estate_market_volatility(real_estate_market_volatility: Any) -> 
     - Elevated Volatility; Stable Prices; Affordability Worse Than National Figures
     - Falling Local Home Prices; High Price Volatility; Low Affordability; Rising Distress
     - Falling Local Home Prices; High Price Volatility; Significantly Worse Affordability; Rising Distress
+
+    Note:
+    The sample scorecard places "Low Volatility; Stable Prices; Low Distress"
+    in the Strong column, so this implementation maps that exact label to 2.
     """
     status = normalize_text(real_estate_market_volatility)
 
     mapping = {
-        "low_volatility_stable_prices_low_distress": 1,
-        "stable_low_volatility": 1,
-        "low_volatility": 1,
-
-        # In the sample matrix, the "Strong" real estate box can still describe
-        # low volatility / stable prices / low distress.
-        "low_volatility_stable_prices_low_distress_strong": 2,
+        # Match sample scorecard: Low Volatility / Stable Prices / Low Distress = Strong = 2
+        "low_volatility_stable_prices_low_distress": 2,
         "stable_moderate": 2,
         "stable": 2,
+
+        # Optional explicit Very Strong aliases, if you want to use them later
+        "very_strong_low_volatility_stable_prices_low_distress": 1,
+        "very_strong_low_volatility": 1,
+        "stable_low_volatility": 1,
 
         "elevated_volatility_stable_prices_affordability_worse_than_national_figures": 3,
         "elevated_volatility": 3,
@@ -552,6 +556,10 @@ def calculate_financial_profile_assessment(
     Dimensions:
     - Top 10 Taxpayers as % of Total Levy
     - Maximum Loss-to-Maturity (MLTM) %
+
+    Fix applied:
+    For Top 10 bucket 15%-25% and MLTM bucket 10%-15%,
+    sample scorecard shows Weak/Adequate = 3.5, not Weak = 4.
     """
     top10 = safe_float(top10_taxpayers_percent_of_total_levy, default=25)
     mltm = safe_float(maximum_loss_to_maturity_percent, default=15)
@@ -618,7 +626,7 @@ def calculate_financial_profile_assessment(
             "25%-30%": 3,
             "20%-25%": 3.5,
             "15%-20%": 3.5,
-            "10%-15%": 4,
+            "10%-15%": 3.5,
             "5%-10%": 4.5,
             "<=5%": 4.5,
         },
