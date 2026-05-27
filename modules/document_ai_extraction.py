@@ -2,16 +2,12 @@
 """
 Document-first AI Extraction Module
 
-This module avoids asking AI to freely search the web for values.
-Instead, the workflow is:
-
+Workflow:
 1. Analyst uploads source documents/tables.
 2. The app parses text/tables locally.
 3. AI extracts candidate scorecard values ONLY from uploaded context.
 4. Analyst reviews/approves values.
 5. Approved values are passed into the scorecard.
-
-This is much more stable than web-search-only extraction.
 """
 
 from __future__ import annotations
@@ -75,7 +71,7 @@ def _extract_json_from_text(text: str) -> Dict[str, Any]:
     return {}
 
 
-def _coerce_numeric(value: Any) -> Optional[float]:
+def _coerce_numeric(value: Any):
     if value is None:
         return None
 
@@ -99,23 +95,6 @@ def _coerce_numeric(value: Any) -> Optional[float]:
 
 
 def read_uploaded_file_to_context(uploaded_file) -> Dict[str, Any]:
-    """
-    Parse uploaded file into text/tables.
-
-    Supported:
-    - .csv
-    - .xlsx / .xls
-    - .txt
-    - .pdf, if pypdf is installed
-
-    Returns:
-    {
-      "file_name": ...,
-      "file_type": ...,
-      "text": ...,
-      "tables": [...]
-    }
-    """
     file_name = uploaded_file.name
     suffix = file_name.lower().split(".")[-1]
 
@@ -186,9 +165,6 @@ def read_uploaded_file_to_context(uploaded_file) -> Dict[str, Any]:
 
 
 def build_document_context(parsed_docs: List[Dict[str, Any]], max_chars: int = 60000) -> str:
-    """
-    Combines parsed documents into a context string, capped for token control.
-    """
     parts = []
 
     for doc in parsed_docs:
@@ -233,29 +209,24 @@ Bond Type: {bond_type}
 Targets:
 {json.dumps(target_instructions, indent=2)}
 
-Scorecard categorical labels allowed:
-- MSA Participation:
-  1. "Yes; Broad & Diverse"
-  2. "Yes; Not Broad & Diverse"
-  3. "No"
-
+Allowed categorical labels:
+- MSA Participation: "Yes; Broad & Diverse", "Yes; Not Broad & Diverse", "No"
 - Real Estate Market Volatility:
-  1. "Low Volatility; Stable Prices; Low Distress"
-  2. "Elevated Volatility; Stable Prices; Affordability Worse Than National Figures"
-  3. "Falling Local Home Prices; High Price Volatility; Low Affordability; Rising Distress"
-  4. "Falling Local Home Prices; High Price Volatility; Significantly Worse Affordability; Rising Distress"
-
+  "Low Volatility; Stable Prices; Low Distress",
+  "Elevated Volatility; Stable Prices; Affordability Worse Than National Figures",
+  "Falling Local Home Prices; High Price Volatility; Low Affordability; Rising Distress",
+  "Falling Local Home Prices; High Price Volatility; Significantly Worse Affordability; Rising Distress"
 - Conveyance to Homeowners:
-  1. "All or Nearly All Conveyed"
-  2. "Most Conveyed"
-  3. "Fairly Developed with Significant Conveyance (Some Developer Concentration)"
-  4. "Developed; Significant Undeveloped Parcels Comprise Minority (Large Developer Concentration)"
-  5. "Undeveloped with Limited Vertical Construction; High Concentration"
+  "All or Nearly All Conveyed",
+  "Most Conveyed",
+  "Fairly Developed with Significant Conveyance (Some Developer Concentration)",
+  "Developed; Significant Undeveloped Parcels Comprise Minority (Large Developer Concentration)",
+  "Undeveloped with Limited Vertical Construction; High Concentration"
 
-Return JSON only with this exact structure:
+Return JSON only:
 {{
   "issuer_name": "{issuer_name}",
-  "summary": "brief analyst-facing summary of what was found",
+  "summary": "brief analyst-facing summary",
   "extracted_fields": [
     {{
       "scorecard_field": "Top 10 Taxpayers as % of Total Levy",
@@ -264,7 +235,7 @@ Return JSON only with this exact structure:
       "numeric_value": 16.1,
       "unit": "%",
       "source_document": "file name or sheet name",
-      "source_excerpt": "short excerpt from uploaded document supporting the value",
+      "source_excerpt": "short excerpt supporting the value",
       "confidence": 0.85,
       "notes": "short explanation"
     }}
@@ -338,11 +309,7 @@ def run_document_ai_extraction(
         response = client.responses.create(
             model=model,
             input=prompt,
-            text={
-                "format": {
-                    "type": "json_object"
-                }
-            },
+            text={"format": {"type": "json_object"}},
         )
 
         text = getattr(response, "output_text", None)
@@ -384,16 +351,8 @@ def run_document_ai_extraction(
 def extracted_fields_to_dataframe(result: Dict[str, Any]) -> pd.DataFrame:
     fields = result.get("extracted_fields", []) or []
     columns = [
-        "approve",
-        "scorecard_field",
-        "scorecard_key",
-        "value",
-        "numeric_value",
-        "unit",
-        "source_document",
-        "source_excerpt",
-        "confidence",
-        "notes",
+        "approve", "scorecard_field", "scorecard_key", "value", "numeric_value", "unit",
+        "source_document", "source_excerpt", "confidence", "notes",
     ]
 
     if not fields:
@@ -406,7 +365,6 @@ def extracted_fields_to_dataframe(result: Dict[str, Any]) -> pd.DataFrame:
             df[col] = None
 
     df["approve"] = df.get("confidence", pd.Series([0] * len(df))).fillna(0).astype(float) >= 0.70
-
     df["numeric_value"] = df.apply(
         lambda row: row["numeric_value"] if pd.notna(row["numeric_value"]) else _coerce_numeric(row["value"]),
         axis=1,
@@ -451,53 +409,3 @@ def approved_fields_to_scorecard_inputs(approved_df: pd.DataFrame) -> Dict[str, 
             inputs[key] = raw_value
 
     return inputs
-
-
-def build_mock_document_ai_result(issuer_name: str, selected_targets: List[str]) -> Dict[str, Any]:
-    mock_values = {
-        "Median Household EBI (% of U.S.)": ("144%", 144.0, "%", "sample_economic_appendix.xlsx", "Median Household EBI: 144% of U.S."),
-        "Unemployment Rate Difference vs U.S. (%)": ("-0.3%", -0.3, "%", "sample_economic_appendix.xlsx", "4.1% vs 4.4%"),
-        "MSA Participation": ("Yes; Broad & Diverse", None, "", "sample_economic_appendix.xlsx", "Sacramento-Roseville-Arden MSA"),
-        "Real Estate Market Volatility": ("Low Volatility; Stable Prices; Low Distress", None, "", "sample_economic_appendix.xlsx", "Stable prices and low distress"),
-        "Population Growth Difference vs U.S. (%)": ("0.5%", 0.5, "%", "sample_economic_appendix.xlsx", "Population growth above national growth"),
-        "Top 10 Taxpayers as % of Total Levy": ("16.1%", 16.1, "%", "sample_top_taxpayers.xlsx", "Top 10 % of Total Levy: 16.10%"),
-        "Largest Taxpayer as % of Total Levy": ("6.1%", 6.1, "%", "sample_top_taxpayers.xlsx", "Lennar Landbank: 6.10%"),
-        "District Size (Parcels)": ("5900", 5900.0, "parcels", "sample_district_characteristics.xlsx", "District Size: +5,900"),
-        "Est. Value-to-Lien": ("15.5-to-1", 15.5, "x", "sample_vtl.xlsx", "Direct & Overlapping VTL: 15.53-to-1"),
-        "Maximum Loss-to-Maturity (MLTM) %": ("13.9%", 13.9, "%", "sample_mltm.xlsx", "S&P MLTM: 13.9%"),
-        "Conveyance to Homeowners": ("Fairly Developed with Significant Conveyance (Some Developer Concentration)", None, "", "sample_builder_table.xlsx", "Fairly Developed"),
-    }
-
-    extracted = []
-    for target in selected_targets:
-        value, numeric, unit, doc, excerpt = mock_values.get(target, (None, None, "", "mock", "not found"))
-        extracted.append(
-            {
-                "scorecard_field": target,
-                "scorecard_key": SCORECARD_FIELD_MAP.get(target, ""),
-                "value": value,
-                "numeric_value": numeric,
-                "unit": unit,
-                "source_document": doc,
-                "source_excerpt": excerpt,
-                "confidence": 0.85,
-                "notes": "Mock value for workflow testing.",
-            }
-        )
-
-    return {
-        "ok": True,
-        "issuer_name": issuer_name,
-        "summary": "Mock document-first extraction completed.",
-        "extracted_fields": extracted,
-        "derived_calculations": [
-            {
-                "calculation_name": "Scorecard-ready input extraction",
-                "formula": "Document extraction + analyst review",
-                "inputs_used": selected_targets,
-                "output_value": "candidate scorecard fields",
-                "notes": "Mock mode only.",
-            }
-        ],
-        "warnings": ["Mock mode only; not based on uploaded files."],
-    }
