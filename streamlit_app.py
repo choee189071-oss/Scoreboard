@@ -31,8 +31,16 @@ from modules.scoring_special_assessment import (
 )
 
 if uploaded_file is not None:
-    df = pd.read_csv(uploaded_file)
+    try:
+    df = pd.read_csv(uploaded_file, encoding="utf-8")
+except UnicodeDecodeError:
+    uploaded_file.seek(0)
 
+    try:
+        df = pd.read_csv(uploaded_file, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        uploaded_file.seek(0)
+        df = pd.read_csv(uploaded_file, encoding="latin1")
     st.subheader("Preview Data")
     st.dataframe(df)
 
