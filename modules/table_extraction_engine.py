@@ -657,9 +657,15 @@ def _find_amount(text: str, patterns: List[str]) -> Optional[float]:
 def extract_vtl_inputs_from_text(text: Any) -> Dict[str, Optional[float]]:
     content = safe_text(text)
     assessed_value = _find_amount(content, [
-        r"total assessed value[^$\d]{0,160}\$?\s*([\d,]+(?:\.\d+)?)",
-        r"assessed value[^$\d]{0,160}\$?\s*([\d,]+(?:\.\d+)?)",
-        r"fiscal year[^\n]{0,180}assessed value[^$\d]{0,160}\$?\s*([\d,]+(?:\.\d+)?)",
+        # Prefer the total tax base used in CFD VTL / tax-base analysis.
+        r"assessed\s+value\s+of\s+all\s+(?:the\s+)?taxable\s+property[^$\d]{0,260}\$?\s*([\d,]+(?:\.\d+)?)",
+        r"fiscal\s+year\s+\d{4}(?:-\d{2})?[^.]{0,300}?assessed\s+value\s+of\s+all\s+(?:the\s+)?taxable\s+property[^$\d]{0,260}\$?\s*([\d,]+(?:\.\d+)?)",
+        r"(?:total|aggregate)\s+assessed\s+value[^$\d]{0,240}\$?\s*([\d,]+(?:\.\d+)?)",
+        r"taxable\s+assessed\s+value[^$\d]{0,240}\$?\s*([\d,]+(?:\.\d+)?)",
+        r"(?:total|aggregate)?\s*assessed\s+valuation[^$\d]{0,240}\$?\s*([\d,]+(?:\.\d+)?)",
+        r"preliminary\s+assessed\s+value[^$\d]{0,300}\$?\s*([\d,]+(?:\.\d+)?)",
+        r"developed\s+property[^.]{0,320}?assessed\s+value[^$\d]{0,240}\$?\s*([\d,]+(?:\.\d+)?)",
+        r"assessed\s+value[^$\d]{0,180}\$?\s*([\d,]+(?:\.\d+)?)",
     ])
     direct_debt = _find_amount(content, [
         r"direct debt[^$\d]{0,180}\$?\s*([\d,]+(?:\.\d+)?)",
