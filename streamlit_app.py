@@ -2603,6 +2603,91 @@ def _parse_money_series(series):
     return pd.Series([_parse_money_value(v) for v in series])
 
 
+
+# =============================================================================
+# Calculator widget-state sync helpers
+# =============================================================================
+
+def _safe_float_or_none(value):
+    try:
+        if value is None or pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        return float(value)
+    except Exception:
+        parsed = _parse_money_value(value)
+        if parsed is not None:
+            return float(parsed)
+        try:
+            return float(parse_numeric_input(value))
+        except Exception:
+            return None
+
+
+def sync_vtl_prefill_to_widgets(prefill: dict, source_note=None):
+    """Immediately sync approved VTL candidates into the visible number_input widgets.
+
+    Streamlit widgets keep their own state after first render, so updating only
+    `vtl_prefill` is not enough. This helper updates both the prefill store and
+    the widget keys, then the caller can rerun to refresh the UI.
+    """
+    if not prefill:
+        return
+    existing = st.session_state.get('vtl_prefill', {}) or {}
+    key_map = {
+        'assessed_value': 'vtl_assessed_value_input',
+        'direct_debt': 'vtl_direct_debt_input',
+        'overlapping_debt': 'vtl_overlapping_debt_input',
+    }
+    for data_key, widget_key in key_map.items():
+        val = _safe_float_or_none(prefill.get(data_key))
+        if val is not None:
+            existing[data_key] = val
+            st.session_state[widget_key] = val
+    st.session_state['vtl_prefill'] = existing
+    if source_note:
+        st.session_state['vtl_direct_source_note'] = source_note
+
+
+def sync_taxpayer_table_to_editor(df, source=None):
+    """Load an approved taxpayer table into the editor and clear old widget state."""
+    if df is None or df.empty:
+        return
+    cleaned = df.copy()
+    if 'taxpayer_name' in cleaned.columns:
+        cleaned['taxpayer_name'] = cleaned['taxpayer_name'].astype(str)
+    if 'levy_percent' in cleaned.columns:
+        cleaned['levy_percent'] = numeric_series_from_column(cleaned['levy_percent'])
+    st.session_state['taxpayer_table_default'] = cleaned
+    if source:
+        st.session_state['taxpayer_table_source'] = source
+    # data_editor stores edited state under its key; delete it so the new default appears.
+    st.session_state.pop('taxpayer_concentration_editor', None)
+
+
+def sync_mltm_schedule_to_editor(df=None, reserve_fund=None, source=None):
+    """Load approved MLTM schedule/reserve into visible editor + number_input."""
+    if df is not None and not df.empty:
+        cleaned = df.copy()
+        st.session_state['mltm_cashflow_default'] = cleaned
+        st.session_state.pop('mltm_cashflow_editor', None)
+    val = _safe_float_or_none(reserve_fund)
+    if val is not None:
+        st.session_state['mltm_reserve_default'] = val
+        st.session_state['mltm_initial_reserve_fund'] = val
+    if source:
+        st.session_state['mltm_schedule_source'] = source
+
+
+def rerun_after_approve():
+    """Force approved candidate values to re-render in downstream calculator widgets."""
+    try:
+        st.rerun()
+    except Exception:
+        st.experimental_rerun()
+
 def scan_taxpayer_table_candidates(parsed_docs):
     """AI-assisted but deterministic table scout for Top Taxpayer / levy concentration tables."""
     candidates = []
@@ -3515,9 +3600,9 @@ with tab_calcs:
                             st.caption(cand.get("notes", ""))
                             st.dataframe(cand["data"], use_container_width=True, hide_index=True)
                             if st.button("Approve and Load This Taxpayer Table", key=f"approve_taxpayer_ai_table_{i}"):
-                                st.session_state["taxpayer_table_default"] = cand["data"].copy()
-                                st.session_state["taxpayer_table_source"] = cand["source_document"]
+                                sync_taxpayer_table_to_editor(cand["data"].copy(), source=cand["source_document"])
                                 st.success("Loaded into Taxpayer Concentration Builder. Please review, edit if needed, then calculate.")
+                                rerun_after_approve()
 
             st.markdown("---")
             st.subheader("Fallback: Upload / Map Taxpayer Table")
@@ -3554,9 +3639,9 @@ with tab_calcs:
                 st.caption("Preview after column mapping")
                 st.dataframe(mapped_taxpayer_df.head(20), use_container_width=True, hide_index=True)
                 if st.button("Approve Uploaded Taxpayer Table", key="approve_taxpayer_direct_upload"):
-                    st.session_state["taxpayer_table_default"] = mapped_taxpayer_df.copy()
-                    st.session_state["taxpayer_table_source"] = taxpayer_upload.name
+                    sync_taxpayer_table_to_editor(mapped_taxpayer_df.copy(), source=taxpayer_upload.name)
                     st.success("Uploaded table loaded into Taxpayer Concentration Builder. Review/edit below before calculating.")
+                    rerun_after_approve()
 
             taxpayer_public_cand = render_public_source_scout_common(
                 calculator_name="Taxpayer Concentration",
@@ -3577,9 +3662,12 @@ with tab_calcs:
                     st.caption("Preview of AI-sourced public taxpayer table")
                     st.dataframe(taxpayer_public_df, use_container_width=True, hide_index=True)
                     if st.button("Approve AI-Sourced Taxpayer Table", key="approve_taxpayer_public_source"):
-                        st.session_state["taxpayer_table_default"] = taxpayer_public_df.copy()
-                        st.session_state["taxpayer_table_source"] = taxpayer_public_cand.get("source_url") or taxpayer_public_cand.get("source_title") or "AI Public Source Scout"
+                        sync_taxpayer_table_to_editor(
+                            taxpayer_public_df.copy(),
+                            source=taxpayer_public_cand.get("source_url") or taxpayer_public_cand.get("source_title") or "AI Public Source Scout",
+                        )
                         st.success("AI-sourced taxpayer table loaded. Review/edit below before calculating.")
+                        rerun_after_approve()
                 else:
                     st.warning("AI found a taxpayer candidate, but the table columns were not standardized. Use the upload/mapping fallback or copy values manually.")
             elif taxpayer_public_cand and taxpayer_public_cand.get("ok"):
@@ -3673,8 +3761,9 @@ with tab_calcs:
                         for k in ["assessed_value", "direct_debt", "overlapping_debt"]:
                             if cand.get(k) is not None:
                                 existing[k] = float(cand[k])
-                        st.session_state["vtl_prefill"] = existing
+                        sync_vtl_prefill_to_widgets(existing, source_note=cand.get("source_document"))
                         st.success("Loaded into Value-to-Lien calculator. Review/edit before calculating.")
+                        rerun_after_approve()
                 else:
                     render_no_candidate_guidance("VTL inputs")
 
@@ -3700,9 +3789,9 @@ with tab_calcs:
                     if v is not None:
                         existing[k] = float(v)
                 if existing:
-                    st.session_state["vtl_prefill"] = existing
-                    st.session_state["vtl_direct_source_note"] = vtl_source_note
+                    sync_vtl_prefill_to_widgets(existing, source_note=vtl_source_note)
                     st.success("Direct VTL inputs loaded. Review/edit below before calculating.")
+                    rerun_after_approve()
                 else:
                     st.warning("No valid numeric VTL values were entered.")
 
@@ -3728,9 +3817,9 @@ with tab_calcs:
                         if vals.get(src_key) is not None:
                             existing[dest_key] = float(parse_numeric_input(vals.get(src_key)))
                     if existing:
-                        st.session_state["vtl_prefill"] = existing
-                        st.session_state["vtl_direct_source_note"] = vtl_public_cand.get("source_url") or vtl_public_cand.get("source_title")
+                        sync_vtl_prefill_to_widgets(existing, source_note=vtl_public_cand.get("source_url") or vtl_public_cand.get("source_title"))
                         st.success("AI-sourced VTL inputs loaded. Review/edit below before calculating.")
+                        rerun_after_approve()
                     else:
                         st.warning("AI did not return usable numeric VTL inputs.")
 
@@ -3806,11 +3895,13 @@ with tab_calcs:
                                 st.metric("Reserve Fund Candidate", f"${cand['reserve_fund']:,.0f}")
                             st.dataframe(cand["data"], use_container_width=True, hide_index=True)
                             if st.button("Approve and Load This MLTM Schedule", key=f"approve_mltm_ai_schedule_{i}"):
-                                st.session_state["mltm_cashflow_default"] = cand["data"].copy()
-                                if cand.get("reserve_fund"):
-                                    st.session_state["mltm_reserve_default"] = float(cand["reserve_fund"])
-                                st.session_state["mltm_schedule_source"] = cand["source_document"]
+                                sync_mltm_schedule_to_editor(
+                                    cand["data"].copy(),
+                                    reserve_fund=cand.get("reserve_fund"),
+                                    source=cand["source_document"],
+                                )
                                 st.success("Loaded into MLTM Stress Test. Review/edit before calculating.")
+                                rerun_after_approve()
 
             st.markdown("---")
             st.subheader("Fallback: Upload / Map MLTM Cashflow Schedule")
@@ -3855,12 +3946,14 @@ with tab_calcs:
                 st.dataframe(mapped_mltm_df.head(20), use_container_width=True, hide_index=True)
                 reserve_direct = st.text_input("Optional reserve fund from source", value="", key="mltm_direct_reserve")
                 if st.button("Approve Uploaded MLTM Schedule", key="approve_mltm_direct_upload"):
-                    st.session_state["mltm_cashflow_default"] = mapped_mltm_df.copy()
                     reserve_val = _parse_money_value(reserve_direct)
-                    if reserve_val is not None:
-                        st.session_state["mltm_reserve_default"] = float(reserve_val)
-                    st.session_state["mltm_schedule_source"] = mltm_upload.name
+                    sync_mltm_schedule_to_editor(
+                        mapped_mltm_df.copy(),
+                        reserve_fund=reserve_val,
+                        source=mltm_upload.name,
+                    )
                     st.success("Uploaded schedule loaded into MLTM Stress Test. Review/edit below before calculating.")
+                    rerun_after_approve()
 
             mltm_public_cand = render_public_source_scout_common(
                 calculator_name="MLTM Stress Test",
@@ -3884,12 +3977,17 @@ with tab_calcs:
                     st.caption("Preview of AI-sourced public MLTM cashflow schedule")
                     st.dataframe(mltm_public_df, use_container_width=True, hide_index=True)
                     if st.button("Approve AI-Sourced MLTM Schedule", key="approve_mltm_public_source"):
-                        st.session_state["mltm_cashflow_default"] = mltm_public_df.copy()
                         vals = _candidate_values_dict(mltm_public_cand)
+                        reserve_val = None
                         if vals.get("initial_reserve_fund") is not None:
-                            st.session_state["mltm_reserve_default"] = float(parse_numeric_input(vals.get("initial_reserve_fund")))
-                        st.session_state["mltm_schedule_source"] = mltm_public_cand.get("source_url") or mltm_public_cand.get("source_title") or "AI Public Source Scout"
+                            reserve_val = float(parse_numeric_input(vals.get("initial_reserve_fund")))
+                        sync_mltm_schedule_to_editor(
+                            mltm_public_df.copy(),
+                            reserve_fund=reserve_val,
+                            source=mltm_public_cand.get("source_url") or mltm_public_cand.get("source_title") or "AI Public Source Scout",
+                        )
                         st.success("AI-sourced MLTM schedule loaded. Review/edit below before calculating.")
+                        rerun_after_approve()
                 else:
                     st.warning("AI found an MLTM candidate, but the table columns were not standardized. Use the upload/mapping fallback or copy values manually.")
             elif mltm_public_cand and mltm_public_cand.get("ok"):
@@ -3898,9 +3996,12 @@ with tab_calcs:
                     st.info("AI found an initial reserve fund but not a full cashflow schedule. You can approve the reserve fund, then upload/map the cashflow schedule separately.")
                     st.metric("Initial Reserve Fund Candidate", f"${parse_numeric_input(vals.get('initial_reserve_fund')):,.0f}")
                     if st.button("Approve AI-Sourced Reserve Fund", key="approve_mltm_public_reserve"):
-                        st.session_state["mltm_reserve_default"] = float(parse_numeric_input(vals.get("initial_reserve_fund")))
-                        st.session_state["mltm_schedule_source"] = mltm_public_cand.get("source_url") or mltm_public_cand.get("source_title") or "AI Public Source Scout"
+                        sync_mltm_schedule_to_editor(
+                            reserve_fund=float(parse_numeric_input(vals.get("initial_reserve_fund"))),
+                            source=mltm_public_cand.get("source_url") or mltm_public_cand.get("source_title") or "AI Public Source Scout",
+                        )
                         st.success("Reserve fund loaded. Review/edit below before calculating.")
+                        rerun_after_approve()
 
         initial_reserve_fund = st.number_input(
             "Initial Reserve Fund",
