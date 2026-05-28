@@ -51,6 +51,83 @@ st.caption(
 
 
 # =============================================================================
+# Geography Auto Mapper
+# =============================================================================
+
+STATE_FIPS_LOOKUP = {
+    "CA": "06",
+    "NY": "36",
+    "TX": "48",
+    "FL": "12",
+    "IL": "17",
+    "NJ": "34",
+    "PA": "42",
+    "AZ": "04",
+    "NV": "32",
+    "WA": "53",
+    "OR": "41",
+    "CO": "08",
+    "MA": "25",
+}
+
+COUNTY_FIPS_LOOKUP = {
+    ("CA", "Alameda"): "001",
+    ("CA", "Contra Costa"): "013",
+    ("CA", "Los Angeles"): "037",
+    ("CA", "Orange"): "059",
+    ("CA", "Riverside"): "065",
+    ("CA", "Sacramento"): "067",
+    ("CA", "San Bernardino"): "071",
+    ("CA", "San Diego"): "073",
+    ("CA", "San Francisco"): "075",
+    ("CA", "San Mateo"): "081",
+    ("CA", "Santa Clara"): "085",
+    ("CA", "Ventura"): "111",
+}
+
+COUNTY_TO_MSA = {
+    ("CA", "Alameda"): "San Francisco-Oakland-Berkeley",
+    ("CA", "Contra Costa"): "San Francisco-Oakland-Berkeley",
+    ("CA", "Los Angeles"): "Los Angeles-Long Beach-Anaheim",
+    ("CA", "Orange"): "Los Angeles-Long Beach-Anaheim",
+    ("CA", "Riverside"): "Riverside-San Bernardino-Ontario",
+    ("CA", "Sacramento"): "Sacramento-Roseville-Folsom",
+    ("CA", "San Bernardino"): "Riverside-San Bernardino-Ontario",
+    ("CA", "San Diego"): "San Diego-Chula Vista-Carlsbad",
+    ("CA", "San Francisco"): "San Francisco-Oakland-Berkeley",
+    ("CA", "San Mateo"): "San Francisco-Oakland-Berkeley",
+    ("CA", "Santa Clara"): "San Jose-Sunnyvale-Santa Clara",
+    ("CA", "Ventura"): "Oxnard-Thousand Oaks-Ventura",
+}
+
+
+def normalize_county_name(county_name):
+    """Normalizes user-entered county names for lookup keys."""
+    county = (county_name or "").strip()
+    county = re.sub(r"\s+County$", "", county, flags=re.I).strip()
+    return county
+
+
+def auto_map_geography(state, county_name):
+    """
+    Auto maps State + County to State FIPS, County FIPS, and MSA name.
+
+    If a lookup is unavailable, returns blanks so the UI can fall back to manual input.
+    """
+    state_clean = (state or "").strip().upper()
+    county_clean = normalize_county_name(county_name)
+    key = (state_clean, county_clean)
+
+    return {
+        "state_fips": STATE_FIPS_LOOKUP.get(state_clean, ""),
+        "county_name_clean": county_clean,
+        "county_fips": COUNTY_FIPS_LOOKUP.get(key, ""),
+        "msa_name": COUNTY_TO_MSA.get(key, ""),
+        "is_fully_mapped": bool(COUNTY_FIPS_LOOKUP.get(key) and COUNTY_TO_MSA.get(key)),
+    }
+
+
+# =============================================================================
 # Advanced Status System
 # =============================================================================
 
@@ -4108,30 +4185,64 @@ with tab_deal:
 
     with col1:
         issuer_name = st.text_input("Issuer / District Name", value=setup.get("issuer_name", ""))
-        state = st.text_input("State", value=setup.get("state", "CA"))
+        state = st.text_input("State", value=setup.get("state", "CA")).strip().upper()
         bond_type = st.selectbox(
             "Bond Type",
             ["Special Assessment Debt", "CFD / Mello-Roos", "Special Tax Bonds"],
             index=0,
         )
 
+    with col3:
+        county_name_raw = st.text_input("County Name", value=setup.get("county_name", "Orange County"))
+        census_year = st.number_input(
+            "ACS Year",
+            min_value=2018,
+            max_value=2024,
+            value=int(setup.get("census_year", 2023)),
+            step=1,
+        )
+
+    geo_map = auto_map_geography(state, county_name_raw)
+    county_name = geo_map["county_name_clean"] or county_name_raw
+
     with col2:
-        state_fips = st.text_input("State FIPS", value=setup.get("state_fips", "06"))
+        mapped_state_fips = geo_map["state_fips"] or setup.get("state_fips", "")
+        state_fips = st.text_input(
+            "State FIPS",
+            value=mapped_state_fips,
+            disabled=bool(geo_map["state_fips"]),
+            help="Auto-mapped from State when available.",
+        )
         geography_type = st.selectbox(
             "Geography Type",
             ["county", "place"],
             index=0 if setup.get("geography_type", "county") == "county" else 1,
         )
+        mapped_county_fips = geo_map["county_fips"]
         county_or_place_fips = st.text_input(
             "County / Place FIPS",
-            value=setup.get("county_or_place_fips", "059"),
-            help="County FIPS is 3 digits. Place FIPS is usually 5 digits.",
+            value=mapped_county_fips or setup.get("county_or_place_fips", ""),
+            disabled=bool(mapped_county_fips) and geography_type == "county",
+            help="Auto-mapped from State + County when available. County FIPS is 3 digits; Place FIPS is usually 5 digits.",
         )
 
     with col3:
-        county_name = st.text_input("County Name", value=setup.get("county_name", "Orange County"))
-        location_name = st.text_input("Location / MSA Name", value=setup.get("location_name", "Los Angeles-Long Beach-Anaheim"))
-        census_year = st.number_input("ACS Year", min_value=2018, max_value=2024, value=int(setup.get("census_year", 2023)), step=1)
+        mapped_msa = geo_map["msa_name"]
+        location_name = st.text_input(
+            "Location / MSA Name",
+            value=mapped_msa or setup.get("location_name", ""),
+            disabled=bool(mapped_msa),
+            help="Auto-mapped from State + County when available. Used for housing and regional market context.",
+        )
+
+    if geo_map["is_fully_mapped"]:
+        st.success(
+            f"Geography auto-mapped: {county_name} County, {state} → County FIPS {county_or_place_fips}; MSA: {location_name}."
+        )
+    else:
+        st.warning(
+            "Geography was not fully auto-mapped. Please verify County FIPS and MSA manually before running market/context pulls."
+        )
 
     deal_setup = {
         "issuer_name": issuer_name,
@@ -4145,6 +4256,8 @@ with tab_deal:
         "census_year": census_year,
     }
     st.session_state["deal_setup"] = deal_setup
+    st.session_state["county_fips"] = county_or_place_fips
+    st.session_state["location_name"] = location_name
 
     st.markdown("---")
     st.subheader("B. Minimum Viable Evidence")
