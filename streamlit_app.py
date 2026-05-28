@@ -2763,6 +2763,200 @@ def render_no_candidate_guidance(kind):
         "Do not rely on AI extraction alone. Upload the original Excel/CSV schedule when possible, review units carefully, and keep the source file/link for audit trail."
     )
 
+
+
+# =============================================================================
+# Calculator Public Source Scout Helpers
+# =============================================================================
+
+def _safe_json_from_text(text):
+    """Extract the first JSON object from model output."""
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return {}
+    try:
+        return json.loads(match.group())
+    except Exception:
+        return {}
+
+
+def ai_public_source_scout_for_calculator(calculator_name, issuer_name, state, county_name, targets, api_key, model):
+    """Use OpenAI web search to find public/source-backed calculator inputs.
+
+    The scout is intentionally conservative. It must return source links and evidence; values are only
+    pre-filled after analyst approval and should still be reviewed manually.
+    """
+    if not api_key:
+        return {"ok": False, "error": "OpenAI API key is required for AI public source scouting."}
+
+    target_text = "\n".join([f"- {t}" for t in targets])
+    prompt = f"""
+You are assisting a municipal credit analyst. Find public, source-backed inputs for the calculator below.
+
+Calculator: {calculator_name}
+Issuer / district: {issuer_name}
+State: {state}
+County / region: {county_name}
+Targets to find:
+{target_text}
+
+Rules:
+1. Do not invent data.
+2. Prefer official statement PDFs, EMMA/MSRB pages, county assessor/open data, official issuer disclosures, continuing disclosure, or clearly reputable public data.
+3. Return only values that have a source URL and short evidence snippet.
+4. If a value is not reliably found, return null for that field and explain why.
+5. Output valid JSON only.
+
+Use this schema:
+{{
+  "ok": true,
+  "calculator_name": "{calculator_name}",
+  "confidence": 0.0,
+  "source_title": "",
+  "source_url": "",
+  "source_type": "official_statement | county_open_data | issuer_disclosure | EMMA | other_public_source | not_found",
+  "evidence_snippet": "",
+  "warning": "Analyst must independently verify source, units, dates, and whether values match the target issue.",
+  "values": {{
+    "assessed_value": null,
+    "direct_debt": null,
+    "overlapping_debt": null,
+    "initial_reserve_fund": null,
+    "top10_taxpayers_percent_of_total_levy": null,
+    "largest_taxpayer_percent_of_total_levy": null
+  }},
+  "taxpayer_table": [{{"taxpayer_name": "", "levy_percent": null}}],
+  "mltm_cashflow": [{{"year": null, "special_tax_levy": null, "annual_debt_service": null}}],
+  "missing_fields": [],
+  "notes": ""
+}}
+"""
+    payload = {
+        "model": model,
+        "input": prompt,
+        "tools": [{"type": "web_search_preview"}],
+        "tool_choice": "auto",
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    response = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=90)
+    if response.status_code >= 400:
+        return {"ok": False, "error": f"OpenAI source scout failed: {response.status_code} {response.text[:500]}"}
+    data = response.json()
+    output_text = data.get("output_text")
+    if not output_text:
+        chunks = []
+        for item in data.get("output", []) or []:
+            for content in item.get("content", []) or []:
+                if content.get("type") in ["output_text", "text"]:
+                    chunks.append(content.get("text", ""))
+        output_text = "\n".join(chunks).strip()
+    parsed = _safe_json_from_text(output_text)
+    if not parsed:
+        return {"ok": False, "error": "AI source scout did not return parseable JSON.", "raw_output": output_text[:2000]}
+    parsed.setdefault("ok", True)
+    parsed.setdefault("warning", "Analyst must independently verify source, units, dates, and whether values match the target issue.")
+    return parsed
+
+
+def render_public_source_scout_common(calculator_name, targets, key_prefix):
+    """Render a reusable AI Source Scout panel and store candidate in session_state."""
+    deal_setup = st.session_state.get("deal_setup", {}) or {}
+    st.markdown("---")
+    st.subheader("AI Public Source Scout")
+    st.caption(
+        "Optional fallback when uploaded documents and table mapping do not work. It searches public sources and returns sourced candidates only; analyst approval is required before pre-fill."
+    )
+    st.warning(
+        "Double-check required: AI-discovered sources may be stale, mismatched to the wrong issuer/series, or use different units. Verify the source link and evidence before approving."
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        scout_query = st.text_input(
+            "Search context / issuer override",
+            value=deal_setup.get("issuer_name", ""),
+            key=f"{key_prefix}_public_scout_query",
+        )
+        manual_source_url = st.text_input(
+            "Optional source URL you already found",
+            value="",
+            key=f"{key_prefix}_manual_source_url",
+        )
+    with c2:
+        try:
+            default_openai_key = st.secrets.get("OPENAI_API_KEY", "")
+        except Exception:
+            default_openai_key = ""
+        scout_api_key = st.text_input(
+            "Optional OpenAI API Key for Source Scout",
+            type="password",
+            value="",
+            key=f"{key_prefix}_public_scout_api_key",
+        )
+        scout_model = st.selectbox(
+            "Source Scout Model",
+            ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"],
+            index=0,
+            key=f"{key_prefix}_public_scout_model",
+        )
+
+    if st.button("Search Public Sources for Calculator Inputs", key=f"{key_prefix}_run_public_scout"):
+        with st.spinner("Searching public sources and extracting candidate inputs..."):
+            candidate = ai_public_source_scout_for_calculator(
+                calculator_name=calculator_name,
+                issuer_name=scout_query or deal_setup.get("issuer_name", ""),
+                state=deal_setup.get("state", ""),
+                county_name=deal_setup.get("county_name", ""),
+                targets=targets,
+                api_key=scout_api_key or default_openai_key,
+                model=scout_model,
+            )
+            if manual_source_url and candidate.get("ok"):
+                candidate["source_url"] = manual_source_url
+            st.session_state[f"{key_prefix}_public_source_candidate"] = candidate
+
+    cand = st.session_state.get(f"{key_prefix}_public_source_candidate")
+    if cand:
+        if not cand.get("ok"):
+            st.error(cand.get("error", "Source scout did not find reliable inputs."))
+            if cand.get("raw_output"):
+                with st.expander("Raw AI output"):
+                    st.code(cand.get("raw_output"))
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("AI Confidence", f"{float(cand.get('confidence', 0.0)):.0%}")
+            c2.write(f"**Source Type:** {cand.get('source_type', '')}")
+            src = cand.get("source_url", "")
+            if src:
+                c3.markdown(f"[Open Source Link]({src})")
+            else:
+                c3.caption("No source URL returned")
+            st.write(f"**Source Title:** {cand.get('source_title', '')}")
+            if cand.get("evidence_snippet"):
+                with st.expander("Evidence snippet", expanded=False):
+                    st.write(cand.get("evidence_snippet"))
+            if cand.get("missing_fields"):
+                st.warning("Missing / not reliably found: " + ", ".join(map(str, cand.get("missing_fields", []))))
+            if cand.get("notes"):
+                st.caption(cand.get("notes"))
+    return st.session_state.get(f"{key_prefix}_public_source_candidate")
+
+
+def _candidate_values_dict(cand):
+    return (cand or {}).get("values", {}) or {}
+
+
+def _candidate_table_df(cand, key):
+    rows = (cand or {}).get(key, []) or []
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
 # =============================================================================
 # Sidebar
 # =============================================================================
@@ -3364,6 +3558,46 @@ with tab_calcs:
                     st.session_state["taxpayer_table_source"] = taxpayer_upload.name
                     st.success("Uploaded table loaded into Taxpayer Concentration Builder. Review/edit below before calculating.")
 
+            taxpayer_public_cand = render_public_source_scout_common(
+                calculator_name="Taxpayer Concentration",
+                targets=[
+                    "Top taxpayer / property owner table",
+                    "Taxpayer special tax levy percent or share of total levy",
+                    "Top 10 taxpayers as percent of total levy",
+                    "Largest taxpayer as percent of total levy",
+                ],
+                key_prefix="taxpayer_calc",
+            )
+            taxpayer_public_df = _candidate_table_df(taxpayer_public_cand, "taxpayer_table")
+            if not taxpayer_public_df.empty:
+                if "taxpayer_name" in taxpayer_public_df.columns and "levy_percent" in taxpayer_public_df.columns:
+                    taxpayer_public_df = taxpayer_public_df[["taxpayer_name", "levy_percent"]].copy()
+                    taxpayer_public_df["levy_percent"] = numeric_series_from_column(taxpayer_public_df["levy_percent"])
+                    taxpayer_public_df = taxpayer_public_df.dropna(subset=["taxpayer_name", "levy_percent"])
+                    st.caption("Preview of AI-sourced public taxpayer table")
+                    st.dataframe(taxpayer_public_df, use_container_width=True, hide_index=True)
+                    if st.button("Approve AI-Sourced Taxpayer Table", key="approve_taxpayer_public_source"):
+                        st.session_state["taxpayer_table_default"] = taxpayer_public_df.copy()
+                        st.session_state["taxpayer_table_source"] = taxpayer_public_cand.get("source_url") or taxpayer_public_cand.get("source_title") or "AI Public Source Scout"
+                        st.success("AI-sourced taxpayer table loaded. Review/edit below before calculating.")
+                else:
+                    st.warning("AI found a taxpayer candidate, but the table columns were not standardized. Use the upload/mapping fallback or copy values manually.")
+            elif taxpayer_public_cand and taxpayer_public_cand.get("ok"):
+                vals = _candidate_values_dict(taxpayer_public_cand)
+                top10 = vals.get("top10_taxpayers_percent_of_total_levy")
+                largest = vals.get("largest_taxpayer_percent_of_total_levy")
+                if top10 is not None or largest is not None:
+                    st.info("AI found aggregate taxpayer concentration values but not a full table. You may approve them directly into the scorecard after verifying the source.")
+                    ctop, clargest = st.columns(2)
+                    ctop.metric("Top 10 Taxpayers %", "" if top10 is None else top10)
+                    clargest.metric("Largest Taxpayer %", "" if largest is None else largest)
+                    if st.button("Approve Aggregate Taxpayer Values", key="approve_taxpayer_public_aggregates"):
+                        if top10 is not None:
+                            safe_add_approved_input("top10_taxpayers_percent_of_total_levy", parse_numeric_input(top10), status="AI Extracted", source_method="AI Public Source Scout", source_document=taxpayer_public_cand.get("source_url"), confidence=taxpayer_public_cand.get("confidence", 0.55), notes="AI-sourced aggregate value; double-check source before use.")
+                        if largest is not None:
+                            safe_add_approved_input("largest_taxpayer_percent_of_total_levy", parse_numeric_input(largest), status="AI Extracted", source_method="AI Public Source Scout", source_document=taxpayer_public_cand.get("source_url"), confidence=taxpayer_public_cand.get("confidence", 0.55), notes="AI-sourced aggregate value; double-check source before use.")
+                        st.success("Aggregate taxpayer values approved into master scorecard inputs.")
+
         default_taxpayers = st.session_state.get("taxpayer_table_default")
         if default_taxpayers is None:
             default_taxpayers = pd.DataFrame(
@@ -3471,6 +3705,34 @@ with tab_calcs:
                     st.success("Direct VTL inputs loaded. Review/edit below before calculating.")
                 else:
                     st.warning("No valid numeric VTL values were entered.")
+
+            vtl_public_cand = render_public_source_scout_common(
+                calculator_name="Value-to-Lien",
+                targets=[
+                    "Assessed value",
+                    "Direct debt",
+                    "Overlapping debt",
+                    "Value-to-lien table or direct and overlapping debt table",
+                ],
+                key_prefix="vtl_calc",
+            )
+            if vtl_public_cand and vtl_public_cand.get("ok"):
+                vals = _candidate_values_dict(vtl_public_cand)
+                pv1, pv2, pv3 = st.columns(3)
+                pv1.metric("Assessed Value", "" if vals.get("assessed_value") is None else f"${parse_numeric_input(vals.get('assessed_value')):,.0f}")
+                pv2.metric("Direct Debt", "" if vals.get("direct_debt") is None else f"${parse_numeric_input(vals.get('direct_debt')):,.0f}")
+                pv3.metric("Overlapping Debt", "" if vals.get("overlapping_debt") is None else f"${parse_numeric_input(vals.get('overlapping_debt')):,.0f}")
+                if st.button("Approve AI-Sourced VTL Inputs", key="approve_vtl_public_source"):
+                    existing = st.session_state.get("vtl_prefill", {}) or {}
+                    for src_key, dest_key in [("assessed_value", "assessed_value"), ("direct_debt", "direct_debt"), ("overlapping_debt", "overlapping_debt")]:
+                        if vals.get(src_key) is not None:
+                            existing[dest_key] = float(parse_numeric_input(vals.get(src_key)))
+                    if existing:
+                        st.session_state["vtl_prefill"] = existing
+                        st.session_state["vtl_direct_source_note"] = vtl_public_cand.get("source_url") or vtl_public_cand.get("source_title")
+                        st.success("AI-sourced VTL inputs loaded. Review/edit below before calculating.")
+                    else:
+                        st.warning("AI did not return usable numeric VTL inputs.")
 
         vtl_prefill = st.session_state.get("vtl_prefill", {}) or {}
         if st.session_state.get("suggested_assessed_value") is not None:
@@ -3599,6 +3861,46 @@ with tab_calcs:
                         st.session_state["mltm_reserve_default"] = float(reserve_val)
                     st.session_state["mltm_schedule_source"] = mltm_upload.name
                     st.success("Uploaded schedule loaded into MLTM Stress Test. Review/edit below before calculating.")
+
+            mltm_public_cand = render_public_source_scout_common(
+                calculator_name="MLTM Stress Test",
+                targets=[
+                    "Annual special tax levy or pledged revenue by year",
+                    "Annual debt service by year",
+                    "Initial reserve fund",
+                    "Debt service schedule or cashflow table",
+                ],
+                key_prefix="mltm_calc",
+            )
+            mltm_public_df = _candidate_table_df(mltm_public_cand, "mltm_cashflow")
+            if not mltm_public_df.empty:
+                needed = ["year", "special_tax_levy", "annual_debt_service"]
+                if all(c in mltm_public_df.columns for c in needed):
+                    mltm_public_df = mltm_public_df[needed].copy()
+                    mltm_public_df["year"] = numeric_series_from_column(mltm_public_df["year"]).astype("Int64")
+                    mltm_public_df["special_tax_levy"] = numeric_series_from_column(mltm_public_df["special_tax_levy"])
+                    mltm_public_df["annual_debt_service"] = numeric_series_from_column(mltm_public_df["annual_debt_service"])
+                    mltm_public_df = mltm_public_df.dropna(subset=needed)
+                    st.caption("Preview of AI-sourced public MLTM cashflow schedule")
+                    st.dataframe(mltm_public_df, use_container_width=True, hide_index=True)
+                    if st.button("Approve AI-Sourced MLTM Schedule", key="approve_mltm_public_source"):
+                        st.session_state["mltm_cashflow_default"] = mltm_public_df.copy()
+                        vals = _candidate_values_dict(mltm_public_cand)
+                        if vals.get("initial_reserve_fund") is not None:
+                            st.session_state["mltm_reserve_default"] = float(parse_numeric_input(vals.get("initial_reserve_fund")))
+                        st.session_state["mltm_schedule_source"] = mltm_public_cand.get("source_url") or mltm_public_cand.get("source_title") or "AI Public Source Scout"
+                        st.success("AI-sourced MLTM schedule loaded. Review/edit below before calculating.")
+                else:
+                    st.warning("AI found an MLTM candidate, but the table columns were not standardized. Use the upload/mapping fallback or copy values manually.")
+            elif mltm_public_cand and mltm_public_cand.get("ok"):
+                vals = _candidate_values_dict(mltm_public_cand)
+                if vals.get("initial_reserve_fund") is not None:
+                    st.info("AI found an initial reserve fund but not a full cashflow schedule. You can approve the reserve fund, then upload/map the cashflow schedule separately.")
+                    st.metric("Initial Reserve Fund Candidate", f"${parse_numeric_input(vals.get('initial_reserve_fund')):,.0f}")
+                    if st.button("Approve AI-Sourced Reserve Fund", key="approve_mltm_public_reserve"):
+                        st.session_state["mltm_reserve_default"] = float(parse_numeric_input(vals.get("initial_reserve_fund")))
+                        st.session_state["mltm_schedule_source"] = mltm_public_cand.get("source_url") or mltm_public_cand.get("source_title") or "AI Public Source Scout"
+                        st.success("Reserve fund loaded. Review/edit below before calculating.")
 
         initial_reserve_fund = st.number_input(
             "Initial Reserve Fund",
