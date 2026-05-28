@@ -2691,6 +2691,78 @@ def render_ai_fill_warning():
         "AI-assisted extraction is only a data-entry accelerator. Always double-check source documents, table headers, units, and dates before approving any value."
     )
 
+
+# =============================================================================
+# Calculator Fallback Upload / Column Mapping Helpers
+# =============================================================================
+
+def read_uploaded_table_file(uploaded_file):
+    """Read a user-uploaded CSV/XLSX/XLS into a DataFrame for calculator pre-fill."""
+    if uploaded_file is None:
+        return None
+    name = uploaded_file.name.lower()
+    try:
+        if name.endswith('.csv'):
+            return pd.read_csv(uploaded_file)
+        if name.endswith(('.xlsx', '.xls')):
+            return pd.read_excel(uploaded_file)
+    except Exception as exc:
+        st.error(f"Could not read uploaded table: {exc}")
+        return None
+    st.error('Unsupported file type. Please upload CSV, XLSX, or XLS.')
+    return None
+
+
+def clean_uploaded_table(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out = out.dropna(how='all')
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
+
+
+def numeric_series_from_column(series):
+    """Parse percent/money/general numeric columns from messy strings."""
+    vals = []
+    for v in series:
+        if v is None:
+            vals.append(None)
+            continue
+        try:
+            if pd.isna(v):
+                vals.append(None)
+                continue
+        except Exception:
+            pass
+        if isinstance(v, (int, float)):
+            vals.append(float(v))
+            continue
+        text = str(v).strip().replace(',', '').replace('$', '').replace('%', '')
+        m = re.search(r'-?\d+(?:\.\d+)?', text)
+        vals.append(float(m.group()) if m else None)
+    return pd.Series(vals)
+
+
+def suggested_column_index(columns, terms):
+    cols = list(columns)
+    scores = []
+    for i, col in enumerate(cols):
+        name = str(col).lower()
+        score = sum(1 for term in terms if term in name)
+        scores.append((score, i))
+    scores.sort(reverse=True)
+    return scores[0][1] if scores and scores[0][0] > 0 else 0
+
+
+def render_no_candidate_guidance(kind):
+    st.info(
+        f"If the scanner cannot find {kind}, it usually means the uploaded PDF table was image-based, the parsed preview missed the table, or the headers/units are non-standard. Use the direct upload / column-mapping fallback below."
+    )
+    st.warning(
+        "Do not rely on AI extraction alone. Upload the original Excel/CSV schedule when possible, review units carefully, and keep the source file/link for audit trail."
+    )
+
 # =============================================================================
 # Sidebar
 # =============================================================================
@@ -3253,6 +3325,45 @@ with tab_calcs:
                                 st.session_state["taxpayer_table_source"] = cand["source_document"]
                                 st.success("Loaded into Taxpayer Concentration Builder. Please review, edit if needed, then calculate.")
 
+            st.markdown("---")
+            st.subheader("Fallback: Upload / Map Taxpayer Table")
+            render_no_candidate_guidance("a taxpayer concentration table")
+            taxpayer_upload = st.file_uploader(
+                "Upload taxpayer table directly (CSV/XLSX/XLS)",
+                type=["csv", "xlsx", "xls"],
+                key="taxpayer_direct_table_upload",
+            )
+            taxpayer_upload_df = clean_uploaded_table(read_uploaded_table_file(taxpayer_upload)) if taxpayer_upload else pd.DataFrame()
+            if not taxpayer_upload_df.empty:
+                st.dataframe(taxpayer_upload_df.head(20), use_container_width=True)
+                cols_available = list(taxpayer_upload_df.columns)
+                c_map1, c_map2 = st.columns(2)
+                with c_map1:
+                    taxpayer_name_col = st.selectbox(
+                        "Taxpayer / Owner column",
+                        cols_available,
+                        index=suggested_column_index(cols_available, ["taxpayer", "owner", "name"]),
+                        key="taxpayer_direct_name_col",
+                    )
+                with c_map2:
+                    taxpayer_levy_col = st.selectbox(
+                        "Levy % / Share % column",
+                        cols_available,
+                        index=suggested_column_index(cols_available, ["levy", "percent", "%", "share", "special tax"]),
+                        key="taxpayer_direct_levy_col",
+                    )
+                mapped_taxpayer_df = pd.DataFrame({
+                    "taxpayer_name": taxpayer_upload_df[taxpayer_name_col].astype(str),
+                    "levy_percent": numeric_series_from_column(taxpayer_upload_df[taxpayer_levy_col]),
+                }).dropna(subset=["taxpayer_name", "levy_percent"])
+                mapped_taxpayer_df = mapped_taxpayer_df[mapped_taxpayer_df["taxpayer_name"].str.strip().ne("")]
+                st.caption("Preview after column mapping")
+                st.dataframe(mapped_taxpayer_df.head(20), use_container_width=True, hide_index=True)
+                if st.button("Approve Uploaded Taxpayer Table", key="approve_taxpayer_direct_upload"):
+                    st.session_state["taxpayer_table_default"] = mapped_taxpayer_df.copy()
+                    st.session_state["taxpayer_table_source"] = taxpayer_upload.name
+                    st.success("Uploaded table loaded into Taxpayer Concentration Builder. Review/edit below before calculating.")
+
         default_taxpayers = st.session_state.get("taxpayer_table_default")
         if default_taxpayers is None:
             default_taxpayers = pd.DataFrame(
@@ -3330,6 +3441,36 @@ with tab_calcs:
                                 existing[k] = float(cand[k])
                         st.session_state["vtl_prefill"] = existing
                         st.success("Loaded into Value-to-Lien calculator. Review/edit before calculating.")
+                else:
+                    render_no_candidate_guidance("VTL inputs")
+
+            st.markdown("---")
+            st.subheader("Fallback: Direct VTL Input with Source Note")
+            st.caption("Use this when AI cannot reliably read the OS table, or when you already have values from an assessor export / OS appendix.")
+            vtl_f1, vtl_f2, vtl_f3 = st.columns(3)
+            with vtl_f1:
+                direct_assessed_value = st.text_input("Assessed Value candidate", value="", key="direct_vtl_assessed_value")
+            with vtl_f2:
+                direct_direct_debt = st.text_input("Direct Debt candidate", value="", key="direct_vtl_direct_debt")
+            with vtl_f3:
+                direct_overlapping_debt = st.text_input("Overlapping Debt candidate", value="", key="direct_vtl_overlapping_debt")
+            vtl_source_note = st.text_input("Source note / URL for these VTL inputs", value="", key="direct_vtl_source_note")
+            if st.button("Approve Direct VTL Inputs", key="approve_direct_vtl_inputs"):
+                existing = st.session_state.get("vtl_prefill", {}) or {}
+                parsed_values = {
+                    "assessed_value": _parse_money_value(direct_assessed_value),
+                    "direct_debt": _parse_money_value(direct_direct_debt),
+                    "overlapping_debt": _parse_money_value(direct_overlapping_debt),
+                }
+                for k, v in parsed_values.items():
+                    if v is not None:
+                        existing[k] = float(v)
+                if existing:
+                    st.session_state["vtl_prefill"] = existing
+                    st.session_state["vtl_direct_source_note"] = vtl_source_note
+                    st.success("Direct VTL inputs loaded. Review/edit below before calculating.")
+                else:
+                    st.warning("No valid numeric VTL values were entered.")
 
         vtl_prefill = st.session_state.get("vtl_prefill", {}) or {}
         if st.session_state.get("suggested_assessed_value") is not None:
@@ -3408,6 +3549,56 @@ with tab_calcs:
                                     st.session_state["mltm_reserve_default"] = float(cand["reserve_fund"])
                                 st.session_state["mltm_schedule_source"] = cand["source_document"]
                                 st.success("Loaded into MLTM Stress Test. Review/edit before calculating.")
+
+            st.markdown("---")
+            st.subheader("Fallback: Upload / Map MLTM Cashflow Schedule")
+            render_no_candidate_guidance("an MLTM cashflow or debt-service schedule")
+            mltm_upload = st.file_uploader(
+                "Upload cashflow / debt service schedule directly (CSV/XLSX/XLS)",
+                type=["csv", "xlsx", "xls"],
+                key="mltm_direct_schedule_upload",
+            )
+            mltm_upload_df = clean_uploaded_table(read_uploaded_table_file(mltm_upload)) if mltm_upload else pd.DataFrame()
+            if not mltm_upload_df.empty:
+                st.dataframe(mltm_upload_df.head(20), use_container_width=True)
+                cols_available = list(mltm_upload_df.columns)
+                m1, m2, m3 = st.columns(3)
+                with m1:
+                    mltm_year_col = st.selectbox(
+                        "Year column",
+                        cols_available,
+                        index=suggested_column_index(cols_available, ["year", "fiscal", "period"]),
+                        key="mltm_direct_year_col",
+                    )
+                with m2:
+                    mltm_levy_col = st.selectbox(
+                        "Special tax levy / revenue column",
+                        cols_available,
+                        index=suggested_column_index(cols_available, ["levy", "special tax", "revenue", "tax"]),
+                        key="mltm_direct_levy_col",
+                    )
+                with m3:
+                    mltm_debt_col = st.selectbox(
+                        "Annual debt service column",
+                        cols_available,
+                        index=suggested_column_index(cols_available, ["debt service", "annual debt", "principal", "interest", "p&i"]),
+                        key="mltm_direct_debt_col",
+                    )
+                mapped_mltm_df = pd.DataFrame({
+                    "year": numeric_series_from_column(mltm_upload_df[mltm_year_col]).astype("Int64"),
+                    "special_tax_levy": numeric_series_from_column(mltm_upload_df[mltm_levy_col]),
+                    "annual_debt_service": numeric_series_from_column(mltm_upload_df[mltm_debt_col]),
+                }).dropna(subset=["year", "special_tax_levy", "annual_debt_service"])
+                st.caption("Preview after column mapping")
+                st.dataframe(mapped_mltm_df.head(20), use_container_width=True, hide_index=True)
+                reserve_direct = st.text_input("Optional reserve fund from source", value="", key="mltm_direct_reserve")
+                if st.button("Approve Uploaded MLTM Schedule", key="approve_mltm_direct_upload"):
+                    st.session_state["mltm_cashflow_default"] = mapped_mltm_df.copy()
+                    reserve_val = _parse_money_value(reserve_direct)
+                    if reserve_val is not None:
+                        st.session_state["mltm_reserve_default"] = float(reserve_val)
+                    st.session_state["mltm_schedule_source"] = mltm_upload.name
+                    st.success("Uploaded schedule loaded into MLTM Stress Test. Review/edit below before calculating.")
 
         initial_reserve_fund = st.number_input(
             "Initial Reserve Fund",
