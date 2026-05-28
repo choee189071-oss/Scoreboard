@@ -767,6 +767,360 @@ def append_auto_data_result_once(row: dict, unique_key: str):
     st.session_state["auto_data_results"] = filtered
 
 
+
+# =============================================================================
+# Cleaner Source Status + Safe Semi-Auto Resolvers
+# =============================================================================
+
+def clean_display_dataframe(df):
+    """Hide Python placeholders such as None/nan in Streamlit tables."""
+    if df is None or df.empty:
+        return df
+    return df.fillna("").replace({None: "", "None": "", "nan": "", "NaN": "", pd.NA: ""})
+
+
+def normalize_column_name(col):
+    return re.sub(r"[^a-z0-9]+", "_", str(col).strip().lower()).strip("_")
+
+
+def infer_assessed_value_columns(df):
+    """Suggest likely assessed-value columns from assessor / parcel exports."""
+    suggestions = []
+    positive_terms = [
+        "assessed", "assessment", "taxable", "total_av", "total_value", "roll_value",
+        "net_value", "market_value", "land_value", "improvement_value", "value", "av"
+    ]
+    negative_terms = ["tax", "rate", "year", "apn", "parcel", "zip", "code", "id", "acre", "sqft", "date"]
+
+    for col in df.columns:
+        norm = normalize_column_name(col)
+        score = 0
+        for term in positive_terms:
+            if term in norm:
+                score += 2
+        for term in negative_terms:
+            if term in norm:
+                score -= 1
+
+        sample = pd.to_numeric(
+            df[col].astype(str).str.replace(r"[$,% ,]", "", regex=True),
+            errors="coerce",
+        )
+        numeric_share = sample.notna().mean() if len(sample) else 0
+        if numeric_share > 0.60:
+            score += 2
+        if sample.notna().any() and sample.dropna().median() > 10000:
+            score += 1
+
+        if score > 0:
+            suggestions.append((col, score, numeric_share))
+
+    suggestions = sorted(suggestions, key=lambda x: x[1], reverse=True)
+    return [s[0] for s in suggestions]
+
+
+def clean_money_series(series):
+    return pd.to_numeric(
+        series.astype(str).str.replace(r"[$,% ,]", "", regex=True),
+        errors="coerce",
+    )
+
+
+def classify_housing_market_proxy(price_yoy, inventory_yoy, distress_proxy, affordability_worse):
+    """
+    Deterministic analyst-assist classifier for scorecard housing market volatility.
+    Safer than free-form AI: it gives a reviewable candidate, not an automatic overwrite.
+    """
+    price_yoy = float(price_yoy or 0)
+    inventory_yoy = float(inventory_yoy or 0)
+    distress_proxy = float(distress_proxy or 0)
+
+    risk_points = 0
+    reasons = []
+
+    if price_yoy <= -8:
+        risk_points += 3
+        reasons.append("home prices are falling materially")
+    elif price_yoy < 0:
+        risk_points += 2
+        reasons.append("home prices are declining")
+    elif price_yoy < 3:
+        risk_points += 1
+        reasons.append("home price growth is soft")
+    else:
+        reasons.append("home prices are stable or increasing")
+
+    if inventory_yoy >= 40:
+        risk_points += 2
+        reasons.append("inventory is rising sharply")
+    elif inventory_yoy >= 15:
+        risk_points += 1
+        reasons.append("inventory is rising")
+
+    if distress_proxy >= 2.5:
+        risk_points += 2
+        reasons.append("distress proxy is elevated")
+    elif distress_proxy >= 1.0:
+        risk_points += 1
+        reasons.append("distress proxy is somewhat elevated")
+
+    if affordability_worse:
+        risk_points += 1
+        reasons.append("affordability appears worse than national figures")
+
+    if risk_points <= 1:
+        classification = "Low Volatility; Stable Prices; Low Distress"
+        confidence = 0.75
+    elif risk_points <= 3:
+        classification = "Elevated Volatility; Stable Prices; Affordability Worse Than National Figures"
+        confidence = 0.70
+    elif risk_points <= 5:
+        classification = "Falling Local Home Prices; High Price Volatility; Low Affordability; Rising Distress"
+        confidence = 0.68
+    else:
+        classification = "Falling Local Home Prices; High Price Volatility; Significantly Worse Affordability; Rising Distress"
+        confidence = 0.65
+
+    return {
+        "classification": classification,
+        "confidence": confidence,
+        "risk_points": risk_points,
+        "reasons": reasons,
+    }
+
+
+def add_candidate_value(scorecard_key, scorecard_field, value, source_method, confidence=0.70, notes="", source_document="", source_url=""):
+    """Add a reviewable candidate instead of directly overwriting the scorecard."""
+    candidate = {
+        "scorecard_field": scorecard_field,
+        "scorecard_key": scorecard_key,
+        "value": value,
+        "status": "Needs Review",
+        "source_method": source_method,
+        "source_document": source_document,
+        "source_url": source_url,
+        "confidence": confidence,
+        "notes": notes,
+        "source_excerpt": notes,
+    }
+    st.session_state.setdefault("candidate_extractions", [])
+    st.session_state["candidate_extractions"].append(candidate)
+    return candidate
+
+
+def build_current_source_status_table():
+    """
+    Starts from source_priority_table(), but replaces manual placeholders with live approved values
+    when the app has successfully pulled/calculated data. This avoids duplicate confusing rows.
+    """
+    try:
+        df = source_priority_table().copy()
+    except Exception:
+        return pd.DataFrame()
+
+    approved = st.session_state.get("approved_inputs", {}) or {}
+    meta = st.session_state.get("approved_input_metadata", {}) or {}
+
+    def set_row_by_target(target_contains, status, value, source_url="", date_year="", source_method=""):
+        nonlocal df
+        target_cols = [c for c in df.columns if "target" in str(c).lower() or "data" in str(c).lower() or "field" in str(c).lower()]
+        if not target_cols:
+            return
+        mask = pd.Series(False, index=df.index)
+        for col in target_cols:
+            mask = mask | df[col].astype(str).str.contains(target_contains, case=False, na=False)
+        if not mask.any():
+            return
+        if "Status" in df.columns:
+            df.loc[mask, "Status"] = status
+        elif "status" in df.columns:
+            df.loc[mask, "status"] = status
+        if "Extracted / Calculated Value" in df.columns:
+            df.loc[mask, "Extracted / Calculated Value"] = value
+        if "Date / Year" in df.columns:
+            df.loc[mask, "Date / Year"] = date_year
+        if "Source URL" in df.columns:
+            df.loc[mask, "Source URL"] = source_url
+        elif "source_url" in df.columns:
+            df.loc[mask, "source_url"] = source_url
+        if source_method:
+            for col in df.columns:
+                if "source" in str(col).lower() and "url" not in str(col).lower():
+                    df.loc[mask, col] = source_method
+                    break
+
+    # 7. Local unemployment: auto-fill the original BLS/LAUS row if approved value exists.
+    key = "unemployment_rate_difference_vs_us"
+    if key in approved and not is_missing_master_value(approved.get(key)):
+        m = meta.get(key, {}) or {}
+        set_row_by_target(
+            "Local unemployment",
+            "success",
+            f"{approved.get(key)} %",
+            source_url="https://fred.stlouisfed.org/",
+            date_year=display_value(m.get("review_timestamp", ""))[:10],
+            source_method=display_value(m.get("source_method", "BLS / LAUS via FRED")),
+        )
+
+    # 8. Assessed value: show parser result if user approved/uploaded it.
+    key = "total_assessed_value"
+    if key in approved and not is_missing_master_value(approved.get(key)):
+        m = meta.get(key, {}) or {}
+        try:
+            value = f"${float(approved.get(key)):,.0f}"
+        except Exception:
+            value = approved.get(key)
+        set_row_by_target(
+            "Assessed value",
+            "success",
+            value,
+            source_url="",
+            date_year=display_value(m.get("review_timestamp", ""))[:10],
+            source_method=display_value(m.get("source_method", "Assessed Value Upload Parser")),
+        )
+
+    # 9. Housing proxy: show candidate/approved status if available.
+    key = "real_estate_market_volatility"
+    if key in approved and not is_missing_master_value(approved.get(key)):
+        m = meta.get(key, {}) or {}
+        set_row_by_target(
+            "Housing market trend|distress proxy|Real Estate Market Volatility",
+            display_value(m.get("status", "success")) or "success",
+            approved.get(key),
+            source_url="",
+            date_year=display_value(m.get("review_timestamp", ""))[:10],
+            source_method=display_value(m.get("source_method", "Housing Market Proxy Classifier")),
+        )
+
+    return clean_display_dataframe(df)
+
+
+def render_assessed_value_upload_parser():
+    st.subheader("Assessed Value Upload Parser")
+    st.caption("Safe mode: upload assessor / parcel / tax roll CSV or Excel. The app suggests columns, but analyst approves before it becomes source data.")
+
+    av_file = st.file_uploader(
+        "Upload assessor, parcel, or assessed-value file",
+        type=["csv", "xlsx", "xls"],
+        key="assessed_value_file",
+    )
+
+    if not av_file:
+        st.info("Best source: county assessor export, tax roll, parcel file, or OS table containing assessed valuation.")
+        return
+
+    try:
+        if av_file.name.lower().endswith(".csv"):
+            av_df = pd.read_csv(av_file)
+        else:
+            av_df = pd.read_excel(av_file)
+
+        st.write(f"Rows loaded: {len(av_df):,}")
+        st.dataframe(av_df.head(25), use_container_width=True)
+
+        suggested_cols = infer_assessed_value_columns(av_df)
+        all_cols = list(av_df.columns)
+        default_index = all_cols.index(suggested_cols[0]) if suggested_cols and suggested_cols[0] in all_cols else 0
+
+        value_col = st.selectbox(
+            "Assessed value column",
+            all_cols,
+            index=default_index,
+            key="assessed_value_column_select",
+        )
+
+        parsed_values = clean_money_series(av_df[value_col])
+        total_av = parsed_values.sum(skipna=True)
+        valid_rows = int(parsed_values.notna().sum())
+        numeric_share = valid_rows / max(len(av_df), 1)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Detected Total AV", f"${total_av:,.0f}")
+        c2.metric("Valid Numeric Rows", f"{valid_rows:,}")
+        c3.metric("Numeric Coverage", f"{numeric_share:.0%}")
+
+        st.caption("Suggested columns: " + (", ".join(map(str, suggested_cols[:5])) if suggested_cols else "No strong suggestion."))
+
+        confidence = 0.90 if suggested_cols and value_col == suggested_cols[0] and numeric_share >= 0.60 else 0.75
+        if numeric_share < 0.50:
+            st.warning("Selected column has low numeric coverage. Please verify before approving.")
+
+        approve_col, candidate_col = st.columns(2)
+        with approve_col:
+            if st.button("Approve Assessed Value as Source Data", key="approve_total_av"):
+                safe_add_approved_input(
+                    "total_assessed_value",
+                    float(total_av),
+                    status="Manual Input",
+                    source_method="Assessed Value Upload Parser",
+                    source_document=av_file.name,
+                    confidence=confidence,
+                    notes=f"Total assessed value summed from column '{value_col}' across {valid_rows:,} numeric rows.",
+                )
+                append_auto_data_result_once(
+                    {
+                        "data_source": "County Open Data / Assessor",
+                        "target_data": "Assessed value",
+                        "status": "success",
+                        "Date / Year": datetime.now().date().isoformat(),
+                        "Extracted / Calculated Value": f"${float(total_av):,.0f}",
+                        "source_url": "",
+                        "notes": f"Parsed from {av_file.name}; column {value_col}; confidence {confidence:.0%}.",
+                    },
+                    unique_key="assessed_value_upload_parser",
+                )
+                st.success("Total assessed value approved into master inputs.")
+        with candidate_col:
+            if st.button("Use AV to Update Value-to-Lien Calculator Input", key="candidate_total_av"):
+                st.session_state["suggested_assessed_value"] = float(total_av)
+                st.success("Saved as suggested assessed value for the Value-to-Lien calculator.")
+
+    except Exception as e:
+        st.error(f"Could not parse assessed value file: {e}")
+
+
+def render_housing_market_proxy_resolver():
+    st.subheader("Housing Market Trend / Distress Proxy")
+    st.caption("Safe mode: deterministic classifier creates a reviewable candidate. It does not overwrite approved scorecard data unless you approve it in Reliability Review.")
+
+    h1, h2, h3, h4 = st.columns(4)
+    with h1:
+        price_yoy = st.number_input("Home Price YoY %", value=0.0, step=0.5, key="housing_price_yoy")
+    with h2:
+        inventory_yoy = st.number_input("Inventory YoY %", value=0.0, step=1.0, key="housing_inventory_yoy")
+    with h3:
+        distress_proxy = st.number_input("Distress Proxy %", value=0.0, step=0.1, key="housing_distress_proxy")
+    with h4:
+        affordability_worse = st.checkbox("Affordability worse than U.S.", value=True, key="housing_affordability_worse")
+
+    st.caption("Good inputs: FHFA/Zillow price YoY, Redfin/Realtor inventory YoY, foreclosure/delinquency proxy, and affordability comparison.")
+
+    if st.button("Generate Housing Classification Candidate", key="generate_housing_candidate"):
+        housing = classify_housing_market_proxy(price_yoy, inventory_yoy, distress_proxy, affordability_worse)
+        notes = "Reasons: " + "; ".join(housing["reasons"])
+        add_candidate_value(
+            scorecard_key="real_estate_market_volatility",
+            scorecard_field="Real Estate Market Volatility",
+            value=housing["classification"],
+            source_method="Housing Market Proxy Classifier",
+            confidence=housing["confidence"],
+            notes=f"Risk points: {housing['risk_points']}. {notes}",
+        )
+        append_auto_data_result_once(
+            {
+                "data_source": "Housing Data",
+                "target_data": "Housing market trend / distress proxy",
+                "status": "needs_review",
+                "Date / Year": datetime.now().date().isoformat(),
+                "Extracted / Calculated Value": housing["classification"],
+                "source_url": "",
+                "notes": f"Candidate only. Risk points {housing['risk_points']}; confidence {housing['confidence']:.0%}.",
+            },
+            unique_key="housing_market_proxy_candidate",
+        )
+        st.success("Housing classification candidate added to Reliability Review.")
+        st.json(housing)
+
 def render_local_unemployment_resolver(deal_setup):
     """UI card: show matched source address, allow analyst approval, then pull data."""
     st.subheader("Semi-Auto Resolver: Local Unemployment")
@@ -1747,7 +2101,25 @@ with tab_calcs:
         "Use these workspaces to calculate values that are not reliably available from public APIs or document extraction."
     )
 
-    calc_tab1, calc_tab2, calc_tab3 = st.tabs(["Taxpayer Concentration", "Value-to-Lien", "MLTM Stress Test"])
+    calc_tab1, calc_tab2, calc_tab3, calc_tab4, calc_tab5, calc_tab6 = st.tabs(
+        [
+            "Taxpayer Concentration",
+            "Value-to-Lien",
+            "MLTM Stress Test",
+            "BLS / LAUS",
+            "Assessed Value Upload",
+            "Housing Proxy",
+        ]
+    )
+
+    with calc_tab4:
+        render_local_unemployment_resolver(st.session_state.get("deal_setup", {}))
+
+    with calc_tab5:
+        render_assessed_value_upload_parser()
+
+    with calc_tab6:
+        render_housing_market_proxy_resolver()
 
     with calc_tab1:
         st.subheader("Taxpayer Concentration Builder")
@@ -1877,8 +2249,9 @@ with tab_calcs:
 with tab_sources:
     st.header("5. Sources & Evidence")
 
-    st.subheader("Source Priority Engine")
-    st.dataframe(source_priority_table(), use_container_width=True)
+    st.subheader("Source Priority Engine / Current Data Status")
+    st.caption("This table now updates from approved values, so successful pulls replace manual_required placeholders instead of creating confusing duplicate rows.")
+    st.dataframe(build_current_source_status_table(), use_container_width=True)
 
     st.subheader("Data Reliability Matrix")
     st.dataframe(build_data_reliability_matrix(), use_container_width=True)
@@ -1922,7 +2295,7 @@ with tab_sources:
 
     st.subheader("Auto Context Results")
     if st.session_state.get("auto_data_results"):
-        st.dataframe(auto_data_results_to_dataframe(st.session_state["auto_data_results"]), use_container_width=True)
+        st.dataframe(clean_display_dataframe(auto_data_results_to_dataframe(st.session_state["auto_data_results"])), use_container_width=True)
     else:
         st.info("No auto context results yet.")
 
