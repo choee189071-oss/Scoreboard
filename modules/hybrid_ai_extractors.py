@@ -274,27 +274,27 @@ HYBRID_SECTIONS: Dict[str, Dict[str, Any]] = {
                 guidance="Use exact reserve amount and date. Do not confuse with costs of issuance or improvement fund.",
             ),
             HybridField(
-                key="maximum_loss_to_maturity_percent",
-                label="Maximum Loss-to-Maturity (MLTM) %",
-                scorecard_key="maximum_loss_to_maturity_percent",
-                value_type="percent",
-                preferred_source="Calculated from approved cashflow schedule",
-                regex_patterns=(
-                    r"maximum\s+loss[-\s]*to[-\s]*maturity[^%]{0,220}([0-9]+(?:\.\d+)?)\s*%",
-                    r"MLTM[^%]{0,220}([0-9]+(?:\.\d+)?)\s*%",
-                ),
-                keywords=("debt service schedule", "annual debt service", "special tax", "reserve fund", "mltm"),
-                guidance="Best practice: calculate from approved schedule and reserve, not from an isolated AI estimate.",
-            ),
-            HybridField(
                 key="mltm_cashflow_table",
-                label="MLTM Cashflow Table",
+                label="MLTM Cashflow Input Table",
                 scorecard_key=None,
                 value_type="table",
                 preferred_source="Debt Service Schedule + special tax levy / revenue table",
                 regex_patterns=(),
-                keywords=("debt service schedule", "period ending", "principal", "interest", "total", "special tax levy"),
-                guidance="Requires year, special tax levy/revenue, and annual debt service columns. Analyst must review before calculation.",
+                keywords=("debt service schedule", "period ending", "principal", "interest", "total debt service", "special tax levy", "special tax revenues"),
+                guidance="Calculator input: requires year, special tax levy/revenue, annual debt service, and reserve assumptions. Missing this should prompt calculator/table upload, not direct AI scoring.",
+            ),
+            HybridField(
+                key="maximum_loss_to_maturity_percent",
+                label="Maximum Loss-to-Maturity (MLTM) %",
+                # This is a DERIVED OUTPUT from the MLTM calculator, not an OS extraction requirement.
+                # Keep scorecard_key=None here so the hybrid extractor does not mark the section
+                # as missing just because MLTM has not been calculated yet.
+                scorecard_key=None,
+                value_type="percent",
+                preferred_source="Derived output from approved MLTM calculator",
+                regex_patterns=(),
+                keywords=("maximum loss-to-maturity", "maximum loss to maturity", "mltm", "stress test"),
+                guidance="Derived output. Do not require AI to extract this from the OS; calculate it after the analyst approves the cashflow schedule/reserve inputs.",
             ),
         ],
     },
