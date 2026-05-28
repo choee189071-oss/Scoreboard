@@ -1,8 +1,6 @@
 import streamlit as st
 import pandas as pd
 import re
-import json
-import requests
 from datetime import datetime
 
 from modules.scoring_special_assessment import (
@@ -650,6 +648,216 @@ def fill_missing_scorecard_defaults_for_calculation(inputs):
     return filled, missing_used
 
 
+# =============================================================================
+# Semi-Auto Public Data Resolver: Local Unemployment
+# =============================================================================
+
+LOCAL_UNEMPLOYMENT_FRED_SERIES = {
+    # California counties most likely to appear in this prototype.
+    # FRED county unemployment series are ultimately based on BLS LAUS data.
+    ("CA", "Orange County"): "CAORAN9URN",
+    ("CA", "Los Angeles County"): "CALOSA7URN",
+    ("CA", "San Francisco County"): "CASANF0URN",
+    ("CA", "Alameda County"): "CAALAM1URN",
+    ("CA", "Santa Clara County"): "CASANT5URN",
+    ("CA", "San Diego County"): "CASAND5URN",
+    ("CA", "Riverside County"): "CARIVE5URN",
+    ("CA", "San Bernardino County"): "CASANB1URN",
+}
+
+
+def normalize_county_name(county_name: str) -> str:
+    """Normalize county names while preserving a user-facing County suffix."""
+    if not county_name:
+        return ""
+    name = " ".join(str(county_name).replace(",", " ").split()).strip()
+    if name and not name.lower().endswith("county"):
+        name = f"{name} County"
+    return name
+
+
+def suggest_local_unemployment_series(state: str, county_name: str):
+    """
+    Deterministic first-pass mapper.
+
+    This is intentionally conservative: the app only auto-pulls when a known mapping
+    or analyst-confirmed manual FRED series ID is available. AI can be added later as
+    a suggestion layer, but should not invent the economic value itself.
+    """
+    state_clean = str(state or "").strip().upper()
+    county_clean = normalize_county_name(county_name)
+    series_id = LOCAL_UNEMPLOYMENT_FRED_SERIES.get((state_clean, county_clean))
+
+    if not series_id:
+        return {
+            "ok": False,
+            "state": state_clean,
+            "county_name": county_clean,
+            "series_id": "",
+            "source_url": "https://fred.stlouisfed.org/searchresults/?search_type=series&search="
+            + f"{county_clean.replace(' ', '+')}+{state_clean}+unemployment+rate",
+            "message": "No hard-coded FRED county unemployment series found. Paste a FRED/LAUS series ID below, then approve.",
+        }
+
+    return {
+        "ok": True,
+        "state": state_clean,
+        "county_name": county_clean,
+        "series_id": series_id,
+        "source_url": f"https://fred.stlouisfed.org/series/{series_id}",
+        "message": f"Mapped {county_clean}, {state_clean} to FRED/BLS-LAUS series {series_id}.",
+    }
+
+
+def fetch_latest_fred_graph_value(series_id: str):
+    """
+    Pull latest non-missing observation from FRED's public graph CSV endpoint.
+    This endpoint is convenient for Streamlit prototypes and does not require an API key.
+    """
+    if not series_id:
+        raise ValueError("Missing FRED series id.")
+
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    df = pd.read_csv(url)
+
+    if df.empty or series_id not in df.columns:
+        raise ValueError(f"No usable FRED data returned for {series_id}.")
+
+    df[series_id] = pd.to_numeric(df[series_id].replace(".", pd.NA), errors="coerce")
+    df = df.dropna(subset=[series_id])
+
+    if df.empty:
+        raise ValueError(f"FRED series {series_id} has no numeric observations.")
+
+    latest = df.iloc[-1]
+    return {
+        "series_id": series_id,
+        "date": str(latest["observation_date"]),
+        "value": float(latest[series_id]),
+        "source_url": f"https://fred.stlouisfed.org/series/{series_id}",
+    }
+
+
+def pull_local_unemployment_difference(series_id: str):
+    """Pull local unemployment, US unemployment, and calculate local minus US."""
+    local = fetch_latest_fred_graph_value(series_id)
+    us = fetch_latest_fred_graph_value("UNRATE")
+
+    diff = round(local["value"] - us["value"], 2)
+
+    return {
+        "ok": True,
+        "local_series_id": series_id,
+        "local_date": local["date"],
+        "local_unemployment_rate": local["value"],
+        "us_date": us["date"],
+        "us_unemployment_rate": us["value"],
+        "unemployment_rate_difference_vs_us": diff,
+        "source_url": local["source_url"],
+        "us_source_url": us["source_url"],
+    }
+
+
+def append_auto_data_result_once(row: dict, unique_key: str):
+    """Append a visible auto-data result row while avoiding duplicate rows on reruns."""
+    existing = st.session_state.get("auto_data_results", []) or []
+    filtered = [r for r in existing if r.get("unique_key") != unique_key]
+    row["unique_key"] = unique_key
+    filtered.append(row)
+    st.session_state["auto_data_results"] = filtered
+
+
+def render_local_unemployment_resolver(deal_setup):
+    """UI card: show matched source address, allow analyst approval, then pull data."""
+    st.subheader("Semi-Auto Resolver: Local Unemployment")
+    st.caption(
+        "The app first maps the deal geography to a FRED/BLS-LAUS series. "
+        "After analyst approval, it pulls the local rate and compares it with U.S. unemployment."
+    )
+
+    suggested = suggest_local_unemployment_series(
+        state=deal_setup.get("state"),
+        county_name=deal_setup.get("county_name"),
+    )
+
+    left, right = st.columns([1.3, 1])
+
+    with left:
+        if suggested.get("ok"):
+            st.success(suggested.get("message"))
+        else:
+            st.warning(suggested.get("message"))
+
+        st.markdown(f"**找到的地址是：** {suggested.get('source_url', '')}")
+
+        default_series = suggested.get("series_id", "")
+        series_id = st.text_input(
+            "FRED / BLS-LAUS Series ID",
+            value=default_series,
+            placeholder="Example: CAORAN9URN",
+            help="If the mapper cannot find the county series, paste the FRED county unemployment series ID here.",
+            key="local_unemployment_series_id_input",
+        )
+
+    with right:
+        st.markdown("**What this will write to scorecard**")
+        st.code("unemployment_rate_difference_vs_us = local unemployment - US unemployment")
+
+    approve_and_pull = st.button(
+        "Approve Series and Pull Local Unemployment",
+        type="primary",
+        key="approve_pull_local_unemployment",
+    )
+
+    if approve_and_pull:
+        if not series_id.strip():
+            st.error("No series ID available yet. Paste a FRED/BLS-LAUS series ID first.")
+            return
+
+        try:
+            result = pull_local_unemployment_difference(series_id.strip().upper())
+
+            safe_add_approved_input(
+                scorecard_key="unemployment_rate_difference_vs_us",
+                value=result["unemployment_rate_difference_vs_us"],
+                status="Auto Pulled",
+                source_method=f"FRED/BLS-LAUS {result['local_series_id']}",
+                source_document=None,
+                confidence=1.0,
+                notes=(
+                    f"Local unemployment {result['local_unemployment_rate']}% "
+                    f"as of {result['local_date']} minus U.S. unemployment "
+                    f"{result['us_unemployment_rate']}% as of {result['us_date']}."
+                ),
+            )
+
+            append_auto_data_result_once(
+                {
+                    "data_source": "BLS / LAUS via FRED",
+                    "target_data": "Local unemployment difference vs U.S.",
+                    "status": "success",
+                    "Date / Year": result["local_date"],
+                    "Extracted / Calculated Value": f"{result['unemployment_rate_difference_vs_us']} %",
+                    "source_url": result["source_url"],
+                    "notes": (
+                        f"Found address: {result['source_url']}. "
+                        f"Local {result['local_unemployment_rate']}% vs U.S. {result['us_unemployment_rate']}%."
+                    ),
+                },
+                unique_key="local_unemployment_difference_vs_us",
+            )
+
+            st.success("Local unemployment difference was pulled and approved into the scorecard.")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Local Unemployment", f"{result['local_unemployment_rate']}%")
+            c2.metric("U.S. Unemployment", f"{result['us_unemployment_rate']}%")
+            c3.metric("Difference vs U.S.", f"{result['unemployment_rate_difference_vs_us']}%")
+
+        except Exception as exc:
+            st.error(f"Could not pull unemployment data: {exc}")
+
+
+
 
 
 def add_approved_input(
@@ -976,29 +1184,6 @@ def run_auto_context_pull(deal_setup, census_api_key=None, fred_api_key=None):
 
     st.session_state["auto_data_results"] = bundle.get("results", [])
     merge_approved_inputs(bundle.get("approved_inputs", {}), status="Auto Pulled", source_method="Auto Data Connector")
-
-    # BLS / LAUS can be safely automated for county unemployment when FIPS is available.
-    # If the public API is unavailable, the workflow continues and analyst can use the semi-manual box.
-    try:
-        unemp = auto_pull_unemployment_difference(
-            deal_setup.get("state_fips"),
-            deal_setup.get("county_or_place_fips"),
-        )
-        safe_add_approved_input(
-            scorecard_key="unemployment_rate_difference_vs_us",
-            value=unemp["difference_vs_us"],
-            status="Auto Pulled",
-            source_method="BLS LAUS + U.S. CPS unemployment",
-            confidence=1.0,
-            notes=(
-                f"Local {unemp['local_unemployment_rate']}% vs U.S. {unemp['us_unemployment_rate']}%; "
-                f"periods: local {unemp['local_period']}, U.S. {unemp['us_period']}; "
-                f"series: {unemp['local_series_id']} and {unemp['us_series_id']}."
-            ),
-        )
-    except Exception as e:
-        st.session_state["last_unemployment_pull_error"] = str(e)
-
     sync_candidates_from_sources()
 
 
@@ -1021,213 +1206,6 @@ def run_document_extraction_pipeline(deal_setup, selected_targets, api_key, mode
     st.session_state["last_document_ai_result"] = result
     sync_candidates_from_sources()
     return result
-
-
-
-
-# =============================================================================
-# Semi-Automated Data Helpers: BLS / Assessor / Housing Proxy
-# =============================================================================
-
-def latest_bls_value(series_id, start_year=2023, end_year=None):
-    """
-    Pulls the latest numeric observation from BLS public API.
-    No API key required for small requests.
-    """
-    if end_year is None:
-        end_year = datetime.now().year
-
-    url = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
-    payload = {
-        "seriesid": [series_id],
-        "startyear": str(start_year),
-        "endyear": str(end_year),
-    }
-
-    response = requests.post(url, json=payload, timeout=20)
-    response.raise_for_status()
-    data = response.json()
-
-    if data.get("status") != "REQUEST_SUCCEEDED":
-        raise ValueError(data.get("message", "BLS request did not succeed."))
-
-    series = (data.get("Results", {}).get("series") or [{}])[0]
-    observations = series.get("data", []) or []
-
-    for obs in observations:
-        period = obs.get("period", "")
-        if period.startswith("M") and period != "M13":
-            return {
-                "series_id": series_id,
-                "year": obs.get("year"),
-                "period": period,
-                "period_name": obs.get("periodName"),
-                "value": float(obs.get("value")),
-            }
-
-    raise ValueError(f"No monthly observations found for {series_id}.")
-
-
-def county_laus_unemployment_series_id(state_fips, county_fips):
-    """
-    County LAUS unemployment rate series.
-    Example: Orange County, CA = LAUCN060590000000003.
-    """
-    state = str(state_fips).zfill(2)
-    county = str(county_fips).zfill(3)
-    return f"LAUCN{state}{county}0000000003"
-
-
-def auto_pull_unemployment_difference(state_fips, county_or_place_fips):
-    """
-    Pull local county unemployment rate and U.S. unemployment rate,
-    then store local minus U.S. as scorecard input.
-    """
-    local_series = county_laus_unemployment_series_id(state_fips, county_or_place_fips)
-    us_series = "LNS14000000"  # U.S. unemployment rate, seasonally adjusted.
-
-    local = latest_bls_value(local_series)
-    us = latest_bls_value(us_series)
-    diff = round(local["value"] - us["value"], 2)
-
-    return {
-        "local_series_id": local_series,
-        "us_series_id": us_series,
-        "local_unemployment_rate": local["value"],
-        "us_unemployment_rate": us["value"],
-        "difference_vs_us": diff,
-        "local_period": f"{local.get('period_name')} {local.get('year')}",
-        "us_period": f"{us.get('period_name')} {us.get('year')}",
-    }
-
-
-def normalize_column_name(col):
-    return re.sub(r"[^a-z0-9]+", "_", str(col).strip().lower()).strip("_")
-
-
-def infer_assessed_value_columns(df):
-    """Suggest likely assessed value columns from assessor / parcel exports."""
-    suggestions = []
-    positive_terms = [
-        "assessed", "assessment", "taxable", "total_av", "total_value", "roll_value",
-        "net_value", "land_value", "improvement_value", "value"
-    ]
-    negative_terms = ["tax", "rate", "year", "apn", "parcel", "zip", "code", "id", "acre", "sqft"]
-
-    for col in df.columns:
-        norm = normalize_column_name(col)
-        score = 0
-        for term in positive_terms:
-            if term in norm:
-                score += 2
-        for term in negative_terms:
-            if term in norm:
-                score -= 1
-
-        sample = pd.to_numeric(
-            df[col].astype(str).str.replace(r"[$,% ,]", "", regex=True),
-            errors="coerce",
-        )
-        numeric_share = sample.notna().mean() if len(sample) else 0
-        if numeric_share > 0.60:
-            score += 2
-        if sample.dropna().median() > 10000 if sample.notna().any() else False:
-            score += 1
-
-        if score > 0:
-            suggestions.append((col, score, numeric_share))
-
-    suggestions = sorted(suggestions, key=lambda x: x[1], reverse=True)
-    return [s[0] for s in suggestions]
-
-
-def clean_money_series(series):
-    return pd.to_numeric(
-        series.astype(str).str.replace(r"[$,% ,]", "", regex=True),
-        errors="coerce",
-    )
-
-
-def classify_housing_market_proxy(price_yoy, inventory_yoy, distress_proxy, affordability_worse):
-    """
-    Deterministic analyst-assist classifier for scorecard housing market volatility.
-    It does not replace judgement; it creates a reviewable recommendation.
-    """
-    price_yoy = float(price_yoy or 0)
-    inventory_yoy = float(inventory_yoy or 0)
-    distress_proxy = float(distress_proxy or 0)
-
-    risk_points = 0
-    reasons = []
-
-    if price_yoy <= -8:
-        risk_points += 3
-        reasons.append("home prices are falling materially")
-    elif price_yoy < 0:
-        risk_points += 2
-        reasons.append("home prices are declining")
-    elif price_yoy < 3:
-        risk_points += 1
-        reasons.append("home price growth is soft")
-    else:
-        reasons.append("home prices are stable or increasing")
-
-    if inventory_yoy >= 40:
-        risk_points += 2
-        reasons.append("inventory is rising sharply")
-    elif inventory_yoy >= 15:
-        risk_points += 1
-        reasons.append("inventory is rising")
-
-    if distress_proxy >= 2.5:
-        risk_points += 2
-        reasons.append("distress proxy is elevated")
-    elif distress_proxy >= 1.0:
-        risk_points += 1
-        reasons.append("distress proxy is somewhat elevated")
-
-    if affordability_worse:
-        risk_points += 1
-        reasons.append("affordability appears worse than national figures")
-
-    if risk_points <= 1:
-        classification = "Low Volatility; Stable Prices; Low Distress"
-        confidence = 0.75
-    elif risk_points <= 3:
-        classification = "Elevated Volatility; Stable Prices; Affordability Worse Than National Figures"
-        confidence = 0.70
-    elif risk_points <= 5:
-        classification = "Falling Local Home Prices; High Price Volatility; Low Affordability; Rising Distress"
-        confidence = 0.68
-    else:
-        classification = "Falling Local Home Prices; High Price Volatility; Significantly Worse Affordability; Rising Distress"
-        confidence = 0.65
-
-    return {
-        "classification": classification,
-        "confidence": confidence,
-        "risk_points": risk_points,
-        "reasons": reasons,
-    }
-
-
-def add_candidate_value(scorecard_key, scorecard_field, value, source_method, confidence=0.70, notes="", source_document=""):
-    """Add a reviewable candidate instead of directly overwriting the scorecard."""
-    candidate = {
-        "scorecard_field": scorecard_field,
-        "scorecard_key": scorecard_key,
-        "value": value,
-        "status": "Needs Review",
-        "source_method": source_method,
-        "source_document": source_document,
-        "source_url": "",
-        "confidence": confidence,
-        "notes": notes,
-        "source_excerpt": notes,
-    }
-    st.session_state.setdefault("candidate_extractions", [])
-    st.session_state["candidate_extractions"].append(candidate)
-    return candidate
 
 
 # =============================================================================
@@ -1269,6 +1247,33 @@ c3.metric("Candidate Queue", candidate_count)
 c4.metric("Approved Inputs", approved_count)
 
 
+st.markdown(
+    """
+    <div style="
+        display:flex;
+        gap:10px;
+        align-items:center;
+        margin:18px 0 26px 0;
+        padding:14px 16px;
+        border:1px solid #e5e7eb;
+        border-radius:16px;
+        background:#fafafa;
+        font-size:15px;
+        font-weight:600;
+    ">
+        <span>① Deal Workspace</span>
+        <span style="color:#9ca3af;">→</span>
+        <span>② Calculators</span>
+        <span style="color:#9ca3af;">→</span>
+        <span>③ Reliability Review</span>
+        <span style="color:#9ca3af;">→</span>
+        <span>④ Scorecard</span>
+        <span style="color:#9ca3af;">→</span>
+        <span>⑤ Sources & Evidence</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 tab_deal, tab_calcs, tab_review, tab_scorecard, tab_sources = st.tabs(
     [
@@ -1452,9 +1457,14 @@ with tab_deal:
         else:
             st.warning("Auto context completed. No documents uploaded, so document extraction was skipped.")
 
+    st.markdown("---")
+    render_local_unemployment_resolver(deal_setup)
+
     if st.session_state.get("auto_data_results"):
         st.subheader("Auto Context Results")
-        st.dataframe(auto_data_results_to_dataframe(st.session_state["auto_data_results"]), use_container_width=True)
+        auto_context_df = auto_data_results_to_dataframe(st.session_state["auto_data_results"])
+        auto_context_df = auto_context_df.fillna("").replace({None: "", "None": "", "nan": "", "NaN": ""})
+        st.dataframe(auto_context_df, use_container_width=True)
 
     if st.session_state.get("parsed_documents"):
         st.subheader("Parsed Document Preview")
@@ -1737,142 +1747,7 @@ with tab_calcs:
         "Use these workspaces to calculate values that are not reliably available from public APIs or document extraction."
     )
 
-    calc_tab1, calc_tab2, calc_tab3, calc_tab4, calc_tab5, calc_tab6 = st.tabs(
-        [
-            "Taxpayer Concentration",
-            "Value-to-Lien",
-            "MLTM Stress Test",
-            "BLS Unemployment",
-            "Assessed Value Upload",
-            "Housing Market Proxy",
-        ]
-    )
-
-    with calc_tab4:
-        st.subheader("BLS / LAUS Local Unemployment")
-        st.caption("Fully automated when county FIPS is available. Result writes directly to approved inputs unless manually overridden.")
-
-        setup = st.session_state.get("deal_setup", {})
-        local_series_guess = county_laus_unemployment_series_id(
-            setup.get("state_fips", "06"),
-            setup.get("county_or_place_fips", "059"),
-        )
-        st.code(f"Suggested local LAUS series: {local_series_guess}")
-
-        if st.button("Pull Local vs U.S. Unemployment", key="pull_bls_unemployment"):
-            try:
-                unemp = auto_pull_unemployment_difference(
-                    setup.get("state_fips"),
-                    setup.get("county_or_place_fips"),
-                )
-                safe_add_approved_input(
-                    "unemployment_rate_difference_vs_us",
-                    unemp["difference_vs_us"],
-                    status="Auto Pulled",
-                    source_method="BLS LAUS + U.S. CPS unemployment",
-                    confidence=1.0,
-                    notes=(
-                        f"Local {unemp['local_unemployment_rate']}% vs U.S. {unemp['us_unemployment_rate']}%; "
-                        f"periods: local {unemp['local_period']}, U.S. {unemp['us_period']}; "
-                        f"series: {unemp['local_series_id']} and {unemp['us_series_id']}."
-                    ),
-                )
-                st.success(f"Approved unemployment difference vs U.S.: {unemp['difference_vs_us']}%")
-                st.json(unemp)
-            except Exception as e:
-                st.error(f"BLS pull failed: {e}")
-                st.info("You can still enter the unemployment difference manually in the Scorecard tab.")
-
-    with calc_tab5:
-        st.subheader("Assessed Value Upload Parser")
-        st.caption("Semi-manual: upload assessor / parcel / tax roll CSV or Excel. The app suggests likely value columns, then analyst approves.")
-
-        av_file = st.file_uploader(
-            "Upload assessor, parcel, or assessed-value file",
-            type=["csv", "xlsx", "xls"],
-            key="assessed_value_file",
-        )
-
-        if av_file:
-            try:
-                if av_file.name.lower().endswith(".csv"):
-                    av_df = pd.read_csv(av_file)
-                else:
-                    av_df = pd.read_excel(av_file)
-
-                st.write(f"Rows loaded: {len(av_df):,}")
-                st.dataframe(av_df.head(25), use_container_width=True)
-
-                suggested_cols = infer_assessed_value_columns(av_df)
-                all_cols = list(av_df.columns)
-                default_index = all_cols.index(suggested_cols[0]) if suggested_cols and suggested_cols[0] in all_cols else 0
-
-                value_col = st.selectbox(
-                    "Assessed value column",
-                    all_cols,
-                    index=default_index,
-                    key="assessed_value_column_select",
-                )
-
-                parsed_values = clean_money_series(av_df[value_col])
-                total_av = parsed_values.sum(skipna=True)
-                valid_rows = int(parsed_values.notna().sum())
-
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Detected Total AV", f"${total_av:,.0f}")
-                c2.metric("Valid Numeric Rows", f"{valid_rows:,}")
-                c3.metric("Selected Column", value_col)
-
-                st.caption("Suggested columns: " + (", ".join(map(str, suggested_cols[:5])) if suggested_cols else "No strong suggestion."))
-
-                approve_col, candidate_col = st.columns(2)
-                with approve_col:
-                    if st.button("Approve Assessed Value as Source Data", key="approve_total_av"):
-                        safe_add_approved_input(
-                            "total_assessed_value",
-                            total_av,
-                            status="AI Extracted",
-                            source_method="Assessed Value Upload Parser",
-                            source_document=av_file.name,
-                            confidence=0.90 if suggested_cols and value_col == suggested_cols[0] else 0.75,
-                            notes=f"Total assessed value summed from column '{value_col}' across {valid_rows:,} numeric rows.",
-                        )
-                        st.success("Total assessed value approved into master inputs.")
-                with candidate_col:
-                    if st.button("Use AV to Update Value-to-Lien Calculator Input", key="candidate_total_av"):
-                        st.session_state["suggested_assessed_value"] = float(total_av)
-                        st.success("Saved as suggested assessed value for the Value-to-Lien calculator.")
-
-            except Exception as e:
-                st.error(f"Could not parse assessed value file: {e}")
-
-    with calc_tab6:
-        st.subheader("Housing Market Trend / Distress Proxy")
-        st.caption("AI-like analyst assistant: enter a few market indicators, get a reviewable scorecard classification.")
-
-        h1, h2, h3, h4 = st.columns(4)
-        with h1:
-            price_yoy = st.number_input("Home Price YoY %", value=0.0, step=0.5, key="housing_price_yoy")
-        with h2:
-            inventory_yoy = st.number_input("Inventory YoY %", value=0.0, step=1.0, key="housing_inventory_yoy")
-        with h3:
-            distress_proxy = st.number_input("Distress Proxy %", value=0.0, step=0.1, key="housing_distress_proxy")
-        with h4:
-            affordability_worse = st.checkbox("Affordability worse than U.S.", value=True, key="housing_affordability_worse")
-
-        if st.button("Generate Housing Classification Candidate", key="generate_housing_candidate"):
-            housing = classify_housing_market_proxy(price_yoy, inventory_yoy, distress_proxy, affordability_worse)
-            notes = "Reasons: " + "; ".join(housing["reasons"])
-            add_candidate_value(
-                scorecard_key="real_estate_market_volatility",
-                scorecard_field="Real Estate Market Volatility",
-                value=housing["classification"],
-                source_method="Housing Market Proxy Classifier",
-                confidence=housing["confidence"],
-                notes=f"Risk points: {housing['risk_points']}. {notes}",
-            )
-            st.success("Housing classification candidate added to Reliability Review.")
-            st.json(housing)
+    calc_tab1, calc_tab2, calc_tab3 = st.tabs(["Taxpayer Concentration", "Value-to-Lien", "MLTM Stress Test"])
 
     with calc_tab1:
         st.subheader("Taxpayer Concentration Builder")
@@ -1922,7 +1797,7 @@ with tab_calcs:
         col1, col2 = st.columns(2)
 
         with col1:
-            assessed_value = st.number_input("Assessed Value", min_value=0.0, value=float(st.session_state.get("suggested_assessed_value", 3454244692.0)), step=1000000.0)
+            assessed_value = st.number_input("Assessed Value", min_value=0.0, value=3454244692.0, step=1000000.0)
             direct_debt = st.number_input("Direct Debt", min_value=0.0, value=183240000.0, step=1000000.0)
 
         with col2:
