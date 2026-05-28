@@ -1059,14 +1059,14 @@ def regex_extract_fields(parsed_docs: List[Dict[str, Any]], section_id: str) -> 
                         "scorecard_key": "district_size_parcels",
                         "value": int(value),
                         "value_type": "number",
-                        "confidence": 0.84,
+                        "confidence": 0.45 if value < 50 and ("assessor" in lower or "building site" in lower or "apn" in lower) else 0.84,
                         "method": "Regex Narrative Scan",
                         "tier": "Tier 1",
                         "source_document": page.get("document"),
                         "page": page.get("page"),
                         "evidence": text[:1600],
                         "preferred_source": "OS district description / taxable parcels disclosure",
-                        "guidance": "Narrative parcel count extracted from OS. Verify taxable vs developed parcel definition.",
+                        "guidance": "Narrative parcel count extracted from OS. Verify taxable vs developed parcel definition; small APN/building-site counts should not be treated as district scale without analyst confirmation.",
                     })
                     break
 
@@ -1194,6 +1194,7 @@ If a field is not found, return value=null, confidence=0, page=null, and notes e
 Prefer deal-specific values over general county values.
 For assessed value, prefer "assessed value of all taxable property within the CFD" over developed-property-only value.
 For taxpayer concentration, do not confuse assessed-value share with levy share unless the source clearly says levy/special tax share.
+For district_size_parcels, be very conservative: do NOT use assessor parcels, APNs, ownership parcels, or building sites as the scorecard parcel count unless the text explicitly says they are taxable parcels/units used for the special tax assessment. If the text only says building sites or assessor parcels, return value=null with low confidence and explain the ambiguity.
 For MLTM, prefer a calculated schedule or explicit MLTM; do not make up a stress value.
 
 Fields:
@@ -1246,6 +1247,24 @@ Text window:
         return {"ok": True, "data": parsed, "raw_response_id": data.get("id")}
     except Exception as exc:
         return {"ok": False, "error": f"OpenAI extraction exception: {exc}"}
+
+
+def _adjust_candidate_for_credit_context(field: HybridField, value: Any, confidence: float, evidence: str, notes: str) -> Tuple[Any, float, str]:
+    """Post-process extracted candidates for common muni-credit ambiguity traps."""
+    if field.key == "district_size_parcels":
+        ev = _safe_text(evidence).lower()
+        try:
+            numeric_value = float(value)
+        except Exception:
+            numeric_value = None
+        ambiguous_terms = ["building site", "building sites", "assessor", "assessor's parcel", "assessor’s parcel", "apn", "ownership parcel", "fee title owner"]
+        if numeric_value is not None and numeric_value < 50 and any(t in ev for t in ambiguous_terms):
+            confidence = min(float(confidence or 0), 0.45)
+            notes = _normalize_space(
+                (notes or "")
+                + " Potential ambiguity: value may reflect assessor/APN parcels, ownership parcels, or building sites rather than true taxable/homeowner parcel count for scorecard scale. Analyst should verify before approval."
+            )
+    return value, confidence, notes
 
 
 def run_hybrid_section_extraction(
@@ -1310,21 +1329,27 @@ def run_hybrid_section_extraction(
                     value = _coerce_value(item.get("value"), f.value_type)
                     if value is None or value == "":
                         continue
+                    evidence = item.get("evidence") or ""
+                    notes = item.get("notes") or ""
+                    confidence = float(item.get("confidence") or 0.55)
+                    value, confidence, notes = _adjust_candidate_for_credit_context(f, value, confidence, evidence, notes)
+                    if value is None or value == "":
+                        continue
                     ai_candidates.append({
                         "field_key": f.key,
                         "label": f.label,
                         "scorecard_key": f.scorecard_key,
                         "value": value,
                         "value_type": f.value_type,
-                        "confidence": float(item.get("confidence") or 0.55),
+                        "confidence": confidence,
                         "method": "OpenAI Responses API Structured Extraction",
                         "tier": "Tier 2",
                         "source_document": item.get("source_label") or "Uploaded OS / source window",
                         "page": item.get("page"),
-                        "evidence": item.get("evidence") or "",
+                        "evidence": evidence,
                         "preferred_source": f.preferred_source,
                         "guidance": f.guidance,
-                        "notes": item.get("notes") or "",
+                        "notes": notes,
                         "response_id": ai_result.get("raw_response_id"),
                     })
             else:
