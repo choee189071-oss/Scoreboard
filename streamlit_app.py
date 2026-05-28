@@ -43,6 +43,11 @@ from modules.table_extraction_engine import (
     confidence_status,
 )
 
+from modules.hybrid_ai_extractors import (
+    HYBRID_SECTIONS,
+    run_hybrid_section_extraction,
+)
+
 st.set_page_config(page_title="Municipal Credit Deal Workspace", layout="wide")
 
 st.title("Municipal Credit Deal Workspace")
@@ -3342,6 +3347,260 @@ def run_document_extraction_pipeline(deal_setup, selected_targets, api_key, mode
 
 
 
+
+
+# =============================================================================
+# Hybrid Regex → OpenAI Structured Extraction UI
+# =============================================================================
+
+HYBRID_SECTION_IDS = [
+    "market_economic",
+    "assessed_tax_base",
+    "housing_proxy",
+    "taxbase_concentration",
+    "leverage_vtl",
+    "cashflow_mltm",
+]
+
+
+def _hybrid_api_key(explicit_key=None):
+    if explicit_key:
+        return explicit_key
+    try:
+        return st.secrets.get("OPENAI_API_KEY", "")
+    except Exception:
+        return ""
+
+
+def _hybrid_format_value(value, value_type):
+    if value is None or value == "":
+        return ""
+    try:
+        if value_type == "money":
+            return f"${float(value):,.0f}"
+        if value_type == "percent":
+            return f"{float(value):.2f}%".rstrip("0").rstrip(".") + ("%" if "%" not in f"{float(value):.2f}%" else "")
+        if value_type == "number":
+            return f"{float(value):,.2f}".rstrip("0").rstrip(".")
+    except Exception:
+        pass
+    return str(value)
+
+
+def _hybrid_status_label(candidate):
+    method = str(candidate.get("method", ""))
+    conf = float(candidate.get("confidence", 0) or 0)
+    if "Regex" in method and conf >= 0.85:
+        return "Source Verified"
+    if "OpenAI" in method:
+        return "AI Extracted / Needs Review"
+    return "Needs Review"
+
+
+def _hybrid_approve_candidate(candidate):
+    """Approve a single hybrid candidate into approved_inputs and relevant calculator prefill state."""
+    field_key = candidate.get("field_key")
+    scorecard_key = candidate.get("scorecard_key")
+    value = candidate.get("value")
+    value_type = candidate.get("value_type")
+    confidence = float(candidate.get("confidence", 0) or 0)
+    status = _hybrid_status_label(candidate)
+    method = candidate.get("method", "Hybrid Extraction")
+    source_document = candidate.get("source_document", "")
+    page = candidate.get("page")
+    evidence = str(candidate.get("evidence", ""))[:1200]
+    notes = f"Hybrid extraction approval. Field={field_key}. Page={page}. Evidence: {evidence}"
+
+    # Scorecard-compatible fields.
+    if scorecard_key:
+        safe_add_approved_input(
+            scorecard_key=scorecard_key,
+            value=value,
+            status=status,
+            source_method=method,
+            source_document=f"{source_document} p.{page}" if page else source_document,
+            confidence=confidence,
+            notes=notes,
+        )
+
+    # Calculator / resolver sync hooks.
+    if field_key in {"all_taxable_assessed_value", "assessed_value"} and value is not None:
+        try:
+            st.session_state["suggested_assessed_value"] = float(value)
+            vtl_prefill = st.session_state.get("vtl_prefill", {}) or {}
+            vtl_prefill["assessed_value"] = float(value)
+            st.session_state["vtl_prefill"] = vtl_prefill
+        except Exception:
+            pass
+
+        # Also update Auto Context table row so the Assessed Value tab reflects approval.
+        try:
+            upsert_auto_data_result_by_target(
+                {
+                    "data_source": "OS / Appendix PDF" if "Regex" in method or "OpenAI" in method else "Hybrid Resolver",
+                    "series_label": source_document,
+                    "target_data": "Assessed value",
+                    "status": "success" if status == "Source Verified" else "needs_review",
+                    "date_or_year": datetime.now().date().isoformat(),
+                    "value": _hybrid_format_value(value, "money"),
+                    "source_url": "",
+                    "notes": notes,
+                },
+                target_contains="Assessed value",
+                unique_key=f"hybrid_assessed_value_{field_key}",
+            )
+        except Exception:
+            pass
+
+    if field_key == "direct_debt" and value is not None:
+        vtl_prefill = st.session_state.get("vtl_prefill", {}) or {}
+        try:
+            vtl_prefill["direct_debt"] = float(value)
+            st.session_state["vtl_prefill"] = vtl_prefill
+        except Exception:
+            pass
+
+    if field_key == "overlapping_debt" and value is not None:
+        vtl_prefill = st.session_state.get("vtl_prefill", {}) or {}
+        try:
+            vtl_prefill["overlapping_debt"] = float(value)
+            st.session_state["vtl_prefill"] = vtl_prefill
+        except Exception:
+            pass
+
+    if field_key == "initial_reserve_fund" and value is not None:
+        try:
+            st.session_state["mltm_initial_reserve_fund"] = float(value)
+        except Exception:
+            pass
+
+    # Audit metadata for fields without scorecard keys.
+    if not scorecard_key:
+        st.session_state.setdefault("hybrid_non_scorecard_approvals", {})[field_key] = {
+            "value": value,
+            "status": status,
+            "method": method,
+            "source_document": source_document,
+            "page": page,
+            "confidence": confidence,
+            "notes": notes,
+            "approved_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+
+def render_hybrid_section_workflow(
+    section_id,
+    deal_setup,
+    api_key=None,
+    model="gpt-4.1-mini",
+    key_prefix="hybrid",
+    expanded=False,
+):
+    """Render the same clean workflow in every major section.
+
+    Flow: Regex Full-OS Scan → OpenAI JSON fallback → Analyst approval.
+    Nothing is pushed into scorecard/calculators until an approval button is clicked.
+    """
+    section = HYBRID_SECTIONS.get(section_id, {})
+    title = section.get("title", section_id)
+    subtitle = section.get("subtitle", "")
+    storage_key = f"{key_prefix}_{section_id}_result"
+
+    with st.expander(f"Hybrid Source Resolver — {title}", expanded=expanded):
+        st.info("Flow: Regex full-document scan → OpenAI structured JSON fallback for missing fields → analyst review/approval → calculator/scorecard sync.")
+        if subtitle:
+            st.caption(subtitle)
+        st.warning("AI-sourced values are candidates only. Always verify source document, page, table headers, units, and dates before approving.")
+
+        parsed_docs = st.session_state.get("parsed_documents", []) or []
+        if not parsed_docs and section_id not in {"market_economic", "housing_proxy"}:
+            st.info("Upload an OS / Appendix PDF or schedule file in Deal Workspace before running document extraction.")
+
+        c1, c2, c3 = st.columns([1.2, 1.2, 2])
+        with c1:
+            run_scan = st.button("Run Hybrid Resolver", key=f"{key_prefix}_{section_id}_run")
+        with c2:
+            force_ai = st.button("Force AI JSON Fallback", key=f"{key_prefix}_{section_id}_force_ai")
+        with c3:
+            st.caption("Regex is attempted first. OpenAI is used only when missing/forced and an API key is available.")
+
+        if run_scan or force_ai:
+            if not parsed_docs and section_id not in {"market_economic", "housing_proxy"}:
+                st.error("No parsed documents available.")
+            else:
+                with st.spinner(f"Running {title} hybrid extraction..."):
+                    result = run_hybrid_section_extraction(
+                        section_id=section_id,
+                        parsed_docs=parsed_docs,
+                        api_key=_hybrid_api_key(api_key),
+                        model=model,
+                        issuer_name=deal_setup.get("issuer_name", ""),
+                        state=deal_setup.get("state", ""),
+                        county_name=deal_setup.get("county_name", ""),
+                        force_ai=bool(force_ai),
+                    )
+                st.session_state[storage_key] = result
+
+        result = st.session_state.get(storage_key)
+        if not result:
+            st.caption("No hybrid extraction has been run for this section yet.")
+            return
+
+        if not result.get("ok"):
+            st.error(result.get("error", "Hybrid extraction failed."))
+            return
+
+        candidates = result.get("candidates", []) or []
+        missing = result.get("missing", []) or []
+        ai_error = result.get("ai_error")
+        candidate_pages = result.get("candidate_pages", []) or []
+
+        summary_cols = st.columns(4)
+        summary_cols[0].metric("Candidates Found", len(candidates))
+        summary_cols[1].metric("Still Missing", len(missing))
+        summary_cols[2].metric("Candidate Pages", len(candidate_pages))
+        summary_cols[3].metric("AI Used", "Yes" if result.get("ai_candidates") else "No")
+
+        if ai_error:
+            st.warning(f"AI fallback did not complete: {ai_error}")
+
+        if candidate_pages:
+            with st.expander("Candidate pages / matched evidence windows", expanded=False):
+                st.dataframe(pd.DataFrame(candidate_pages), use_container_width=True)
+
+        if candidates:
+            st.markdown("#### Reviewable Candidates")
+            for i, cand in enumerate(candidates):
+                status = _hybrid_status_label(cand)
+                conf = float(cand.get("confidence", 0) or 0)
+                with st.container(border=True):
+                    left, mid, right = st.columns([1.6, 1, 1])
+                    left.markdown(f"**{cand.get('label', cand.get('field_key'))}**")
+                    left.caption(f"{status} · {cand.get('method', '')}")
+                    mid.metric("Value", _hybrid_format_value(cand.get("value"), cand.get("value_type")))
+                    right.metric("Confidence", f"{conf:.0%}")
+                    src = cand.get("source_document") or ""
+                    page = cand.get("page")
+                    st.caption(f"Source: {src}" + (f" · Page {page}" if page else ""))
+                    if cand.get("guidance"):
+                        st.caption("Review note: " + str(cand.get("guidance")))
+                    with st.expander("Evidence / notes", expanded=False):
+                        if cand.get("evidence"):
+                            st.write(cand.get("evidence"))
+                        if cand.get("notes"):
+                            st.write("Notes: " + str(cand.get("notes")))
+                    if st.button(f"Approve Candidate — {cand.get('label', cand.get('field_key'))}", key=f"{key_prefix}_{section_id}_approve_{i}"):
+                        _hybrid_approve_candidate(cand)
+                        st.success("Approved and synced where applicable. Scorecard widgets update after rerun.")
+                        rerun_after_approve()
+
+        if missing:
+            st.markdown("#### Missing After Hybrid Scan")
+            missing_df = pd.DataFrame(missing)
+            st.dataframe(missing_df, use_container_width=True, hide_index=True)
+            st.caption("For missing fields: try a more specific OS/appendix, upload a mapped table, enter manually, or use explicitly labelled fallback assumptions.")
+
+
 # =============================================================================
 # AI-Assisted Calculator Fill Helpers
 # =============================================================================
@@ -5045,6 +5304,14 @@ with tab_calcs:
 
     with unified_tab_market:
         st.subheader("Market & Economic Context")
+        render_hybrid_section_workflow(
+            "market_economic",
+            deal_setup,
+            api_key=openai_api_key or default_openai_key,
+            model=model,
+            key_prefix="market_economic_hybrid",
+            expanded=False,
+        )
         render_local_unemployment_resolver(deal_setup, key_prefix="data_workspace")
 
         st.markdown("#### Economic Fundamentals Auto-Fill")
@@ -5091,10 +5358,26 @@ with tab_calcs:
 
     with unified_tab_assessed:
         st.subheader("Assessed Value / Tax Base Resolver")
+        render_hybrid_section_workflow(
+            "assessed_tax_base",
+            deal_setup,
+            api_key=openai_api_key or default_openai_key,
+            model=model,
+            key_prefix="assessed_taxbase_hybrid",
+            expanded=True,
+        )
         render_assessed_value_upload_parser(key_prefix="data_workspace")
 
     with unified_tab_housing:
         st.subheader("Housing Market Trend / Distress Proxy")
+        render_hybrid_section_workflow(
+            "housing_proxy",
+            deal_setup,
+            api_key=openai_api_key or default_openai_key,
+            model=model,
+            key_prefix="housing_proxy_hybrid",
+            expanded=False,
+        )
         render_housing_market_proxy_resolver(key_prefix="data_workspace")
 
     # The last three unified tabs are the analytical engines.
@@ -5104,6 +5387,14 @@ with tab_calcs:
 
     with calc_tab1:
         st.subheader("Taxpayer Concentration Builder")
+        render_hybrid_section_workflow(
+            "taxbase_concentration",
+            deal_setup,
+            api_key=openai_api_key or default_openai_key,
+            model=model,
+            key_prefix="taxbase_concentration_hybrid",
+            expanded=True,
+        )
         render_ai_fill_warning()
 
         with st.expander("AI Table Extraction Engine", expanded=False):
@@ -5447,6 +5738,14 @@ Recommended next step: run OCR Mode or use the upload/mapping fallback below.
 
     with calc_tab2:
         st.subheader("Value-to-Lien Calculator")
+        render_hybrid_section_workflow(
+            "leverage_vtl",
+            deal_setup,
+            api_key=openai_api_key or default_openai_key,
+            model=model,
+            key_prefix="leverage_vtl_hybrid",
+            expanded=True,
+        )
         render_ai_fill_warning()
         render_tiered_missing_data_fallback_center(
             fields=["est_value_to_lien"],
@@ -5635,6 +5934,14 @@ Recommended next step: run OCR Mode or use the upload/mapping fallback below.
 
     with calc_tab3:
         st.subheader("Maximum Loss-to-Maturity Stress Test")
+        render_hybrid_section_workflow(
+            "cashflow_mltm",
+            deal_setup,
+            api_key=openai_api_key or default_openai_key,
+            model=model,
+            key_prefix="cashflow_mltm_hybrid",
+            expanded=True,
+        )
         render_ai_fill_warning()
         render_tiered_missing_data_fallback_center(
             fields=["maximum_loss_to_maturity_percent"],
