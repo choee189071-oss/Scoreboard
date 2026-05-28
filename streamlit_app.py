@@ -767,6 +767,40 @@ def append_auto_data_result_once(row: dict, unique_key: str):
     st.session_state["auto_data_results"] = filtered
 
 
+def upsert_auto_data_result_by_target(row: dict, target_contains: str, unique_key: str = None):
+    """
+    Replace a manual_required placeholder row in Auto Context Results with a resolved result.
+
+    This prevents the confusing pattern where the old BLS/LAUS row remains
+    manual_required while a new success row is appended at the bottom.
+    """
+    existing = st.session_state.get("auto_data_results", []) or []
+    target_text = str(target_contains or "").lower()
+
+    def row_matches(existing_row):
+        if unique_key and existing_row.get("unique_key") == unique_key:
+            return True
+
+        # Remove earlier appended local-unemployment rows too.
+        source_text = str(existing_row.get("data_source") or existing_row.get("Data Source") or "").lower()
+        if target_text == "local unemployment" and "bls / laus via fred" in source_text:
+            return True
+
+        # Match by target/field-like columns regardless of source dataframe naming.
+        for k, v in existing_row.items():
+            key_text = str(k).lower()
+            if any(token in key_text for token in ["target", "data", "field"]):
+                if target_text and target_text in str(v).lower():
+                    return True
+        return False
+
+    filtered = [r for r in existing if not row_matches(r)]
+    if unique_key:
+        row["unique_key"] = unique_key
+    filtered.append(row)
+    st.session_state["auto_data_results"] = filtered
+
+
 
 # =============================================================================
 # Cleaner Source Status + Safe Semi-Auto Resolvers
@@ -1185,20 +1219,27 @@ def render_local_unemployment_resolver(deal_setup, key_prefix="main"):
                 ),
             )
 
-            append_auto_data_result_once(
+            upsert_auto_data_result_by_target(
                 {
                     "data_source": "BLS / LAUS via FRED",
-                    "target_data": "Local unemployment difference vs U.S.",
+                    "series_label": result["local_series_id"],
+                    "target_data": "Local unemployment",
                     "status": "success",
-                    "Date / Year": result["local_date"],
-                    "Extracted / Calculated Value": f"{result['unemployment_rate_difference_vs_us']} %",
+                    "date_or_year": result["local_date"],
+                    "value": (
+                        f"{result['local_unemployment_rate']}% "
+                        f"(U.S. {result['us_unemployment_rate']}%; "
+                        f"diff {result['unemployment_rate_difference_vs_us']}%)"
+                    ),
                     "source_url": result["source_url"],
                     "notes": (
                         f"Found address: {result['source_url']}. "
-                        f"Local {result['local_unemployment_rate']}% vs U.S. {result['us_unemployment_rate']}%."
+                        f"Scorecard input unemployment_rate_difference_vs_us = "
+                        f"{result['unemployment_rate_difference_vs_us']}%."
                     ),
                 },
-                unique_key="local_unemployment_difference_vs_us",
+                target_contains="Local unemployment",
+                unique_key="local_unemployment",
             )
 
             st.success("Local unemployment difference was pulled and approved into the scorecard.")
