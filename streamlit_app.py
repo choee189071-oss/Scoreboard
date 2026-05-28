@@ -4208,9 +4208,9 @@ with tab_scorecard:
 # =============================================================================
 
 with tab_calcs:
-    st.header("2. Data & Calculators Workspace")
+    st.header("2. Data & Credit Analysis Workspace")
     st.caption(
-        "Run market/public-data pulls, resolve missing fields safely, then calculate deal-specific ratios and stress tests."
+        "Run market/public-data pulls, resolve missing fields safely, and build district/structural credit metrics in one integrated workflow."
     )
 
     st.markdown("---")
@@ -4291,9 +4291,9 @@ with tab_calcs:
             st.warning("Auto context completed. No documents uploaded, so document extraction was skipped.")
 
     st.markdown("---")
-    st.subheader("B. Missing Data Resolver")
-    st.caption("Use safe semi-auto tools to resolve fields that should not be guessed. Results replace the manual_required rows after approval.")
-    resolver_tab1, resolver_tab2, resolver_tab3 = st.tabs(["Local Unemployment", "Assessed Value", "Housing Proxy"])
+    st.subheader("B. Credit Metric Resolution & Analytical Engines")
+    st.caption("Use safe semi-auto tools, AI/table extraction, fallback uploads, and calculators to resolve missing credit metrics. Every AI/inferred value remains reviewable before it enters the scorecard.")
+    resolver_tab1, resolver_tab2, resolver_tab3 = st.tabs(["Economic / Local Market", "Assessed Value / Tax Base", "Housing Proxy"] )
     with resolver_tab1:
         render_local_unemployment_resolver(deal_setup, key_prefix="data_workspace")
     with resolver_tab2:
@@ -4338,14 +4338,18 @@ with tab_calcs:
 
 
     st.markdown("---")
-    st.subheader("C. Analytical Calculators")
-    st.caption("Use these workspaces for ratios/stress tests that require analyst inputs or uploaded schedules.")
+    st.markdown("### District & Structural Analytical Engines")
+    st.caption("These calculators now live inside the same credit-metric workflow as the resolvers above: extract or source data → approve/pre-fill → calculate → sync to scorecard.")
+
+    st.info(
+        "Recommended flow: AI/Public Source Scout or Upload Mapping → Analyst Review/Approve → Run Calculator → Review in Scorecard/Reliability Review."
+    )
 
     calc_tab1, calc_tab2, calc_tab3 = st.tabs(
         [
-            "Taxpayer Concentration",
-            "Value-to-Lien",
-            "MLTM Stress Test",
+            "Tax Base & Concentration",
+            "Leverage & Value-to-Lien",
+            "Cashflow & MLTM Stress",
         ]
     )
 
