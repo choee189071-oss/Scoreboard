@@ -5196,64 +5196,139 @@ with tab_calcs:
                         st.success("Reserve fund loaded. Review/edit below before calculating.")
                         rerun_after_approve()
 
-        initial_reserve_fund = st.number_input(
-            "Initial Reserve Fund",
-            min_value=0.0,
-            value=float(st.session_state.get("mltm_reserve_default", 15439154.0)),
-            step=100000.0,
-            key="mltm_initial_reserve_fund",
-        )
+        # ---------------------------------------------------------------------
+        # MLTM calculation workspace
+        # ---------------------------------------------------------------------
+        # IMPORTANT: Do NOT show demo/default MLTM data.  A fake-looking default
+        # cashflow table is more dangerous than a clear Missing state.
+        # The calculator only opens after a schedule has been approved from:
+        #   1) AI table extraction,
+        #   2) uploaded/mapped schedule,
+        #   3) public source scout.
 
-        default_cashflow = st.session_state.get("mltm_cashflow_default")
-        if default_cashflow is None:
-            default_cashflow = pd.DataFrame(
-                {
-                    "year": list(range(2027, 2037)),
-                    "special_tax_levy": [
-                        12191803,
-                        12460759,
-                        12710019,
-                        12959939,
-                        13219518,
-                        13492483,
-                        13758628,
-                        14025653,
-                        14138513,
-                        14239823,
-                    ],
-                    "annual_debt_service": [
-                        11108912,
-                        11327963,
-                        11554563,
-                        11781763,
-                        12017744,
-                        12265894,
-                        12507844,
-                        12750594,
-                        12853194,
-                        12945294,
-                    ],
-                }
+        def _is_demo_mltm_schedule(df):
+            """Detect and suppress the old sample MLTM schedule if it is still in session_state."""
+            try:
+                if df is None or df.empty:
+                    return False
+                check = df.copy()
+                needed = ["year", "special_tax_levy", "annual_debt_service"]
+                if not all(c in check.columns for c in needed):
+                    return False
+                first = check.iloc[0]
+                return (
+                    int(float(first.get("year"))) == 2027
+                    and int(float(first.get("special_tax_levy"))) == 12191803
+                    and int(float(first.get("annual_debt_service"))) == 11108912
+                )
+            except Exception:
+                return False
+
+        approved_cashflow = st.session_state.get("mltm_cashflow_default")
+
+        if _is_demo_mltm_schedule(approved_cashflow):
+            st.session_state.pop("mltm_cashflow_default", None)
+            st.session_state.pop("mltm_cashflow_editor", None)
+            st.session_state.pop("mltm_reserve_default", None)
+            st.session_state.pop("mltm_initial_reserve_fund", None)
+            st.session_state.pop("mltm_schedule_source", None)
+            approved_cashflow = None
+            st.warning(
+                "Old demo MLTM schedule was removed. Upload, extract, or approve a real cashflow schedule before calculating MLTM."
+            )
+
+        has_approved_cashflow = isinstance(approved_cashflow, pd.DataFrame) and not approved_cashflow.empty
+
+        if not has_approved_cashflow:
+            st.error("No approved MLTM cashflow schedule available.")
+            st.info(
+                "Upload/map a debt-service or levy schedule, run AI Table Extraction, or use AI Public Source Scout. "
+                "MLTM calculation is disabled until a real schedule is approved."
+            )
+
+            status_rows = pd.DataFrame(
+                [
+                    {
+                        "Required Input": "Annual special tax levy / pledged revenue schedule",
+                        "Status": "Missing",
+                        "Next Step": "Upload/map schedule or approve AI-extracted table",
+                    },
+                    {
+                        "Required Input": "Annual debt service schedule",
+                        "Status": "Missing",
+                        "Next Step": "Upload/map schedule or approve AI-extracted table",
+                    },
+                    {
+                        "Required Input": "Initial reserve fund",
+                        "Status": "Optional but recommended / Missing",
+                        "Next Step": "Extract from OS or enter manually after source review",
+                    },
+                ]
+            )
+            st.dataframe(status_rows, use_container_width=True, hide_index=True)
+            st.caption(
+                "No sample values are displayed here by design, to avoid accidentally treating demo data as deal data."
             )
         else:
-            st.info(f"AI-loaded schedule source: {st.session_state.get('mltm_schedule_source', 'uploaded document')}. Review before calculating.")
-
-        cashflow_df = st.data_editor(default_cashflow, num_rows="dynamic", use_container_width=True, key="mltm_cashflow_editor")
-
-        if st.button("Calculate MLTM", key="calculate_mltm"):
-            mltm_results = calculate_mltm_from_cashflow(cashflow_df, initial_reserve_fund=initial_reserve_fund)
-            safe_add_approved_input(
-                "maximum_loss_to_maturity_percent",
-                mltm_results["maximum_loss_to_maturity_percent"],
-                status="Calculated",
-                source_method="MLTM Stress Test",
-                confidence=1.0,
+            st.success(
+                f"Approved MLTM schedule loaded. Source: {st.session_state.get('mltm_schedule_source', 'uploaded / approved source')}. Review before calculating."
             )
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Estimated MLTM %", mltm_results["maximum_loss_to_maturity_percent"])
-            c2.metric("Total Revenue", f"{mltm_results['total_revenue']:,.0f}")
-            c3.metric("Total Debt Service", f"{mltm_results['total_debt_service']:,.0f}")
-            st.dataframe(mltm_results["mltm_cashflow_table"], use_container_width=True)
+
+            reserve_default = st.session_state.get("mltm_reserve_default")
+            reserve_text_default = "" if reserve_default is None else str(float(reserve_default))
+            reserve_text = st.text_input(
+                "Initial Reserve Fund",
+                value=reserve_text_default,
+                placeholder="Missing / enter only after source review",
+                key="mltm_initial_reserve_fund_text",
+                help="Leave blank if no reliable reserve fund source is available. MLTM calculation will be disabled until this is filled.",
+            )
+
+            if reserve_text.strip() == "":
+                initial_reserve_fund = None
+                st.warning(
+                    "Initial reserve fund is missing. Enter a source-reviewed reserve value before calculating MLTM."
+                )
+            else:
+                initial_reserve_fund = parse_numeric_input(reserve_text, default=0.0)
+                st.session_state["mltm_reserve_default"] = initial_reserve_fund
+
+            cashflow_df = st.data_editor(
+                approved_cashflow,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="mltm_cashflow_editor",
+            )
+
+            can_calculate_mltm = (
+                cashflow_df is not None
+                and not cashflow_df.empty
+                and initial_reserve_fund is not None
+                and all(c in cashflow_df.columns for c in ["year", "special_tax_levy", "annual_debt_service"])
+            )
+
+            if not can_calculate_mltm:
+                st.warning(
+                    "MLTM calculation requires an approved cashflow table with year, special_tax_levy, annual_debt_service, plus an initial reserve fund."
+                )
+
+            if st.button("Calculate MLTM", key="calculate_mltm", disabled=not can_calculate_mltm):
+                mltm_results = calculate_mltm_from_cashflow(cashflow_df, initial_reserve_fund=initial_reserve_fund)
+                safe_add_approved_input(
+                    "maximum_loss_to_maturity_percent",
+                    mltm_results["maximum_loss_to_maturity_percent"],
+                    status="Calculated",
+                    source_method="MLTM Stress Test",
+                    confidence=1.0,
+                    notes=f"Calculated from approved MLTM schedule source: {st.session_state.get('mltm_schedule_source', 'approved source')}",
+                )
+                sync_candidate_results_to_scorecard()
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Estimated MLTM %", mltm_results["maximum_loss_to_maturity_percent"])
+                c2.metric("Total Revenue", f"{mltm_results['total_revenue']:,.0f}")
+                c3.metric("Total Debt Service", f"{mltm_results['total_debt_service']:,.0f}")
+                st.dataframe(mltm_results["mltm_cashflow_table"], use_container_width=True)
+
 
 
 # =============================================================================
