@@ -419,6 +419,57 @@ def _extract_pages_from_page_list(obj: Any, file_name: str) -> List[Dict[str, An
     return pages
 
 
+def _extract_pages_from_pdf_bytes(raw_bytes: Any, file_name: str) -> List[Dict[str, Any]]:
+    """Last-resort parser used when parsed_docs has bytes but no page text.
+
+    This fixes the common Streamlit state problem where a document record exists
+    but pages/text were created by an older parser version or were never filled.
+    """
+    if not raw_bytes:
+        return []
+    if isinstance(raw_bytes, str):
+        try:
+            # Do not assume base64; most apps store bytes directly. If it is a
+            # text representation, this will simply fail and return [].
+            raw_bytes = raw_bytes.encode("latin-1", errors="ignore")
+        except Exception:
+            return []
+    if not isinstance(raw_bytes, (bytes, bytearray)):
+        return []
+
+    pages: List[Dict[str, Any]] = []
+    try:
+        import io
+        import pdfplumber  # type: ignore
+        with pdfplumber.open(io.BytesIO(bytes(raw_bytes))) as pdf:
+            for idx, page in enumerate(pdf.pages):
+                try:
+                    txt = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+                except Exception:
+                    txt = ""
+                if txt.strip():
+                    pages.append({"document": file_name, "page": idx + 1, "text": txt})
+        if pages:
+            return pages
+    except Exception:
+        pass
+
+    try:
+        import io
+        from PyPDF2 import PdfReader  # type: ignore
+        reader = PdfReader(io.BytesIO(bytes(raw_bytes)))
+        for idx, page in enumerate(reader.pages):
+            try:
+                txt = page.extract_text() or ""
+            except Exception:
+                txt = ""
+            if txt.strip():
+                pages.append({"document": file_name, "page": idx + 1, "text": txt})
+    except Exception:
+        return []
+    return pages
+
+
 def _pages_from_docs(parsed_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Robustly convert parsed document objects into page-level text.
@@ -426,6 +477,12 @@ def _pages_from_docs(parsed_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     Important: candidate-page detection is not allowed to be a gate for regex/AI.
     This function tries every common parser shape so the hybrid resolver can always
     build full OS text when any text exists.
+
+    2026-05-28 fix:
+    - If a doc already has page-level text, do NOT also re-split the full-text
+      copy. This avoids double-counting pages.
+    - If a doc has no page/text but does contain raw PDF bytes, parse those bytes
+      here as a last-resort recovery path.
     """
     pages: List[Dict[str, Any]] = []
     for doc_idx, doc in enumerate(parsed_docs or []):
@@ -437,23 +494,52 @@ def _pages_from_docs(parsed_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         file_name = doc.get("file_name") or doc.get("name") or doc.get("filename") or f"Uploaded document {doc_idx + 1}"
 
+        doc_pages: List[Dict[str, Any]] = []
+
         # 1) Page-list style parsers.
         for list_key in _PAGE_LIST_KEYS:
             extracted = _extract_pages_from_page_list(doc.get(list_key), file_name)
             if extracted:
-                pages.extend(extracted)
+                doc_pages.extend(extracted)
 
-        # 2) Full-text style parsers. Always include, but dedupe later.
-        for key in _TEXT_KEYS:
-            txt = doc.get(key)
-            if isinstance(txt, str) and txt.strip():
-                pages.extend(_split_marked_pages(txt, file_name))
+        # 2) Full-text style parsers. Only use this when page-list text is absent,
+        # otherwise we duplicate pages and inflate scan coverage metrics.
+        if not doc_pages:
+            for key in _TEXT_KEYS:
+                txt = doc.get(key)
+                if isinstance(txt, str) and txt.strip():
+                    doc_pages.extend(_split_marked_pages(txt, file_name))
 
-        # 3) Nested context/payload structures.
-        for nested_key in ("document", "payload", "result", "data"):
-            nested = doc.get(nested_key)
-            if isinstance(nested, dict):
-                pages.extend(_pages_from_docs([{**nested, "file_name": file_name}]))
+        # 3) Raw PDF-byte fallback. This is the important recovery path for stale
+        # session_state records where parsed_documents has one doc but pages/text
+        # are empty. It only works if raw bytes were stored in the parsed doc.
+        if not doc_pages:
+            for bytes_key in ("raw_bytes", "raw_file_bytes", "file_bytes", "bytes", "content_bytes"):
+                if bytes_key in doc and doc.get(bytes_key):
+                    doc_pages = _extract_pages_from_pdf_bytes(doc.get(bytes_key), file_name)
+                    if doc_pages:
+                        # Cache recovered pages back into the session-state doc so
+                        # subsequent regex/candidate/debug passes do not re-parse
+                        # the PDF bytes repeatedly.
+                        try:
+                            doc["pages"] = [{"page": p.get("page"), "text": p.get("text", "")} for p in doc_pages]
+                            doc["text"] = "\n\n".join(
+                                f"--- PAGE {p.get('page')} ---\n{p.get('text','')}" for p in doc_pages
+                            )
+                            doc["page_count"] = len(doc_pages)
+                            doc["full_document_scanned"] = True
+                        except Exception:
+                            pass
+                        break
+
+        # 4) Nested context/payload structures.
+        if not doc_pages:
+            for nested_key in ("document", "payload", "result", "data"):
+                nested = doc.get(nested_key)
+                if isinstance(nested, dict):
+                    doc_pages.extend(_pages_from_docs([{**nested, "file_name": file_name}]))
+
+        pages.extend(doc_pages)
 
     # Deduplicate exact document/page/text repeats while keeping order.
     seen = set()
@@ -462,11 +548,15 @@ def _pages_from_docs(parsed_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         txt = _safe_text(p.get("text", ""))
         if not txt.strip():
             continue
-        key = (_safe_text(p.get("document")), int(p.get("page") or 1), hash(txt[:800]))
+        try:
+            page_no = int(p.get("page") or 1)
+        except Exception:
+            page_no = 1
+        key = (_safe_text(p.get("document")), page_no, hash(txt[:800]))
         if key in seen:
             continue
         seen.add(key)
-        deduped.append({"document": _safe_text(p.get("document")) or "Uploaded document", "page": int(p.get("page") or 1), "text": txt})
+        deduped.append({"document": _safe_text(p.get("document")) or "Uploaded document", "page": page_no, "text": txt})
     return deduped
 
 
