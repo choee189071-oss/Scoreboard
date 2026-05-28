@@ -1,0 +1,747 @@
+"""
+Hybrid AI extraction layer for the Municipal Credit Deal Workspace.
+
+Purpose
+-------
+For every credit-analysis section, use the same safe data-acquisition pattern:
+1) full-document regex scan first (cheap, deterministic, auditable),
+2) if regex is missing/weak, use OpenAI Responses API for structured JSON extraction,
+3) return reviewable candidates only,
+4) let Streamlit/analyst approval decide what enters calculators/scorecards.
+
+This module is intentionally UI-free. streamlit_app.py renders the workflow and approval buttons.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import requests
+
+
+# -----------------------------------------------------------------------------
+# Section / field configuration
+# -----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class HybridField:
+    key: str
+    label: str
+    scorecard_key: Optional[str]
+    value_type: str  # money | percent | number | text | table
+    preferred_source: str
+    regex_patterns: Tuple[str, ...]
+    keywords: Tuple[str, ...]
+    guidance: str
+
+
+HYBRID_SECTIONS: Dict[str, Dict[str, Any]] = {
+    "market_economic": {
+        "title": "Market & Economic Context",
+        "subtitle": "Public-data first; AI fallback only for missing context/classification notes.",
+        "fields": [
+            HybridField(
+                key="median_household_ebi_percent_of_us",
+                label="Median Household EBI (% of U.S.)",
+                scorecard_key="median_household_ebi_percent_of_us",
+                value_type="percent",
+                preferred_source="Census / ACS public data connector",
+                regex_patterns=(),
+                keywords=("median household income", "effective buying income", "ebi"),
+                guidance="Use Census/ACS connector when possible. AI should not invent income values; it may only extract from cited text.",
+            ),
+            HybridField(
+                key="population_growth_difference_vs_us",
+                label="Population Growth Difference vs U.S. (%)",
+                scorecard_key="population_growth_difference_vs_us",
+                value_type="percent",
+                preferred_source="Census / ACS public data connector",
+                regex_patterns=(),
+                keywords=("population", "population growth", "acs"),
+                guidance="Prefer calculated Census local growth minus U.S. growth. AI fallback must be labelled as sourced/extracted or left blank.",
+            ),
+            HybridField(
+                key="msa_participation",
+                label="MSA Participation",
+                scorecard_key="msa_participation",
+                value_type="text",
+                preferred_source="Rule-based geography classifier + analyst review",
+                regex_patterns=(),
+                keywords=("metropolitan", "msa", "regional economy"),
+                guidance="Classification only. Must remain reviewable when inferred.",
+            ),
+        ],
+    },
+    "assessed_tax_base": {
+        "title": "Assessed Value / Tax Base",
+        "subtitle": "Regex scans full OS first; AI fallback extracts JSON from candidate page windows.",
+        "fields": [
+            HybridField(
+                key="all_taxable_assessed_value",
+                label="All Taxable Property Assessed Value",
+                scorecard_key="total_assessed_value",
+                value_type="money",
+                preferred_source="Official Statement / Assessor assessed value table",
+                regex_patterns=(
+                    r"assessed\s+value\s+of\s+all\s+(?:the\s+)?taxable\s+property[^\$]{0,260}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"all\s+(?:the\s+)?taxable\s+property[^\$]{0,260}assessed\s+value[^\$]{0,260}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"total\s+(?:taxable\s+)?assessed\s+value[^\$]{0,260}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"taxable\s+assessed\s+value[^\$]{0,260}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"assessed\s+valuation[^\$]{0,260}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                ),
+                keywords=("assessed value", "taxable property", "value-to-lien", "assessed valuation"),
+                guidance="Prefer all taxable property within the CFD over developed-property-only value.",
+            ),
+            HybridField(
+                key="developed_property_assessed_value",
+                label="Developed Property Assessed Value",
+                scorecard_key=None,
+                value_type="money",
+                preferred_source="Official Statement / Assessor developed-property AV disclosure",
+                regex_patterns=(
+                    r"developed\s+property[^\$]{0,320}assessed\s+value[^\$]{0,220}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"preliminary\s+assessed\s+value[^\$]{0,320}developed\s+property[^\$]{0,220}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"preliminary\s+assessed\s+value[^\$]{0,320}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                ),
+                keywords=("developed property", "preliminary assessed value", "fiscal year"),
+                guidance="Use as supplemental context; total taxable AV usually drives total district tax base.",
+            ),
+        ],
+    },
+    "housing_proxy": {
+        "title": "Housing Proxy",
+        "subtitle": "Public housing-series pull first; AI source scout only fills missing inventory/distress signals.",
+        "fields": [
+            HybridField(
+                key="home_price_yoy",
+                label="Home Price YoY %",
+                scorecard_key=None,
+                value_type="percent",
+                preferred_source="FHFA HPI / verified housing data source",
+                regex_patterns=(),
+                keywords=("home price", "hpi", "fhfa", "housing"),
+                guidance="Prefer FHFA HPI or another direct public series. Do not treat AI narrative as observed price data.",
+            ),
+            HybridField(
+                key="inventory_yoy",
+                label="Inventory YoY %",
+                scorecard_key=None,
+                value_type="percent",
+                preferred_source="Verified inventory source / Realtor dataset / source scout link",
+                regex_patterns=(),
+                keywords=("inventory", "active listings", "new listing count", "housing supply"),
+                guidance="Show link and source date. If inferred, label as inferred housing stress, not observed foreclosure/delinquency.",
+            ),
+            HybridField(
+                key="real_estate_market_volatility",
+                label="Real Estate Market Volatility",
+                scorecard_key="real_estate_market_volatility",
+                value_type="text",
+                preferred_source="Derived housing classifier after analyst review",
+                regex_patterns=(),
+                keywords=("housing", "volatility", "distress", "foreclosure", "delinquency"),
+                guidance="Classification field; keep warnings when based on inferred housing stress.",
+            ),
+        ],
+    },
+    "taxbase_concentration": {
+        "title": "Tax Base & Concentration",
+        "subtitle": "TOC/page finder + regex table clues first; API fallback reconstructs taxpayer fields as JSON.",
+        "fields": [
+            HybridField(
+                key="top10_taxpayers_percent_of_total_levy",
+                label="Top 10 Taxpayers as % of Total Levy",
+                scorecard_key="top10_taxpayers_percent_of_total_levy",
+                value_type="percent",
+                preferred_source="Largest Taxpayers / Special Tax Levy table in OS",
+                regex_patterns=(),
+                keywords=("largest taxpayers", "top taxpayers", "top ten taxpayers", "special tax levy", "taxpayer concentration"),
+                guidance="If a table is present, calculate sum of top taxpayer levy percentages. Do not confuse assessed-value share with levy share unless policy allows it.",
+            ),
+            HybridField(
+                key="largest_taxpayer_percent_of_total_levy",
+                label="Largest Taxpayer as % of Total Levy",
+                scorecard_key="largest_taxpayer_percent_of_total_levy",
+                value_type="percent",
+                preferred_source="Largest Taxpayers / Special Tax Levy table in OS",
+                regex_patterns=(
+                    r"responsible\s+for\s+approximately\s+([0-9]{1,3}(?:\.\d+)?)\s*%\s+of\s+(?:the\s+)?(?:projected\s+)?Fiscal\s+Year\s+\d{4}-\d{2}\s+Special\s+Tax",
+                    r"responsible\s+for\s+approximately\s+([0-9]{1,3}(?:\.\d+)?)\s*%\s+of\s+(?:the\s+)?(?:projected\s+)?[^.]{0,160}Special\s+Tax",
+                ),
+                keywords=("largest taxpayers", "largest taxpayer", "special tax levy", "property owner"),
+                guidance="Usually the first row of the taxpayer table. Cross-check against top-10 total; largest should not exceed top-10.",
+            ),
+            HybridField(
+                key="district_size_parcels",
+                label="District Size (Parcels)",
+                scorecard_key="district_size_parcels",
+                value_type="number",
+                preferred_source="OS development status / taxable parcels disclosure",
+                regex_patterns=(
+                    r"contains\s+([0-9][0-9,]*)\s+taxable\s+parcels",
+                    r"([0-9][0-9,]*)\s+taxable\s+parcels",
+                    r"there\s+are\s+([0-9][0-9,]*)\s+parcels\s+of\s+developed\s+property",
+                ),
+                keywords=("taxable parcels", "developed property", "approved property", "undeveloped property"),
+                guidance="Prefer total taxable parcels unless scorecard specifically requests developed parcels only.",
+            ),
+            HybridField(
+                key="conveyance_to_homeowners",
+                label="Conveyance to Homeowners",
+                scorecard_key="conveyance_to_homeowners",
+                value_type="text",
+                preferred_source="OS development status / homeowner conveyance disclosure",
+                regex_patterns=(),
+                keywords=("conveyed to individual homeowners", "completed", "homeowners", "development status"),
+                guidance="Classification should be reviewable. Use exact unit counts when available.",
+            ),
+        ],
+    },
+    "leverage_vtl": {
+        "title": "Leverage & Value-to-Lien",
+        "subtitle": "Extract AV/debt/VTL from OS; API fallback returns numeric JSON and evidence snippets.",
+        "fields": [
+            HybridField(
+                key="assessed_value",
+                label="Assessed Value",
+                scorecard_key="total_assessed_value",
+                value_type="money",
+                preferred_source="OS / Assessor total taxable AV disclosure",
+                regex_patterns=(
+                    r"assessed\s+value\s+of\s+all\s+(?:the\s+)?taxable\s+property[^\$]{0,260}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"total\s+(?:taxable\s+)?assessed\s+value[^\$]{0,260}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                ),
+                keywords=("assessed value", "taxable property", "value-to-lien"),
+                guidance="Prefer all taxable AV.",
+            ),
+            HybridField(
+                key="direct_debt",
+                label="Direct Debt",
+                scorecard_key=None,
+                value_type="money",
+                preferred_source="Estimated Direct and Overlapping Indebtedness table",
+                regex_patterns=(
+                    r"Principal\s+Amount\s+of\s+Bonds\s*\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"\$\s*([0-9][0-9,]*(?:\.\d+)?)\s+COMMUNITY\s+FACILITIES\s+DISTRICT",
+                ),
+                keywords=("direct debt", "overlapping debt", "indebtedness", "series 2015 bonds"),
+                guidance="Usually includes this bond issue and parity/direct obligations. Verify table labels.",
+            ),
+            HybridField(
+                key="overlapping_debt",
+                label="Overlapping Debt",
+                scorecard_key=None,
+                value_type="money",
+                preferred_source="Estimated Direct and Overlapping Indebtedness table",
+                regex_patterns=(),
+                keywords=("overlapping debt", "overlapping indebtedness", "general obligation debt"),
+                guidance="Verify whether overlapping GO debt is included or excluded from the selected VTL definition.",
+            ),
+            HybridField(
+                key="est_value_to_lien",
+                label="Est. Value-to-Lien",
+                scorecard_key="est_value_to_lien",
+                value_type="number",
+                preferred_source="OS Estimated Assessed Value-to-Lien Ratios section",
+                regex_patterns=(
+                    r"(?:resulting\s+in\s+an\s+)?estimated\s+assessed\s+value[-\s]*to[-\s]*lien\s+ratio[^.]{0,360}?approximately\s+([0-9]+(?:\.\d+)?)\s*-?to-?1",
+                    r"value[-\s]*to[-\s]*lien\s+ratio[^.]{0,360}?approximately\s+([0-9]+(?:\.\d+)?)\s*-?to-?1",
+                ),
+                keywords=("value-to-lien", "value to lien", "assessed value-to-lien ratios"),
+                guidance="Use OS-disclosed VTL when source definition matches scorecard definition; otherwise calculate from AV/debt.",
+            ),
+        ],
+    },
+    "cashflow_mltm": {
+        "title": "Cashflow & MLTM Stress",
+        "subtitle": "Extract debt-service schedule/reserve fund first; API fallback returns schedule JSON for review.",
+        "fields": [
+            HybridField(
+                key="initial_reserve_fund",
+                label="Initial Reserve Fund",
+                scorecard_key=None,
+                value_type="money",
+                preferred_source="Sources and Uses / Reserve Fund disclosure",
+                regex_patterns=(
+                    r"Reserve\s+Fund(?:\(1\))?\s*\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"reserve\s+requirement[^\$]{0,240}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"deposit\s+to\s+the\s+Reserve\s+Fund[^\$]{0,240}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                ),
+                keywords=("reserve fund", "reserve requirement", "sources and uses"),
+                guidance="Use exact reserve amount and date. Do not confuse with costs of issuance or improvement fund.",
+            ),
+            HybridField(
+                key="maximum_loss_to_maturity_percent",
+                label="Maximum Loss-to-Maturity (MLTM) %",
+                scorecard_key="maximum_loss_to_maturity_percent",
+                value_type="percent",
+                preferred_source="Calculated from approved cashflow schedule",
+                regex_patterns=(
+                    r"maximum\s+loss[-\s]*to[-\s]*maturity[^%]{0,220}([0-9]+(?:\.\d+)?)\s*%",
+                    r"MLTM[^%]{0,220}([0-9]+(?:\.\d+)?)\s*%",
+                ),
+                keywords=("debt service schedule", "annual debt service", "special tax", "reserve fund", "mltm"),
+                guidance="Best practice: calculate from approved schedule and reserve, not from an isolated AI estimate.",
+            ),
+            HybridField(
+                key="mltm_cashflow_table",
+                label="MLTM Cashflow Table",
+                scorecard_key=None,
+                value_type="table",
+                preferred_source="Debt Service Schedule + special tax levy / revenue table",
+                regex_patterns=(),
+                keywords=("debt service schedule", "period ending", "principal", "interest", "total", "special tax levy"),
+                guidance="Requires year, special tax levy/revenue, and annual debt service columns. Analyst must review before calculation.",
+            ),
+        ],
+    },
+}
+
+
+# -----------------------------------------------------------------------------
+# Basic utilities
+# -----------------------------------------------------------------------------
+
+def _safe_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _normalize_space(text: str) -> str:
+    return re.sub(r"\s+", " ", _safe_text(text)).strip()
+
+
+def _clean_money(value: Any) -> Optional[float]:
+    text = _safe_text(value)
+    m = re.search(r"[-+]?\$?\s*([0-9][0-9,]*(?:\.\d+)?)", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except Exception:
+        return None
+
+
+def _clean_number(value: Any) -> Optional[float]:
+    text = _safe_text(value).replace(",", "")
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
+
+
+def _coerce_value(raw: Any, value_type: str) -> Any:
+    if raw is None:
+        return None
+    if value_type == "money":
+        return _clean_money(raw)
+    if value_type in {"percent", "number"}:
+        return _clean_number(raw)
+    if value_type == "text":
+        text = _normalize_space(str(raw))
+        return text or None
+    return raw
+
+
+def _pages_from_docs(parsed_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    pages: List[Dict[str, Any]] = []
+    for doc in parsed_docs or []:
+        file_name = doc.get("file_name", "Uploaded document")
+        doc_pages = doc.get("pages") or []
+        if doc_pages:
+            for i, page in enumerate(doc_pages):
+                if isinstance(page, dict):
+                    pages.append({
+                        "document": file_name,
+                        "page": int(page.get("page") or i + 1),
+                        "text": _safe_text(page.get("text", "")),
+                    })
+                else:
+                    pages.append({"document": file_name, "page": i + 1, "text": _safe_text(page)})
+        else:
+            text = _safe_text(doc.get("text", ""))
+            # Split existing page markers if present; otherwise one document-sized chunk.
+            matches = list(re.finditer(r"---\s*PAGE\s+(\d+)\s*---", text, flags=re.I))
+            if matches:
+                for idx, match in enumerate(matches):
+                    start = match.end()
+                    end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+                    pages.append({"document": file_name, "page": int(match.group(1)), "text": text[start:end]})
+            else:
+                pages.append({"document": file_name, "page": 1, "text": text})
+    return pages
+
+
+def _full_text_from_pages(pages: List[Dict[str, Any]]) -> str:
+    return "\n\n".join(f"--- {p['document']} PAGE {p['page']} ---\n{p.get('text','')}" for p in pages)
+
+
+def _evidence_window(pages: List[Dict[str, Any]], document: str, page_no: int, radius: int = 1, max_chars: int = 9000) -> str:
+    selected = [p for p in pages if p.get("document") == document and abs(int(p.get("page", 0)) - int(page_no)) <= radius]
+    text = _full_text_from_pages(selected)
+    return text[:max_chars]
+
+
+def find_candidate_pages_for_fields(parsed_docs: List[Dict[str, Any]], fields: Iterable[HybridField], max_pages: int = 12) -> List[Dict[str, Any]]:
+    pages = _pages_from_docs(parsed_docs)
+    hits: List[Dict[str, Any]] = []
+    all_keywords: List[str] = []
+    for field in fields:
+        all_keywords.extend([k.lower() for k in field.keywords])
+    all_keywords = list(dict.fromkeys([k for k in all_keywords if k]))
+
+    for p in pages:
+        lower = _safe_text(p.get("text", "")).lower()
+        matched = [k for k in all_keywords if k in lower]
+        if matched:
+            score = sum(3 if any(core in k for core in ["largest", "assessed", "debt service", "value-to-lien", "taxable property"]) else 1 for k in matched)
+            hits.append({**p, "matched_terms": matched, "page_score": score})
+
+    # TOC helper: if a contents page lists a section and page number, add that page window.
+    toc_targets = ["largest taxpayers", "estimated assessed value-to-lien ratios", "estimated direct and overlapping", "debt service schedule", "reserve fund"]
+    for p in pages[:15]:
+        text = _safe_text(p.get("text", ""))
+        for target in toc_targets:
+            m = re.search(re.escape(target) + r"[^0-9]{0,80}(\d{1,3})", text, flags=re.I)
+            if m:
+                try:
+                    reported_page = int(m.group(1))
+                except Exception:
+                    continue
+                # Official Statement body page numbers often start after front matter; search nearby actual pages.
+                for offset in range(0, 10):
+                    actual = reported_page + offset
+                    for match_page in [q for q in pages if int(q.get("page", 0)) == actual]:
+                        hits.append({**match_page, "matched_terms": [f"TOC: {target} → {reported_page}"], "page_score": 10})
+
+    # Deduplicate document/page, keep high score.
+    dedup: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for h in hits:
+        key = (_safe_text(h.get("document")), int(h.get("page", 0)))
+        if key not in dedup or h.get("page_score", 0) > dedup[key].get("page_score", 0):
+            dedup[key] = h
+    return sorted(dedup.values(), key=lambda x: x.get("page_score", 0), reverse=True)[:max_pages]
+
+
+# -----------------------------------------------------------------------------
+# Regex extraction
+# -----------------------------------------------------------------------------
+
+def regex_extract_fields(parsed_docs: List[Dict[str, Any]], section_id: str) -> List[Dict[str, Any]]:
+    section = HYBRID_SECTIONS.get(section_id)
+    if not section:
+        return []
+    fields: List[HybridField] = section["fields"]
+    pages = _pages_from_docs(parsed_docs)
+    results: List[Dict[str, Any]] = []
+
+    # Search page-by-page so we can cite/source by page.
+    for field in fields:
+        for page in pages:
+            text = _safe_text(page.get("text", ""))
+            if not text.strip():
+                continue
+            search_text = _normalize_space(text)
+            for pattern in field.regex_patterns:
+                for match in re.finditer(pattern, search_text, flags=re.I):
+                    raw = match.group(1) if match.groups() else match.group(0)
+                    value = _coerce_value(raw, field.value_type)
+                    if value is None or value == "":
+                        continue
+                    start = max(match.start() - 360, 0)
+                    end = min(match.end() + 520, len(search_text))
+                    excerpt = search_text[start:end]
+                    confidence = 0.92
+                    # Extra confidence for preferred total assessed value phrase.
+                    if field.key == "all_taxable_assessed_value" and "all" in match.group(0).lower() and "taxable" in match.group(0).lower():
+                        confidence = 0.97
+                    results.append({
+                        "field_key": field.key,
+                        "label": field.label,
+                        "scorecard_key": field.scorecard_key,
+                        "value": value,
+                        "value_type": field.value_type,
+                        "confidence": confidence,
+                        "method": "Regex Full-OS Scan",
+                        "tier": "Tier 1",
+                        "source_document": page.get("document"),
+                        "page": page.get("page"),
+                        "evidence": excerpt,
+                        "preferred_source": field.preferred_source,
+                        "guidance": field.guidance,
+                    })
+
+    # Special derived extraction for conveyance classification.
+    if section_id == "taxbase_concentration":
+        for page in pages:
+            text = _normalize_space(_safe_text(page.get("text", "")))
+            if "conveyed to individual homeowners" in text.lower():
+                # Use narrative classification but keep evidence.
+                results.append({
+                    "field_key": "conveyance_to_homeowners",
+                    "label": "Conveyance to Homeowners",
+                    "scorecard_key": "conveyance_to_homeowners",
+                    "value": "Most Conveyed",
+                    "value_type": "text",
+                    "confidence": 0.95,
+                    "method": "Regex Full-OS Scan / Narrative Classifier",
+                    "tier": "Tier 1",
+                    "source_document": page.get("document"),
+                    "page": page.get("page"),
+                    "evidence": text[:1200],
+                    "preferred_source": "OS development status / homeowner conveyance disclosure",
+                    "guidance": "Verify unit counts and whether classification should be Most Conveyed vs Fairly Developed.",
+                })
+                break
+
+    # Deduplicate: prefer higher confidence and, for assessed value, all-taxable fields.
+    best: Dict[str, Dict[str, Any]] = {}
+    for r in results:
+        key = r["field_key"]
+        if key not in best or r.get("confidence", 0) > best[key].get("confidence", 0):
+            best[key] = r
+    return list(best.values())
+
+
+# -----------------------------------------------------------------------------
+# OpenAI Responses API fallback
+# -----------------------------------------------------------------------------
+
+def _json_schema_for_fields(fields: Iterable[HybridField]) -> Dict[str, Any]:
+    properties: Dict[str, Any] = {}
+    required: List[str] = []
+    for field in fields:
+        if field.value_type in {"money", "percent", "number"}:
+            val_schema = {"type": ["number", "null"]}
+        elif field.value_type == "table":
+            val_schema = {
+                "type": ["array", "null"],
+                "items": {"type": "object", "additionalProperties": {"type": ["string", "number", "null"]}},
+            }
+        else:
+            val_schema = {"type": ["string", "null"]}
+        properties[field.key] = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "value": val_schema,
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "page": {"type": ["integer", "null"]},
+                "evidence": {"type": "string"},
+                "source_label": {"type": "string"},
+                "notes": {"type": "string"},
+            },
+            "required": ["value", "confidence", "page", "evidence", "source_label", "notes"],
+        }
+        required.append(field.key)
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": required,
+    }
+
+
+def _extract_output_text(response_json: Dict[str, Any]) -> str:
+    if not isinstance(response_json, dict):
+        return ""
+    if response_json.get("output_text"):
+        return _safe_text(response_json.get("output_text"))
+    pieces: List[str] = []
+    for item in response_json.get("output", []) or []:
+        for content in item.get("content", []) or []:
+            if content.get("type") in {"output_text", "text"} and content.get("text"):
+                pieces.append(content.get("text"))
+    return "\n".join(pieces)
+
+
+def ai_extract_fields_from_text(
+    *,
+    section_id: str,
+    fields: List[HybridField],
+    candidate_text: str,
+    api_key: str,
+    model: str = "gpt-4.1-mini",
+    issuer_name: str = "",
+    state: str = "",
+    county_name: str = "",
+) -> Dict[str, Any]:
+    if not api_key:
+        return {"ok": False, "error": "OpenAI API key is required for AI fallback."}
+
+    field_instructions = "\n".join(
+        f"- {f.key}: {f.label}; type={f.value_type}; preferred source={f.preferred_source}; rule={f.guidance}"
+        for f in fields
+    )
+    prompt = f"""
+You are a municipal credit analyst extracting deal inputs from an Official Statement text window.
+
+Issuer / district: {issuer_name}
+State: {state}
+County: {county_name}
+Section: {HYBRID_SECTIONS.get(section_id, {}).get('title', section_id)}
+
+Extract ONLY values that are explicitly supported by the provided text. Do not invent values.
+If a field is not found, return value=null, confidence=0, page=null, and notes explaining what is missing.
+Prefer deal-specific values over general county values.
+For assessed value, prefer "assessed value of all taxable property within the CFD" over developed-property-only value.
+For taxpayer concentration, do not confuse assessed-value share with levy share unless the source clearly says levy/special tax share.
+For MLTM, prefer a calculated schedule or explicit MLTM; do not make up a stress value.
+
+Fields:
+{field_instructions}
+
+Text window:
+{candidate_text[:30000]}
+""".strip()
+
+    schema = _json_schema_for_fields(fields)
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": "Return strictly valid JSON matching the supplied schema. Be conservative and source-grounded."},
+            {"role": "user", "content": prompt},
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "municipal_credit_extraction",
+                "strict": True,
+                "schema": schema,
+            }
+        },
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    try:
+        response = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=60)
+        if response.status_code >= 400:
+            # Fallback to plain prompt JSON in case account/model does not support strict schema.
+            fallback_payload = {
+                "model": model,
+                "input": prompt + "\n\nReturn JSON only.",
+            }
+            response = requests.post("https://api.openai.com/v1/responses", headers=headers, json=fallback_payload, timeout=60)
+        if response.status_code >= 400:
+            return {"ok": False, "error": f"OpenAI Responses API failed: {response.status_code} {response.text[:500]}"}
+        data = response.json()
+        text = _extract_output_text(data)
+        if not text.strip():
+            return {"ok": False, "error": "OpenAI returned no output text.", "raw": data}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            # Try to isolate JSON object.
+            m = re.search(r"\{[\s\S]*\}", text)
+            if not m:
+                return {"ok": False, "error": "OpenAI output was not JSON.", "output_text": text[:1000]}
+            parsed = json.loads(m.group(0))
+        return {"ok": True, "data": parsed, "raw_response_id": data.get("id")}
+    except Exception as exc:
+        return {"ok": False, "error": f"OpenAI extraction exception: {exc}"}
+
+
+def run_hybrid_section_extraction(
+    *,
+    section_id: str,
+    parsed_docs: List[Dict[str, Any]],
+    api_key: Optional[str] = None,
+    model: str = "gpt-4.1-mini",
+    issuer_name: str = "",
+    state: str = "",
+    county_name: str = "",
+    force_ai: bool = False,
+) -> Dict[str, Any]:
+    section = HYBRID_SECTIONS.get(section_id)
+    if not section:
+        return {"ok": False, "error": f"Unknown hybrid section: {section_id}"}
+
+    fields: List[HybridField] = section["fields"]
+    regex_candidates = regex_extract_fields(parsed_docs, section_id)
+    found_keys = {c["field_key"] for c in regex_candidates if c.get("value") not in [None, ""]}
+    missing_fields = [f for f in fields if f.key not in found_keys]
+
+    ai_candidates: List[Dict[str, Any]] = []
+    ai_error = None
+    candidate_pages = find_candidate_pages_for_fields(parsed_docs, fields, max_pages=10)
+    if force_ai or (missing_fields and api_key):
+        pages = _pages_from_docs(parsed_docs)
+        if candidate_pages:
+            # Build evidence window around best pages, rather than sending entire OS.
+            chunks: List[str] = []
+            for hit in candidate_pages[:5]:
+                chunks.append(_evidence_window(pages, hit.get("document"), int(hit.get("page", 1)), radius=1, max_chars=6500))
+            candidate_text = "\n\n".join(chunks)
+        else:
+            candidate_text = _full_text_from_pages(pages)[:30000]
+
+        ai_result = ai_extract_fields_from_text(
+            section_id=section_id,
+            fields=missing_fields if not force_ai else fields,
+            candidate_text=candidate_text,
+            api_key=api_key or "",
+            model=model,
+            issuer_name=issuer_name,
+            state=state,
+            county_name=county_name,
+        )
+        if ai_result.get("ok"):
+            for f in (missing_fields if not force_ai else fields):
+                item = (ai_result.get("data") or {}).get(f.key) or {}
+                value = _coerce_value(item.get("value"), f.value_type)
+                if value is None or value == "":
+                    continue
+                ai_candidates.append({
+                    "field_key": f.key,
+                    "label": f.label,
+                    "scorecard_key": f.scorecard_key,
+                    "value": value,
+                    "value_type": f.value_type,
+                    "confidence": float(item.get("confidence") or 0.55),
+                    "method": "OpenAI Responses API Structured Extraction",
+                    "tier": "Tier 2",
+                    "source_document": item.get("source_label") or "Uploaded OS / source window",
+                    "page": item.get("page"),
+                    "evidence": item.get("evidence") or "",
+                    "preferred_source": f.preferred_source,
+                    "guidance": f.guidance,
+                    "notes": item.get("notes") or "",
+                    "response_id": ai_result.get("raw_response_id"),
+                })
+        else:
+            ai_error = ai_result.get("error")
+
+    # Merge regex first, then AI for missing only.
+    candidates_by_key: Dict[str, Dict[str, Any]] = {c["field_key"]: c for c in regex_candidates}
+    for c in ai_candidates:
+        if force_ai or c["field_key"] not in candidates_by_key:
+            candidates_by_key[c["field_key"]] = c
+
+    final_candidates = list(candidates_by_key.values())
+    final_found = {c["field_key"] for c in final_candidates if c.get("value") not in [None, ""]}
+    still_missing = [
+        {"field_key": f.key, "label": f.label, "preferred_source": f.preferred_source, "guidance": f.guidance}
+        for f in fields if f.key not in final_found
+    ]
+
+    return {
+        "ok": True,
+        "section_id": section_id,
+        "title": section["title"],
+        "subtitle": section.get("subtitle", ""),
+        "regex_candidates": regex_candidates,
+        "ai_candidates": ai_candidates,
+        "candidates": final_candidates,
+        "missing": still_missing,
+        "candidate_pages": [
+            {"document": h.get("document"), "page": h.get("page"), "matched_terms": h.get("matched_terms", []), "page_score": h.get("page_score", 0)}
+            for h in candidate_pages
+        ],
+        "ai_error": ai_error,
+    }
