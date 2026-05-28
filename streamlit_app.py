@@ -886,48 +886,57 @@ def safe_add_approved_input(
     )
 
 
+def _format_scorecard_widget_text(value, default=None, integer=False):
+    """Return the text that should appear in a scorecard input widget."""
+    if is_missing_master_value(value):
+        return ""
+    if integer:
+        try:
+            return str(int(parse_numeric_input(value, default or 0)))
+        except Exception:
+            return str(value)
+    return str(value)
+
+
 def nullable_number_input(label, scorecard_key, default=None, step=0.1, min_value=None, max_value=None, integer=False):
     """
-    Scorecard input that respects missing data.
+    Scorecard input that respects missing data and supports stable manual overrides.
 
-    Important Streamlit behavior:
-    Once a widget key exists, Streamlit will keep the old widget value even if
-    approved_inputs later changes. To make approved / calculated values appear
-    in the Scorecard, we sync the widget key from the approved master value
-    before rendering the widget. Manual Input still wins and is never overwritten.
+    Important fix:
+    Streamlit reruns on every edit. If we always pass value=current_text into
+    st.text_input and resync from approved_inputs before rendering, the field can
+    jump back to the prior extracted/approved value while the analyst is typing.
+
+    This version initializes the widget state once, lets the analyst type freely,
+    and only syncs from approved_inputs when the field is not manually owned and
+    the analyst has not started editing that widget.
     """
     current_value = get_master_value(scorecard_key, fallback=None)
     widget_key = f"scorecard_input_{scorecard_key}"
+    dirty_key = f"{widget_key}_dirty"
     status = get_master_status(scorecard_key)
+    current_text = _format_scorecard_widget_text(current_value, default=default, integer=integer)
 
-    if is_missing_master_value(current_value):
-        current_text = ""
-    else:
-        if integer:
-            try:
-                current_text = str(int(parse_numeric_input(current_value, default or 0)))
-            except Exception:
-                current_text = str(current_value)
-        else:
-            current_text = str(current_value)
-
-    # Keep Scorecard widgets in sync with approved/calculated data.
-    # Do not overwrite values that the analyst manually owns.
-    if status != "Manual Input":
+    # Initialize the widget once. Do not keep forcing value=... on every rerun.
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = current_text
+        st.session_state[dirty_key] = False
+    elif status != "Manual Input" and not st.session_state.get(dirty_key, False):
+        # Keep untouched widgets synced with newly approved/API values.
         if st.session_state.get(widget_key, "") != current_text:
             st.session_state[widget_key] = current_text
 
     raw_value = st.text_input(
         label,
-        value=current_text,
         placeholder="Missing data",
         key=widget_key,
     )
 
-    if raw_value.strip() == "":
+    raw_clean = str(raw_value or "").strip()
+    if raw_clean == "":
         return None
 
-    parsed = parse_numeric_input(raw_value, default if default is not None else 0.0)
+    parsed = parse_numeric_input(raw_clean, default if default is not None else 0.0)
 
     if min_value is not None and parsed < min_value:
         st.warning(f"{label} is below minimum value {min_value}.")
@@ -936,8 +945,9 @@ def nullable_number_input(label, scorecard_key, default=None, step=0.1, min_valu
 
     value_to_store = int(parsed) if integer else parsed
 
-    # If user edited the input away from the approved/master value, treat it as manual override.
-    if str(raw_value).strip() != str(current_text).strip():
+    # If the analyst edits away from the master value, immediately lock it as Manual Input.
+    if raw_clean != str(current_text).strip():
+        st.session_state[dirty_key] = True
         set_manual_override(scorecard_key, value_to_store)
 
     return value_to_store
@@ -946,11 +956,13 @@ def nullable_number_input(label, scorecard_key, default=None, step=0.1, min_valu
 def nullable_selectbox(label, scorecard_key, options):
     """
     Selectbox that shows blank when missing and writes user selections as Manual Input.
-    Also syncs the visible widget from approved/calculated master data.
+    Stable override version: once the analyst changes it, later AI/API sync will not
+    snap it back during reruns.
     """
     current_value = get_master_value(scorecard_key, fallback=None)
     full_options = [""] + options
     widget_key = f"scorecard_select_{scorecard_key}"
+    dirty_key = f"{widget_key}_dirty"
     status = get_master_status(scorecard_key)
 
     if is_missing_master_value(current_value):
@@ -960,16 +972,16 @@ def nullable_selectbox(label, scorecard_key, options):
     else:
         master_selected = ""
 
-    if status != "Manual Input":
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = master_selected
+        st.session_state[dirty_key] = False
+    elif status != "Manual Input" and not st.session_state.get(dirty_key, False):
         if st.session_state.get(widget_key, "") != master_selected:
             st.session_state[widget_key] = master_selected
-
-    index = full_options.index(st.session_state.get(widget_key, master_selected)) if st.session_state.get(widget_key, master_selected) in full_options else 0
 
     selected = st.selectbox(
         label,
         full_options,
-        index=index,
         format_func=lambda x: "Missing data" if x == "" else x,
         key=widget_key,
     )
@@ -978,10 +990,10 @@ def nullable_selectbox(label, scorecard_key, options):
         return None
 
     if selected != current_value:
+        st.session_state[dirty_key] = True
         set_manual_override(scorecard_key, selected)
 
     return selected
-
 
 def fill_missing_scorecard_defaults_for_calculation(inputs):
     """
