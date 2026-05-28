@@ -1096,7 +1096,7 @@ def approve_total_assessed_value(value, source_method, source_document="", confi
         unique_key="assessed_value_resolved",
     )
 
-def render_assessed_value_upload_parser():
+def render_assessed_value_upload_parser(key_prefix="main"):
     st.subheader("Assessed Value Resolver")
     st.caption(
         "Safe mode: try OS/Appendix extraction first, then assessor/parcel upload parsing, then manual override. "
@@ -1111,7 +1111,7 @@ def render_assessed_value_upload_parser():
             st.info("Upload an OS / Appendix PDF in Deal Workspace first, then this tab can search for assessed value evidence.")
         else:
             st.write(f"Parsed documents available: {len(parsed_docs)}")
-            if st.button("Scan Uploaded Documents for Assessed Value", key="scan_docs_for_assessed_value"):
+            if st.button("Scan Uploaded Documents for Assessed Value", key=f"{key_prefix}_scan_docs_for_assessed_value"):
                 st.session_state["assessed_value_doc_candidates"] = extract_assessed_value_candidates_from_documents(parsed_docs)
 
             candidates = st.session_state.get("assessed_value_doc_candidates", []) or []
@@ -1125,7 +1125,7 @@ def render_assessed_value_upload_parser():
                         st.write(f"**Confidence:** {c['confidence']:.0%}")
                         with st.expander("Evidence excerpt"):
                             st.write(c["excerpt"])
-                        if st.button("Approve This Document Candidate", key=f"approve_doc_assessed_value_{i}"):
+                        if st.button("Approve This Document Candidate", key=f"{key_prefix}_approve_doc_assessed_value_{i}"):
                             approve_total_assessed_value(
                                 c["value"],
                                 source_method="OS / Appendix AI-Assisted Extraction",
@@ -1139,7 +1139,7 @@ def render_assessed_value_upload_parser():
         av_file = st.file_uploader(
             "Upload assessor, parcel, or assessed-value file",
             type=["csv", "xlsx", "xls"],
-            key="assessed_value_file",
+            key=f"{key_prefix}_assessed_value_file",
         )
 
         if not av_file:
@@ -1162,7 +1162,7 @@ def render_assessed_value_upload_parser():
                     "Assessed value column",
                     all_cols,
                     index=default_index,
-                    key="assessed_value_column_select",
+                    key=f"{key_prefix}_assessed_value_column_select",
                 )
 
                 parsed_values = clean_money_series(av_df[value_col])
@@ -1183,7 +1183,7 @@ def render_assessed_value_upload_parser():
 
                 approve_col, candidate_col = st.columns(2)
                 with approve_col:
-                    if st.button("Approve Assessed Value as Source Data", key="approve_total_av"):
+                    if st.button("Approve Assessed Value as Source Data", key=f"{key_prefix}_approve_total_av"):
                         approve_total_assessed_value(
                             float(total_av),
                             source_method="Assessed Value Upload Parser",
@@ -1193,7 +1193,7 @@ def render_assessed_value_upload_parser():
                         )
                         st.success("Total assessed value approved and Auto Context row updated.")
                 with candidate_col:
-                    if st.button("Use AV to Update Value-to-Lien Calculator Input", key="candidate_total_av"):
+                    if st.button("Use AV to Update Value-to-Lien Calculator Input", key=f"{key_prefix}_candidate_total_av"):
                         st.session_state["suggested_assessed_value"] = float(total_av)
                         st.success("Saved as suggested assessed value for the Value-to-Lien calculator.")
 
@@ -1201,9 +1201,9 @@ def render_assessed_value_upload_parser():
                 st.error(f"Could not parse assessed value file: {e}")
 
     with av_tab3:
-        manual_av = st.text_input("Manual total assessed value", placeholder="Example: 3454244692", key="manual_total_assessed_value")
-        manual_source = st.text_input("Manual source note", placeholder="Example: OS p. A-12 / County assessor roll", key="manual_total_assessed_value_source")
-        if st.button("Approve Manual Assessed Value", key="approve_manual_total_av"):
+        manual_av = st.text_input("Manual total assessed value", placeholder="Example: 3454244692", key=f"{key_prefix}_manual_total_assessed_value")
+        manual_source = st.text_input("Manual source note", placeholder="Example: OS p. A-12 / County assessor roll", key=f"{key_prefix}_manual_total_assessed_value_source")
+        if st.button("Approve Manual Assessed Value", key=f"{key_prefix}_approve_manual_total_av"):
             if not manual_av.strip():
                 st.error("Enter a value first.")
             else:
@@ -1217,23 +1217,23 @@ def render_assessed_value_upload_parser():
                 )
                 st.success("Manual assessed value approved and Auto Context row updated.")
 
-def render_housing_market_proxy_resolver():
+def render_housing_market_proxy_resolver(key_prefix="main"):
     st.subheader("Housing Market Trend / Distress Proxy")
     st.caption("Safe mode: deterministic classifier creates a reviewable candidate. It does not overwrite approved scorecard data unless you approve it in Reliability Review.")
 
     h1, h2, h3, h4 = st.columns(4)
     with h1:
-        price_yoy = st.number_input("Home Price YoY %", value=0.0, step=0.5, key="housing_price_yoy")
+        price_yoy = st.number_input("Home Price YoY %", value=0.0, step=0.5, key=f"{key_prefix}_housing_price_yoy")
     with h2:
-        inventory_yoy = st.number_input("Inventory YoY %", value=0.0, step=1.0, key="housing_inventory_yoy")
+        inventory_yoy = st.number_input("Inventory YoY %", value=0.0, step=1.0, key=f"{key_prefix}_housing_inventory_yoy")
     with h3:
-        distress_proxy = st.number_input("Distress Proxy %", value=0.0, step=0.1, key="housing_distress_proxy")
+        distress_proxy = st.number_input("Distress Proxy %", value=0.0, step=0.1, key=f"{key_prefix}_housing_distress_proxy")
     with h4:
-        affordability_worse = st.checkbox("Affordability worse than U.S.", value=True, key="housing_affordability_worse")
+        affordability_worse = st.checkbox("Affordability worse than U.S.", value=True, key=f"{key_prefix}_housing_affordability_worse")
 
     st.caption("Good inputs: FHFA/Zillow price YoY, Redfin/Realtor inventory YoY, foreclosure/delinquency proxy, and affordability comparison.")
 
-    if st.button("Generate Housing Classification Candidate", key="generate_housing_candidate"):
+    if st.button("Generate Housing Classification Candidate", key=f"{key_prefix}_generate_housing_candidate"):
         housing = classify_housing_market_proxy(price_yoy, inventory_yoy, distress_proxy, affordability_worse)
         notes = "Reasons: " + "; ".join(housing["reasons"])
         add_candidate_value(
@@ -1965,9 +1965,9 @@ with tab_deal:
     with resolver_tab1:
         render_local_unemployment_resolver(deal_setup, key_prefix="deal_workspace")
     with resolver_tab2:
-        render_assessed_value_upload_parser()
+        render_assessed_value_upload_parser(key_prefix="deal_workspace")
     with resolver_tab3:
-        render_housing_market_proxy_resolver()
+        render_housing_market_proxy_resolver(key_prefix="deal_workspace")
 
     if st.session_state.get("auto_data_results"):
         st.subheader("Auto Context Results")
@@ -2271,10 +2271,10 @@ with tab_calcs:
         render_local_unemployment_resolver(st.session_state.get("deal_setup", {}), key_prefix="sources_resolver")
 
     with calc_tab5:
-        render_assessed_value_upload_parser()
+        render_assessed_value_upload_parser(key_prefix="calc_tab")
 
     with calc_tab6:
-        render_housing_market_proxy_resolver()
+        render_housing_market_proxy_resolver(key_prefix="calc_tab")
 
     with calc_tab1:
         st.subheader("Taxpayer Concentration Builder")
