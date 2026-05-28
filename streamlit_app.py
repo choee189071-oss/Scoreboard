@@ -4783,21 +4783,77 @@ with tab_calcs:
             taxpayer_engine_candidate = st.session_state.get("taxpayer_table_candidate_engine")
             if taxpayer_engine_candidate:
                 st.write(f"**Source document:** {taxpayer_engine_candidate.get('source_document', '')}")
-                st.write(f"**Confidence:** {taxpayer_engine_candidate.get('confidence', 0)}% — `{taxpayer_engine_candidate.get('status', '')}`")
+                confidence = int(taxpayer_engine_candidate.get("confidence", 0) or 0)
+                status = taxpayer_engine_candidate.get("status", "")
+                st.write(f"**Confidence:** {confidence}% — `{status}`")
+
+                # Reliability badge: align table extraction with the platform-wide Tier 1 / Tier 2 / Tier 3 logic.
+                if confidence >= 85:
+                    st.success("🟢 Tier 1 — Source Verified / strong table reconstruction. Still verify source dates, units, and headers before approval.")
+                elif confidence >= 40:
+                    st.warning("🟡 Tier 2 — AI Reconstructed. Review the evidence and table carefully before approval.")
+                else:
+                    st.info("⚪ Tier 3 — Evidence Located, Reconstruction Failed or Low Confidence. This does not mean the OS lacks taxpayer data.")
+
                 table_candidate = taxpayer_engine_candidate.get("table", pd.DataFrame())
                 if table_candidate is None or table_candidate.empty:
-                    st.warning("A possible taxpayer section was found, but no clean taxpayer rows were reconstructed. Use the upload/mapping fallback or verify the evidence manually.")
+                    st.warning(
+                        """
+⚠ Taxpayer table was not fully reconstructed.
+
+The system detected a possible taxpayer section in the document, but could not reliably rebuild structured taxpayer rows.
+
+Recommended next steps:
+
+• OCR Mode → re-process scanned pages
+• Vision Mode → analyze table images directly
+• Upload CSV/XLSX → analyst-provided taxpayer table with column mapping
+• Evidence Preview → manually verify extracted content
+
+This does **not** necessarily mean the Official Statement lacks taxpayer information. It may indicate a PDF parsing, OCR, or table reconstruction limitation.
+                        """
+                    )
                 else:
                     st.dataframe(table_candidate, use_container_width=True, hide_index=True)
+
                 with st.expander("Evidence Preview"):
                     st.text(str(taxpayer_engine_candidate.get("preview", ""))[:3000])
+
+                st.markdown("### Recovery Options")
+                rec1, rec2, rec3, rec4 = st.columns(4)
+                with rec1:
+                    if st.button("🔍 OCR Mode", key="taxpayer_recovery_ocr_mode"):
+                        st.info("OCR Mode placeholder: use this when the table is image-based or scanned. Upload/map fallback is available below for now.")
+                with rec2:
+                    if st.button("👁 Vision Mode", key="taxpayer_recovery_vision_mode"):
+                        st.info("Vision Mode placeholder: use this when PDF text extraction fails but the table is visible as an image.")
+                with rec3:
+                    if st.button("📄 Upload CSV/XLSX", key="taxpayer_recovery_upload_mode"):
+                        st.info("Use the Upload / Column Mapping fallback section below to load taxpayer rows manually with less typing.")
+                with rec4:
+                    if st.button("📖 Open Evidence", key="taxpayer_recovery_open_evidence"):
+                        st.info("Open the Evidence Preview expander above and verify the table manually against the source PDF.")
+
                 if st.button("Approve and Load Taxpayer Table", key="approve_taxpayer_table_engine"):
                     if table_candidate is not None and not table_candidate.empty:
                         sync_taxpayer_table_to_editor(table_candidate.copy(), source=taxpayer_engine_candidate.get("source_document"))
                         st.success("Taxpayer table loaded into calculator. Review before calculating.")
                         rerun_after_approve()
                     else:
-                        st.error("No usable taxpayer table rows to load.")
+                        st.info(
+                            """
+No approved taxpayer rows are currently available.
+
+Possible reasons:
+
+• Table exists but reconstruction failed
+• PDF is image-based
+• Table spans multiple pages
+• Confidence is below approval threshold
+
+Open Evidence Preview or use the upload / mapping fallback before approving.
+                            """
+                        )
 
         parsed_docs = st.session_state.get("parsed_documents", []) or []
         with st.expander("AI Fill from Uploaded Documents", expanded=False):
