@@ -1217,49 +1217,414 @@ def render_assessed_value_upload_parser(key_prefix="main"):
                 )
                 st.success("Manual assessed value approved and Auto Context row updated.")
 
-def render_housing_market_proxy_resolver(key_prefix="main"):
-    st.subheader("Housing Market Trend / Distress Proxy")
-    st.caption("Safe mode: deterministic classifier creates a reviewable candidate. It does not overwrite approved scorecard data unless you approve it in Reliability Review.")
 
-    h1, h2, h3, h4 = st.columns(4)
-    with h1:
-        price_yoy = st.number_input("Home Price YoY %", value=0.0, step=0.5, key=f"{key_prefix}_housing_price_yoy")
-    with h2:
-        inventory_yoy = st.number_input("Inventory YoY %", value=0.0, step=1.0, key=f"{key_prefix}_housing_inventory_yoy")
-    with h3:
-        distress_proxy = st.number_input("Distress Proxy %", value=0.0, step=0.1, key=f"{key_prefix}_housing_distress_proxy")
-    with h4:
-        affordability_worse = st.checkbox("Affordability worse than U.S.", value=True, key=f"{key_prefix}_housing_affordability_worse")
+def normalize_market_name(value):
+    """Normalize MSA/county labels for fuzzy matching across public housing datasets."""
+    value = str(value or "").lower()
+    value = re.sub(r"\b(metropolitan|metropolitan statistical area|msa|metro division|county|ca|california)\b", " ", value)
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return " ".join(value.split())
 
-    st.caption("Good inputs: FHFA/Zillow price YoY, Redfin/Realtor inventory YoY, foreclosure/delinquency proxy, and affordability comparison.")
 
-    if st.button("Generate Housing Classification Candidate", key=f"{key_prefix}_generate_housing_candidate"):
-        housing = classify_housing_market_proxy(price_yoy, inventory_yoy, distress_proxy, affordability_worse)
-        notes = "Reasons: " + "; ".join(housing["reasons"])
-        add_candidate_value(
-            scorecard_key="real_estate_market_volatility",
-            scorecard_field="Real Estate Market Volatility",
-            value=housing["classification"],
-            source_method="Housing Market Proxy Classifier",
-            confidence=housing["confidence"],
-            notes=f"Risk points: {housing['risk_points']}. {notes}",
-        )
+def fuzzy_place_match(df, place_col, target_name, fallback_terms=None):
+    """Return a best-effort matched row subset for a geography name."""
+    if df is None or df.empty or place_col not in df.columns:
+        return pd.DataFrame()
+
+    target_norm = normalize_market_name(target_name)
+    fallback_terms = fallback_terms or []
+    terms = [t for t in re.split(r"\s+|-|/", target_norm) if len(t) >= 4]
+    for term in fallback_terms:
+        norm_term = normalize_market_name(term)
+        if norm_term:
+            terms.extend([t for t in norm_term.split() if len(t) >= 4])
+
+    terms = list(dict.fromkeys(terms))
+    if not terms:
+        return pd.DataFrame()
+
+    work = df.copy()
+    work["__match_norm"] = work[place_col].astype(str).map(normalize_market_name)
+
+    # First try phrase contains.
+    phrase_matches = work[work["__match_norm"].str.contains(target_norm, na=False, regex=False)] if target_norm else pd.DataFrame()
+    if not phrase_matches.empty:
+        return phrase_matches.drop(columns=["__match_norm"], errors="ignore")
+
+    # Then score token overlap.
+    def score(name):
+        return sum(1 for t in terms if t in name)
+
+    work["__match_score"] = work["__match_norm"].map(score)
+    max_score = work["__match_score"].max()
+    if pd.isna(max_score) or max_score <= 0:
+        return pd.DataFrame()
+    return work[work["__match_score"] == max_score].drop(columns=["__match_norm", "__match_score"], errors="ignore")
+
+
+def pull_fhfa_home_price_yoy(geo_name, state=None, fhfa_url=None):
+    """
+    Pull FHFA HPI from the public hpi_master.csv and compute latest YoY change.
+    Preferred geography is MSA; if no match, try state-level records.
+    """
+    fhfa_url = fhfa_url or "https://www.fhfa.gov/hpi/download/monthly/hpi_master.csv"
+    df = pd.read_csv(fhfa_url)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Common FHFA hpi_master columns: place_name, place_id, yr, period, index_nsa, index_sa, frequency, level, ...
+    place_col = "place_name" if "place_name" in df.columns else None
+    index_col = "index_nsa" if "index_nsa" in df.columns else ("index_sa" if "index_sa" in df.columns else None)
+    year_col = "yr" if "yr" in df.columns else ("year" if "year" in df.columns else None)
+    period_col = "period" if "period" in df.columns else ("quarter" if "quarter" in df.columns else None)
+
+    if not all([place_col, index_col, year_col, period_col]):
+        raise ValueError("FHFA file schema not recognized. Expected place_name, yr, period, and index_nsa/index_sa.")
+
+    # Prefer MSA rows when possible.
+    msa_df = df[df.astype(str).apply(lambda row: row.str.contains("MSA", case=False, na=False).any(), axis=1)]
+    matched = fuzzy_place_match(msa_df if not msa_df.empty else df, place_col, geo_name, fallback_terms=[state])
+
+    if matched.empty and state:
+        # Try state-level as fallback.
+        matched = fuzzy_place_match(df, place_col, state)
+
+    if matched.empty:
+        raise ValueError(f"No FHFA HPI geography match found for '{geo_name}'. Try a broader MSA name or state.")
+
+    # Pick the most common matched place_name to avoid mixing multiple nearby metros.
+    chosen_place = matched[place_col].mode().iloc[0]
+    series = matched[matched[place_col] == chosen_place].copy()
+    series[index_col] = pd.to_numeric(series[index_col], errors="coerce")
+    series[year_col] = pd.to_numeric(series[year_col], errors="coerce")
+    series[period_col] = pd.to_numeric(series[period_col], errors="coerce")
+    series = series.dropna(subset=[index_col, year_col, period_col]).sort_values([year_col, period_col])
+
+    if len(series) < 5:
+        raise ValueError(f"Not enough FHFA HPI observations for {chosen_place}.")
+
+    latest = series.iloc[-1]
+    prev = series[(series[year_col] == latest[year_col] - 1) & (series[period_col] == latest[period_col])]
+    if prev.empty:
+        # Fallback to approximately 12 months / 4 quarters prior depending on frequency.
+        offset = 12 if str(series.get("frequency", "monthly")).lower().str.contains("monthly").any() else 4
+        if len(series) <= offset:
+            raise ValueError("Could not find a comparable year-ago FHFA observation.")
+        prev_row = series.iloc[-1 - offset]
+    else:
+        prev_row = prev.iloc[-1]
+
+    yoy = (float(latest[index_col]) / float(prev_row[index_col]) - 1) * 100
+    latest_label = f"{int(latest[year_col])}-{int(latest[period_col]):02d}"
+
+    return {
+        "ok": True,
+        "home_price_yoy": round(yoy, 2),
+        "latest_index": round(float(latest[index_col]), 3),
+        "prior_index": round(float(prev_row[index_col]), 3),
+        "date_or_year": latest_label,
+        "matched_place": chosen_place,
+        "source_url": fhfa_url,
+    }
+
+
+def find_realtor_download_links():
+    """
+    Best-effort discovery of Realtor.com data CSV links. If the page structure changes,
+    the user can paste a direct CSV URL in the UI.
+    """
+    page_url = "https://www.realtor.com/research/data/"
+    try:
+        tables = pd.read_html(page_url)
+        # read_html may not expose download links; return page URL for attribution.
+        return {"page_url": page_url, "links": []}
+    except Exception:
+        return {"page_url": page_url, "links": []}
+
+
+def pull_realtor_inventory_yoy(market_name, realtor_csv_url=None):
+    """
+    Pull Realtor.com inventory data from a direct CSV/XLSX link supplied or discovered by analyst.
+    The UI keeps a manual fallback because Realtor download URLs may change.
+    """
+    if not realtor_csv_url:
+        raise ValueError("Paste a direct Realtor.com CSV/XLSX download URL, or enter Inventory YoY manually.")
+
+    if realtor_csv_url.lower().endswith(('.xlsx', '.xls')):
+        df = pd.read_excel(realtor_csv_url)
+    else:
+        df = pd.read_csv(realtor_csv_url)
+
+    original_cols = list(df.columns)
+    norm_map = {c: normalize_column_name(c) for c in df.columns}
+    df = df.rename(columns=norm_map)
+
+    # Candidate geography and inventory columns used across Realtor monthly inventory files.
+    geo_candidates = [c for c in df.columns if any(x in c for x in ["cbsa_title", "metro", "county", "state", "region_name"])]
+    yoy_candidates = [
+        c for c in df.columns
+        if ("active_listing" in c or "inventory" in c or "total_listing" in c)
+        and ("yoy" in c or "yy" in c or "year_over_year" in c)
+    ]
+
+    if not geo_candidates:
+        raise ValueError(f"Could not find a geography column in Realtor file. Columns: {original_cols[:15]}")
+    if not yoy_candidates:
+        raise ValueError(f"Could not find an inventory YoY column in Realtor file. Columns: {original_cols[:15]}")
+
+    geo_col = geo_candidates[0]
+    matched = fuzzy_place_match(df, geo_col, market_name)
+    if matched.empty:
+        raise ValueError(f"No Realtor inventory geography match found for '{market_name}'.")
+
+    chosen_row = matched.iloc[-1]
+    yoy_col = yoy_candidates[0]
+    yoy_raw = chosen_row[yoy_col]
+    yoy = parse_numeric_input(yoy_raw, default=0.0)
+
+    date_cols = [c for c in df.columns if c in ["month_date_yyyymm", "month_date", "date", "period"] or "month" in c]
+    date_value = str(chosen_row[date_cols[0]]) if date_cols else datetime.now().date().isoformat()
+
+    return {
+        "ok": True,
+        "inventory_yoy": round(float(yoy), 2),
+        "matched_place": str(chosen_row[geo_col]),
+        "date_or_year": date_value,
+        "source_url": realtor_csv_url,
+        "inventory_column": yoy_col,
+    }
+
+
+def upsert_housing_market_context_rows(context):
+    """Write pulled housing market raw inputs into Auto Context Results, preserving source links."""
+    if context.get("fhfa"):
+        fhfa = context["fhfa"]
         upsert_auto_data_result_by_target(
             {
-                "data_source": "Housing Data",
-                "series_label": "Analyst indicators",
-                "target_data": "Housing market trend / distress proxy",
-                "status": "needs_review",
-                "date_or_year": datetime.now().date().isoformat(),
-                "value": housing["classification"],
-                "source_url": "",
-                "notes": f"Candidate only. Risk points {housing['risk_points']}; confidence {housing['confidence']:.0%}.",
+                "data_source": "FHFA HPI",
+                "series_label": fhfa.get("matched_place", "FHFA matched market"),
+                "target_data": "Home price YoY",
+                "status": "success",
+                "date_or_year": fhfa.get("date_or_year", ""),
+                "value": f"{fhfa.get('home_price_yoy', 0):.2f}%",
+                "source_url": fhfa.get("source_url", ""),
+                "notes": "Pulled from FHFA HPI public dataset.",
             },
-            target_contains="Housing market trend",
-            unique_key="housing_market_proxy_candidate",
+            target_contains="Home price YoY",
+            unique_key="housing_home_price_yoy_fhfa",
         )
-        st.success("Housing classification candidate added to Reliability Review.")
-        st.json(housing)
+
+    if context.get("realtor"):
+        realtor = context["realtor"]
+        upsert_auto_data_result_by_target(
+            {
+                "data_source": "Realtor.com Research Data",
+                "series_label": realtor.get("matched_place", "Realtor matched market"),
+                "target_data": "Inventory YoY",
+                "status": "success",
+                "date_or_year": realtor.get("date_or_year", ""),
+                "value": f"{realtor.get('inventory_yoy', 0):.2f}%",
+                "source_url": realtor.get("source_url", ""),
+                "notes": f"Pulled from Realtor.com data column {realtor.get('inventory_column', '')}.",
+            },
+            target_contains="Inventory YoY",
+            unique_key="housing_inventory_yoy_realtor",
+        )
+
+
+def render_housing_market_proxy_resolver(key_prefix="main"):
+    st.subheader("Housing Market Trend / Distress Proxy")
+    st.caption(
+        "Best-practice workflow: pull raw market data from public sources, let the classifier generate a reviewable candidate, "
+        "then keep analyst override/approval as the final control. Source links are retained in Auto Context Results."
+    )
+
+    setup = st.session_state.get("deal_setup", {}) or {}
+    default_market = setup.get("location_name") or setup.get("county_name") or ""
+    default_state = setup.get("state") or "CA"
+
+    auto_tab, manual_tab, source_tab = st.tabs(["Auto Market Data Pull", "Manual / Override Inputs", "Source Links"])
+
+    with auto_tab:
+        st.markdown("#### Pull Housing Market Context")
+        st.caption("FHFA is used for home-price YoY. Realtor.com can be used for inventory YoY when a direct data download link is supplied.")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            market_name = st.text_input(
+                "Market / MSA / County name",
+                value=default_market,
+                key=f"{key_prefix}_housing_market_name",
+                help="Example: Los Angeles-Long Beach-Anaheim, Orange County, or California.",
+            )
+            fhfa_url = st.text_input(
+                "FHFA HPI dataset URL",
+                value="https://www.fhfa.gov/hpi/download/monthly/hpi_master.csv",
+                key=f"{key_prefix}_fhfa_hpi_url",
+            )
+        with c2:
+            state_for_match = st.text_input("State fallback", value=default_state, key=f"{key_prefix}_housing_state_fallback")
+            realtor_csv_url = st.text_input(
+                "Optional Realtor.com direct CSV/XLSX URL for inventory",
+                value=st.session_state.get("last_realtor_csv_url", ""),
+                key=f"{key_prefix}_realtor_inventory_url",
+                help="Use Realtor.com Research Data Library → Monthly Housing Inventory → Metro/County historical data download.",
+            )
+
+        pull_col, classify_col = st.columns(2)
+        with pull_col:
+            if st.button("Run Housing Market Context Pull", key=f"{key_prefix}_run_housing_context_pull", type="primary"):
+                context = {"errors": []}
+                try:
+                    fhfa = pull_fhfa_home_price_yoy(market_name, state=state_for_match, fhfa_url=fhfa_url)
+                    context["fhfa"] = fhfa
+                    st.session_state[f"{key_prefix}_auto_home_price_yoy"] = fhfa["home_price_yoy"]
+                except Exception as e:
+                    context["errors"].append(f"FHFA HPI pull failed: {e}")
+
+                if realtor_csv_url.strip():
+                    try:
+                        realtor = pull_realtor_inventory_yoy(market_name, realtor_csv_url=realtor_csv_url.strip())
+                        context["realtor"] = realtor
+                        st.session_state[f"{key_prefix}_auto_inventory_yoy"] = realtor["inventory_yoy"]
+                        st.session_state["last_realtor_csv_url"] = realtor_csv_url.strip()
+                    except Exception as e:
+                        context["errors"].append(f"Realtor inventory pull failed: {e}")
+                else:
+                    context["errors"].append("Realtor inventory was not pulled because no direct CSV/XLSX URL was supplied.")
+
+                st.session_state[f"{key_prefix}_housing_market_context"] = context
+                upsert_housing_market_context_rows(context)
+
+                if context.get("fhfa") or context.get("realtor"):
+                    st.success("Housing market context pulled. Review below, then generate a candidate.")
+                for err in context.get("errors", []):
+                    st.warning(err)
+
+        with classify_col:
+            if st.button("Generate Candidate from Pulled Data", key=f"{key_prefix}_generate_candidate_from_pulled"):
+                price_yoy_auto = st.session_state.get(f"{key_prefix}_auto_home_price_yoy", 0.0)
+                inventory_yoy_auto = st.session_state.get(f"{key_prefix}_auto_inventory_yoy", 0.0)
+                distress_proxy_auto = st.session_state.get(f"{key_prefix}_auto_distress_proxy", 0.0)
+                affordability_auto = st.session_state.get(f"{key_prefix}_auto_affordability_worse", True)
+
+                housing = classify_housing_market_proxy(price_yoy_auto, inventory_yoy_auto, distress_proxy_auto, affordability_auto)
+                context = st.session_state.get(f"{key_prefix}_housing_market_context", {}) or {}
+                source_links = []
+                if context.get("fhfa"):
+                    source_links.append(f"FHFA: {context['fhfa'].get('source_url', '')}")
+                if context.get("realtor"):
+                    source_links.append(f"Realtor: {context['realtor'].get('source_url', '')}")
+                notes = "Reasons: " + "; ".join(housing["reasons"]) + (" | Sources: " + " | ".join(source_links) if source_links else "")
+
+                add_candidate_value(
+                    scorecard_key="real_estate_market_volatility",
+                    scorecard_field="Real Estate Market Volatility",
+                    value=housing["classification"],
+                    source_method="Auto Housing Market Context Classifier",
+                    confidence=housing["confidence"],
+                    notes=f"Risk points: {housing['risk_points']}. {notes}",
+                    source_url=" | ".join(source_links),
+                )
+                upsert_auto_data_result_by_target(
+                    {
+                        "data_source": "Housing Data",
+                        "series_label": "FHFA/Realtor + analyst-safe classifier",
+                        "target_data": "Housing market trend / distress proxy",
+                        "status": "needs_review",
+                        "date_or_year": datetime.now().date().isoformat(),
+                        "value": housing["classification"],
+                        "source_url": " | ".join(source_links),
+                        "notes": f"Candidate only. Risk points {housing['risk_points']}; confidence {housing['confidence']:.0%}. {notes}",
+                    },
+                    target_contains="Housing market trend",
+                    unique_key="housing_market_proxy_candidate",
+                )
+                st.success("Housing classification candidate added to Reliability Review.")
+                st.json(housing)
+
+        context = st.session_state.get(f"{key_prefix}_housing_market_context", {}) or {}
+        if context:
+            st.markdown("#### Pulled Market Data")
+            cols = st.columns(3)
+            if context.get("fhfa"):
+                fhfa = context["fhfa"]
+                cols[0].metric("FHFA Home Price YoY", f"{fhfa['home_price_yoy']:.2f}%")
+                st.caption(f"FHFA matched geography: {fhfa.get('matched_place')} | Source: {fhfa.get('source_url')}")
+            if context.get("realtor"):
+                realtor = context["realtor"]
+                cols[1].metric("Inventory YoY", f"{realtor['inventory_yoy']:.2f}%")
+                st.caption(f"Realtor matched geography: {realtor.get('matched_place')} | Source: {realtor.get('source_url')}")
+            if context.get("errors"):
+                with st.expander("Pull warnings / missing sources", expanded=False):
+                    for err in context["errors"]:
+                        st.write("- " + err)
+
+    with manual_tab:
+        st.markdown("#### Analyst Override Inputs")
+        st.caption("These values can override or supplement the auto-pulled data. The candidate still requires analyst approval before entering the scorecard.")
+        h1, h2, h3, h4 = st.columns(4)
+        with h1:
+            price_yoy = st.number_input(
+                "Home Price YoY %",
+                value=float(st.session_state.get(f"{key_prefix}_auto_home_price_yoy", 0.0)),
+                step=0.5,
+                key=f"{key_prefix}_housing_price_yoy",
+            )
+        with h2:
+            inventory_yoy = st.number_input(
+                "Inventory YoY %",
+                value=float(st.session_state.get(f"{key_prefix}_auto_inventory_yoy", 0.0)),
+                step=1.0,
+                key=f"{key_prefix}_housing_inventory_yoy",
+            )
+        with h3:
+            distress_proxy = st.number_input("Distress Proxy %", value=0.0, step=0.1, key=f"{key_prefix}_housing_distress_proxy")
+        with h4:
+            affordability_worse = st.checkbox("Affordability worse than U.S.", value=True, key=f"{key_prefix}_housing_affordability_worse")
+
+        if st.button("Generate Housing Classification Candidate", key=f"{key_prefix}_generate_housing_candidate"):
+            housing = classify_housing_market_proxy(price_yoy, inventory_yoy, distress_proxy, affordability_worse)
+            notes = "Reasons: " + "; ".join(housing["reasons"])
+            add_candidate_value(
+                scorecard_key="real_estate_market_volatility",
+                scorecard_field="Real Estate Market Volatility",
+                value=housing["classification"],
+                source_method="Housing Market Proxy Classifier / Manual Override Inputs",
+                confidence=housing["confidence"],
+                notes=f"Risk points: {housing['risk_points']}. {notes}",
+            )
+            upsert_auto_data_result_by_target(
+                {
+                    "data_source": "Housing Data",
+                    "series_label": "Analyst override indicators",
+                    "target_data": "Housing market trend / distress proxy",
+                    "status": "needs_review",
+                    "date_or_year": datetime.now().date().isoformat(),
+                    "value": housing["classification"],
+                    "source_url": "",
+                    "notes": f"Candidate only. Risk points {housing['risk_points']}; confidence {housing['confidence']:.0%}.",
+                },
+                target_contains="Housing market trend",
+                unique_key="housing_market_proxy_candidate",
+            )
+            st.success("Housing classification candidate added to Reliability Review.")
+            st.json(housing)
+
+    with source_tab:
+        st.markdown("#### Recommended Source Hierarchy")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"Input": "Home Price YoY", "Preferred Source": "FHFA HPI", "Mode": "Auto pull", "Link": "https://www.fhfa.gov/hpi/download/monthly/hpi_master.csv"},
+                    {"Input": "Inventory YoY", "Preferred Source": "Realtor.com Research Data", "Mode": "Paste direct CSV/XLSX link or upload", "Link": "https://www.realtor.com/research/data/"},
+                    {"Input": "Distress Proxy", "Preferred Source": "Foreclosure/delinquency vendor or internal proxy", "Mode": "Manual/optional", "Link": ""},
+                    {"Input": "Affordability", "Preferred Source": "Census income + home price context", "Mode": "Analyst checkbox / future auto", "Link": ""},
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.info("Safe design: raw data rows keep web links; AI/classifier outputs stay as reviewable candidates until approved.")
 
 def render_local_unemployment_resolver(deal_setup, key_prefix="main"):
     """UI card: show matched source address, allow analyst approval, then pull data."""
