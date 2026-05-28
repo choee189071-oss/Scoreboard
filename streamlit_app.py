@@ -472,6 +472,42 @@ def is_missing_master_value(value):
     return False
 
 
+
+
+def has_candidate_value(value):
+    """Return True only when an AI/source candidate has a usable value.
+
+    Empty strings, None, NaN, placeholder words, and zero-confidence blank
+    extraction shells should not create Needs Review cards.
+    """
+    if value is None:
+        return False
+
+    try:
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned == "":
+            return False
+        if cleaned.lower() in [
+            "none",
+            "nan",
+            "null",
+            "n/a",
+            "na",
+            "missing",
+            "not found",
+            "not available",
+            "unknown",
+        ]:
+            return False
+
+    return True
+
 def get_master_value(scorecard_key, fallback=None):
     """
     Single source of truth reader.
@@ -1069,6 +1105,327 @@ def add_candidate_value(scorecard_key, scorecard_field, value, source_method, co
     st.session_state.setdefault("candidate_extractions", [])
     st.session_state["candidate_extractions"].append(candidate)
     return candidate
+
+
+# =============================================================================
+# Economic Fundamentals Engines
+# =============================================================================
+
+def upsert_candidate_value(scorecard_key, scorecard_field, value, source_method, confidence=0.70, notes="", source_document="", source_url=""):
+    """Create or replace one candidate for a scorecard field/source.
+
+    This prevents repeated button clicks from creating duplicate Needs Review cards.
+    Empty values are ignored so blank AI shells do not show as Needs Review.
+    """
+    if not has_candidate_value(value):
+        return None
+
+    existing = st.session_state.get("candidate_extractions", []) or []
+    filtered = [
+        c for c in existing
+        if not (c.get("scorecard_key") == scorecard_key and c.get("source_method") == source_method)
+    ]
+    st.session_state["candidate_extractions"] = filtered
+    return add_candidate_value(
+        scorecard_key=scorecard_key,
+        scorecard_field=scorecard_field,
+        value=value,
+        source_method=source_method,
+        confidence=confidence,
+        notes=notes,
+        source_document=source_document,
+        source_url=source_url,
+    )
+
+
+def census_profile_population(year, deal_setup, census_api_key=None, us=False):
+    """Pull ACS 5-year profile population DP05_0001E for local geography or U.S.
+
+    This supports county/place because those are already in the deal setup.
+    Returns {population, name, source_url, year}.
+    """
+    year = int(year)
+    base_url = f"https://api.census.gov/data/{year}/acs/acs5/profile"
+    params = {"get": "NAME,DP05_0001E"}
+    if census_api_key:
+        params["key"] = census_api_key
+
+    if us:
+        params["for"] = "us:*"
+    else:
+        state_fips = str(deal_setup.get("state_fips", "")).zfill(2)
+        geo_code = str(deal_setup.get("county_or_place_fips", ""))
+        geography_type = str(deal_setup.get("geography_type", "county")).lower()
+        if geography_type == "place":
+            params["for"] = f"place:{geo_code.zfill(5)}"
+            params["in"] = f"state:{state_fips}"
+        else:
+            params["for"] = f"county:{geo_code.zfill(3)}"
+            params["in"] = f"state:{state_fips}"
+
+    response = requests.get(base_url, params=params, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    if len(payload) < 2:
+        raise ValueError("Census response returned no population rows.")
+
+    headers = payload[0]
+    row = payload[1]
+    data = dict(zip(headers, row))
+    pop = float(data.get("DP05_0001E"))
+
+    return {
+        "population": pop,
+        "name": data.get("NAME", "United States" if us else "Local geography"),
+        "year": year,
+        "source_url": response.url,
+    }
+
+
+def run_population_growth_difference_engine(deal_setup, census_api_key=None):
+    """Auto-pull local vs U.S. population growth and write directly to approved inputs.
+
+    This is objective public data, so it can be Auto Pulled. The scorecard receives:
+    population_growth_difference_vs_us = local_growth_pct - us_growth_pct.
+    """
+    current_year = int(deal_setup.get("census_year", 2023))
+    base_year = max(2010, current_year - 5)
+
+    try:
+        local_now = census_profile_population(current_year, deal_setup, census_api_key=census_api_key, us=False)
+        local_then = census_profile_population(base_year, deal_setup, census_api_key=census_api_key, us=False)
+        us_now = census_profile_population(current_year, deal_setup, census_api_key=census_api_key, us=True)
+        us_then = census_profile_population(base_year, deal_setup, census_api_key=census_api_key, us=True)
+
+        local_growth = ((local_now["population"] / local_then["population"]) - 1.0) * 100.0
+        us_growth = ((us_now["population"] / us_then["population"]) - 1.0) * 100.0
+        diff = round(local_growth - us_growth, 2)
+
+        safe_add_approved_input(
+            scorecard_key="population_growth_difference_vs_us",
+            value=diff,
+            status="Auto Pulled",
+            source_method="Census ACS Population Growth Engine",
+            source_document=f"ACS {base_year} and {current_year} DP05_0001E",
+            confidence=1.0,
+            notes=(
+                f"Local growth {local_growth:.2f}% vs U.S. growth {us_growth:.2f}% "
+                f"from ACS {base_year} to {current_year}."
+            ),
+        )
+
+        upsert_auto_data_result_by_target(
+            {
+                "data_source": "Census / ACS",
+                "series_label": f"Population growth {base_year}–{current_year}",
+                "target_data": "Population Growth Difference vs U.S.",
+                "status": "success",
+                "date_or_year": f"{base_year}-{current_year}",
+                "value": f"{diff:.2f}%",
+                "source_url": local_now.get("source_url", ""),
+                "notes": f"{local_now.get('name', 'Local geography')}: {local_growth:.2f}%; U.S.: {us_growth:.2f}%.",
+            },
+            target_contains="Population Growth Difference",
+            unique_key="population_growth_difference_acs",
+        )
+        return {"ok": True, "value": diff, "local_growth": local_growth, "us_growth": us_growth}
+
+    except Exception as e:
+        upsert_auto_data_result_by_target(
+            {
+                "data_source": "Census / ACS",
+                "series_label": "Population growth",
+                "target_data": "Population Growth Difference vs U.S.",
+                "status": "needs_review",
+                "date_or_year": f"{base_year}-{current_year}",
+                "value": "",
+                "source_url": "https://api.census.gov/data.html",
+                "notes": f"Population growth auto-pull failed: {e}",
+            },
+            target_contains="Population Growth Difference",
+            unique_key="population_growth_difference_acs",
+        )
+        return {"ok": False, "error": str(e)}
+
+
+def infer_msa_participation_candidate(deal_setup):
+    """Create a reviewable MSA Participation candidate from geography context.
+
+    This is intentionally an inference, not a hard data pull. It should always require
+    analyst approval in Reliability Review.
+    """
+    location = str(deal_setup.get("location_name") or "").strip()
+    county = str(deal_setup.get("county_name") or "").strip()
+    state = str(deal_setup.get("state") or "").strip()
+    combined = f"{location} {county} {state}".lower()
+
+    broad_terms = [
+        "los angeles", "long beach", "anaheim", "orange county", "san francisco", "oakland", "san jose",
+        "new york", "newark", "jersey city", "chicago", "dallas", "fort worth", "houston", "austin",
+        "seattle", "boston", "washington", "arlington", "alexandria", "denver", "phoenix", "miami",
+        "atlanta", "philadelphia", "san diego", "riverside", "sacramento",
+    ]
+
+    if not location and not county:
+        value = "No"
+        confidence = 0.45
+        reason = "No MSA/county context was provided; analyst should verify regional participation."
+    elif any(term in combined for term in broad_terms):
+        value = "Yes; Broad & Diverse"
+        confidence = 0.78
+        reason = "The deal geography appears to participate in a large/diverse metropolitan economy based on the location/county fields."
+    else:
+        value = "Yes; Not Broad & Diverse"
+        confidence = 0.62
+        reason = "The deal has a named local/regional economy, but the app cannot confirm broad/diverse participation from geography alone."
+
+    notes = (
+        f"Rule/AI-assisted inference from location='{location}', county='{county}', state='{state}'. "
+        f"{reason} Double-check employment base, commuter patterns, and MSA linkages before approval."
+    )
+
+    upsert_candidate_value(
+        scorecard_key="msa_participation",
+        scorecard_field="MSA Participation",
+        value=value,
+        source_method="MSA Participation Inference Engine",
+        confidence=confidence,
+        notes=notes,
+        source_document="Deal setup geography fields",
+        source_url="",
+    )
+
+    upsert_auto_data_result_by_target(
+        {
+            "data_source": "AI / Rule-Based Inference",
+            "series_label": "MSA participation candidate",
+            "target_data": "MSA Participation",
+            "status": "needs_review",
+            "date_or_year": datetime.now().date().isoformat(),
+            "value": value,
+            "source_url": "",
+            "notes": notes,
+        },
+        target_contains="MSA Participation",
+        unique_key="msa_participation_inference",
+    )
+    return {"ok": True, "value": value, "confidence": confidence, "notes": notes}
+
+
+def get_session_float(keys, default=None):
+    for key in keys:
+        if key in st.session_state:
+            try:
+                return float(str(st.session_state.get(key)).replace("%", "").replace(",", ""))
+            except Exception:
+                pass
+    return default
+
+
+def extract_auto_result_percent(target_contains):
+    target_contains = str(target_contains).lower()
+    for r in st.session_state.get("auto_data_results", []) or []:
+        target = str(r.get("target_data") or r.get("Target Data") or "").lower()
+        if target_contains in target:
+            raw = str(r.get("value") or r.get("Extracted / Calculated Value") or "")
+            m = re.search(r"[-+]?\d+(?:\.\d+)?", raw)
+            if m:
+                try:
+                    return float(m.group(0))
+                except Exception:
+                    pass
+    return None
+
+
+def generate_real_estate_volatility_candidate_from_available_data(key_prefix="data_workspace"):
+    """Generate the Real Estate Market Volatility candidate from pulled housing indicators.
+
+    Uses the existing deterministic housing classifier. This does not approve the value;
+    it only pushes a candidate into Reliability Review.
+    """
+    price_yoy = get_session_float(
+        [f"{key_prefix}_auto_home_price_yoy", "main_auto_home_price_yoy", "data_workspace_auto_home_price_yoy"],
+        default=extract_auto_result_percent("home price yoy"),
+    )
+    inventory_yoy = get_session_float(
+        [f"{key_prefix}_auto_inventory_yoy", "main_auto_inventory_yoy", "data_workspace_auto_inventory_yoy"],
+        default=extract_auto_result_percent("inventory yoy"),
+    )
+    distress_proxy = get_session_float(
+        [f"{key_prefix}_auto_distress_proxy", "main_auto_distress_proxy", "data_workspace_auto_distress_proxy"],
+        default=extract_auto_result_percent("distress proxy"),
+    )
+    affordability_worse = bool(st.session_state.get(f"{key_prefix}_auto_affordability_worse", True))
+
+    if price_yoy is None and inventory_yoy is None and distress_proxy is None:
+        return {"ok": False, "error": "No pulled housing indicators available yet. Run Housing Market Context Pull first."}
+
+    # If observed distress is missing, use the already designed safe inferred fallback.
+    inferred_note = ""
+    if distress_proxy is None:
+        inferred = infer_distress_proxy_from_indicators(
+            price_yoy=price_yoy or 0.0,
+            inventory_yoy=inventory_yoy or 0.0,
+            local_unemployment_diff=get_local_unemployment_diff_from_session(),
+            affordability_worse=affordability_worse,
+        )
+        distress_proxy = inferred["distress_proxy"]
+        inferred_note = " Inferred distress proxy used: " + "; ".join(inferred.get("reasons", []))
+
+    housing = classify_housing_market_proxy(
+        price_yoy=price_yoy or 0.0,
+        inventory_yoy=inventory_yoy or 0.0,
+        distress_proxy=distress_proxy or 0.0,
+        affordability_worse=affordability_worse,
+    )
+
+    notes = (
+        f"Derived from available market indicators: home price YoY={price_yoy}, inventory YoY={inventory_yoy}, "
+        f"distress proxy={distress_proxy}, affordability_worse={affordability_worse}. "
+        f"Reasons: {'; '.join(housing['reasons'])}.{inferred_note} Double-check source links before approval."
+    )
+
+    upsert_candidate_value(
+        scorecard_key="real_estate_market_volatility",
+        scorecard_field="Real Estate Market Volatility",
+        value=housing["classification"],
+        source_method="Real Estate Volatility Calculation Engine",
+        confidence=housing["confidence"],
+        notes=notes,
+        source_document="FHFA/Realtor/AI Source Scout or analyst override market indicators",
+        source_url="",
+    )
+
+    upsert_auto_data_result_by_target(
+        {
+            "data_source": "Derived Housing Market Engine",
+            "series_label": "Real estate market volatility candidate",
+            "target_data": "Real Estate Market Volatility",
+            "status": "needs_review",
+            "date_or_year": datetime.now().date().isoformat(),
+            "value": housing["classification"],
+            "source_url": "",
+            "notes": notes,
+        },
+        target_contains="Real Estate Market Volatility",
+        unique_key="real_estate_volatility_derived",
+    )
+    return {"ok": True, **housing, "notes": notes}
+
+
+def run_economic_fundamentals_engines(deal_setup, census_api_key=None, key_prefix="data_workspace"):
+    """Fill the three previously-empty Economic Fundamental fields using their proper method.
+
+    - Population Growth Difference: direct Census ACS pull/calculation, auto-approved.
+    - MSA Participation: AI/rule-based inference candidate, analyst approval required.
+    - Real Estate Market Volatility: derived from pulled housing indicators if available, analyst approval required.
+    """
+    results = {}
+    results["population_growth"] = run_population_growth_difference_engine(deal_setup, census_api_key=census_api_key)
+    results["msa_participation"] = infer_msa_participation_candidate(deal_setup)
+    results["real_estate_volatility"] = generate_real_estate_volatility_candidate_from_available_data(key_prefix=key_prefix)
+    sync_candidates_from_sources()
+    return results
 
 
 def build_current_source_status_table():
@@ -2287,7 +2644,9 @@ def sync_candidates_from_sources():
             source_document = item.get("source_document") or item.get("document") or "Uploaded document"
             source_excerpt = item.get("source_excerpt") or item.get("excerpt") or item.get("evidence") or ""
 
-            if scorecard_key:
+            # Do not create empty Needs Review cards.
+            # If AI did not actually extract a usable value, the field should stay Missing.
+            if scorecard_key and has_candidate_value(value):
                 candidate_rows.append(
                     {
                         "scorecard_field": scorecard_field,
@@ -2331,7 +2690,10 @@ def build_data_reliability_matrix():
         value = safe_value(approved_inputs.get(key))
         meta = approved_meta.get(key, {})
 
-        field_candidates = [c for c in candidates if c.get("scorecard_key") == key]
+        field_candidates = [
+            c for c in candidates
+            if c.get("scorecard_key") == key and has_candidate_value(c.get("value"))
+        ]
         best_candidate = field_candidates[0] if field_candidates else None
 
         if value is not None:
@@ -2522,6 +2884,19 @@ def run_auto_context_pull(deal_setup, census_api_key=None, fred_api_key=None):
 
     st.session_state["auto_data_results"] = bundle.get("results", [])
     merge_approved_inputs(bundle.get("approved_inputs", {}), status="Auto Pulled", source_method="Auto Data Connector")
+
+    # Fill additional Economic Fundamentals using the safest available method:
+    # population growth = Census calculation; MSA participation = reviewable inference.
+    # Real estate volatility is generated when housing market indicators are available.
+    try:
+        run_population_growth_difference_engine(deal_setup, census_api_key=census_api_key)
+    except Exception as e:
+        st.session_state.setdefault("economic_engine_warnings", []).append(f"Population growth engine failed: {e}")
+    try:
+        infer_msa_participation_candidate(deal_setup)
+    except Exception as e:
+        st.session_state.setdefault("economic_engine_warnings", []).append(f"MSA participation inference failed: {e}")
+
     sync_candidates_from_sources()
 
 
@@ -3725,6 +4100,20 @@ with tab_calcs:
         render_assessed_value_upload_parser(key_prefix="data_workspace")
     with resolver_tab3:
         render_housing_market_proxy_resolver(key_prefix="data_workspace")
+
+    st.markdown("#### Economic Fundamentals Auto-Fill")
+    st.caption(
+        "Population Growth is pulled from Census ACS; MSA Participation and Real Estate Market Volatility are reviewable candidates. "
+        "Approve candidates in Reliability Review before they enter the final scorecard."
+    )
+    if st.button("Run Economic Fundamentals Engines", key="run_economic_fundamentals_engines"):
+        results = run_economic_fundamentals_engines(
+            deal_setup,
+            census_api_key=census_api_key or default_census_key or None,
+            key_prefix="data_workspace",
+        )
+        st.success("Economic fundamentals engines completed. Review candidate fields in Reliability Review.")
+        st.json(results)
 
     if st.session_state.get("auto_data_results"):
         st.subheader("Auto Context Results")
