@@ -1121,7 +1121,7 @@ def render_housing_market_proxy_resolver():
         st.success("Housing classification candidate added to Reliability Review.")
         st.json(housing)
 
-def render_local_unemployment_resolver(deal_setup):
+def render_local_unemployment_resolver(deal_setup, key_prefix="main"):
     """UI card: show matched source address, allow analyst approval, then pull data."""
     st.subheader("Semi-Auto Resolver: Local Unemployment")
     st.caption(
@@ -1150,7 +1150,7 @@ def render_local_unemployment_resolver(deal_setup):
             value=default_series,
             placeholder="Example: CAORAN9URN",
             help="If the mapper cannot find the county series, paste the FRED county unemployment series ID here.",
-            key="local_unemployment_series_id_input",
+            key=f"{key_prefix}_local_unemployment_series_id_input",
         )
 
     with right:
@@ -1160,7 +1160,7 @@ def render_local_unemployment_resolver(deal_setup):
     approve_and_pull = st.button(
         "Approve Series and Pull Local Unemployment",
         type="primary",
-        key="approve_pull_local_unemployment",
+        key=f"{key_prefix}_approve_pull_local_unemployment",
     )
 
     if approve_and_pull:
@@ -1812,7 +1812,7 @@ with tab_deal:
             st.warning("Auto context completed. No documents uploaded, so document extraction was skipped.")
 
     st.markdown("---")
-    render_local_unemployment_resolver(deal_setup)
+    render_local_unemployment_resolver(deal_setup, key_prefix="deal_workspace")
 
     if st.session_state.get("auto_data_results"):
         st.subheader("Auto Context Results")
@@ -2113,7 +2113,7 @@ with tab_calcs:
     )
 
     with calc_tab4:
-        render_local_unemployment_resolver(st.session_state.get("deal_setup", {}))
+        render_local_unemployment_resolver(st.session_state.get("deal_setup", {}), key_prefix="sources_resolver")
 
     with calc_tab5:
         render_assessed_value_upload_parser()
