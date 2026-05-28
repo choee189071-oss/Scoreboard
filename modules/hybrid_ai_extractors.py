@@ -701,6 +701,184 @@ def find_candidate_pages_for_fields(parsed_docs: List[Dict[str, Any]], fields: I
             dedup[key] = h
     return sorted(dedup.values(), key=lambda x: x.get("page_score", 0), reverse=True)[:max_pages]
 
+
+
+def _extract_tax_levy_table_candidates(parsed_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Deterministic parser for OS tables like:
+    Land Ownership ... Current Special Tax Levy ... Percentage of Total Special Tax Levy.
+
+    This fixes the common case where candidate pages are found but generic regex returns
+    zero candidates because taxpayer concentration lives in a multi-line PDF table.
+    """
+    pages = _pages_from_docs(parsed_docs)
+    results: List[Dict[str, Any]] = []
+
+    for page in pages:
+        raw_text = _safe_text(page.get("text", ""))
+        lower = raw_text.lower()
+
+        # Keep this parser conservative: only run where the right table heading exists.
+        if not (
+            ("special tax levy" in lower and "percentage" in lower and "assessor parcel" in lower)
+            or ("land ownership" in lower and "special tax levy" in lower)
+        ):
+            continue
+
+        lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+        rows: List[Dict[str, Any]] = []
+
+        for idx, line in enumerate(lines):
+            if not re.fullmatch(r"\d{3}-\d{3}-\d{2}", line):
+                continue
+
+            apn = line
+            window = lines[idx: idx + 30]
+
+            levy = None
+            levy_pos = None
+            for j, candidate in enumerate(window[1:], start=1):
+                candidate_clean = candidate.strip()
+                # A levy amount should be a money-like value, not acreage such as 2.18.
+                money_like = bool(re.fullmatch(r"\$?\s*\d[\d,]*\.\d{2}", candidate_clean))
+                if not money_like:
+                    continue
+                parsed_money = _clean_money(candidate_clean)
+                if parsed_money is not None and parsed_money >= 1000:
+                    levy = parsed_money
+                    levy_pos = j
+                    break
+
+            if levy is None or levy_pos is None:
+                continue
+
+            pct = None
+            for candidate in window[levy_pos + 1: levy_pos + 6]:
+                pct_match = re.fullmatch(r"(\d{1,3}(?:\.\d+)?)%?", candidate.strip())
+                if pct_match:
+                    pct_val = float(pct_match.group(1))
+                    if 0 < pct_val <= 100:
+                        pct = pct_val
+                        break
+
+            if pct is None:
+                continue
+
+            # Owner is usually the text between APN and user/tenant/size columns.
+            # This is evidence only; the actual scorecard fields use the percentages.
+            owner_parts = []
+            for candidate in window[1: levy_pos]:
+                if re.fullmatch(r"\d[\d,]*", candidate) or re.fullmatch(r"\d+(?:\.\d+)?", candidate):
+                    break
+                if re.search(r"(none|Toys|Best Buy|Sports Authority|Meineke|Arizona Tile|Dairy Queen|Jack in the Box|Krispy|Goodyear|Bed, Bath|Petco)", candidate, flags=re.I):
+                    break
+                owner_parts.append(candidate)
+            owner = _normalize_space(" ".join(owner_parts))
+
+            rows.append({
+                "apn": apn,
+                "owner": owner,
+                "special_tax_levy": levy,
+                "percent_of_total_special_tax_levy": pct,
+            })
+
+        # Require enough rows to look like a real taxpayer/parcel table.
+        if len(rows) < 3:
+            continue
+
+        pct_values = [r["percent_of_total_special_tax_levy"] for r in rows if isinstance(r.get("percent_of_total_special_tax_levy"), (int, float))]
+        if not pct_values:
+            continue
+
+        top10 = round(sum(sorted(pct_values, reverse=True)[:10]), 2)
+        largest = round(max(pct_values), 2)
+        parcel_count = len(rows)
+        text = _normalize_space(raw_text)
+
+        evidence = (
+            f"Parsed {parcel_count} parcel rows from Special Tax Levy table on page {page.get('page')}. "
+            f"Top 10 sum = {top10}%; largest parcel/taxpayer = {largest}%. "
+            f"Table excerpt: {text[:2200]}"
+        )
+
+        results.extend([
+            {
+                "field_key": "top10_taxpayers_percent_of_total_levy",
+                "label": "Top 10 Taxpayers as % of Total Levy",
+                "scorecard_key": "top10_taxpayers_percent_of_total_levy",
+                "value": top10,
+                "value_type": "percent",
+                "confidence": 0.88,
+                "method": "Regex Table Parser / Special Tax Levy Table",
+                "tier": "Tier 1",
+                "source_document": page.get("document"),
+                "page": page.get("page"),
+                "evidence": evidence,
+                "preferred_source": "Largest Taxpayers / Special Tax Levy table in OS",
+                "guidance": "Calculated by summing the ten largest percentages in the Special Tax Levy table. Verify whether parcels map one-to-one to taxpayers before approval.",
+                "table_rows": rows,
+            },
+            {
+                "field_key": "largest_taxpayer_percent_of_total_levy",
+                "label": "Largest Taxpayer as % of Total Levy",
+                "scorecard_key": "largest_taxpayer_percent_of_total_levy",
+                "value": largest,
+                "value_type": "percent",
+                "confidence": 0.90,
+                "method": "Regex Table Parser / Special Tax Levy Table",
+                "tier": "Tier 1",
+                "source_document": page.get("document"),
+                "page": page.get("page"),
+                "evidence": evidence,
+                "preferred_source": "Largest Taxpayers / Special Tax Levy table in OS",
+                "guidance": "Calculated as the largest percentage in the Special Tax Levy table. Verify table header says Percentage of Total Special Tax Levy.",
+                "table_rows": rows,
+            },
+            {
+                "field_key": "district_size_parcels",
+                "label": "District Size (Parcels)",
+                "scorecard_key": "district_size_parcels",
+                "value": parcel_count,
+                "value_type": "number",
+                "confidence": 0.86,
+                "method": "Regex Table Parser / Special Tax Levy Table",
+                "tier": "Tier 1",
+                "source_document": page.get("document"),
+                "page": page.get("page"),
+                "evidence": evidence,
+                "preferred_source": "OS development status / taxable parcels disclosure",
+                "guidance": "Counted rows in the Special Tax Levy table. Verify whether combined building rows such as 6/7 should count as one parcel or two buildings.",
+                "table_rows": rows,
+            },
+        ])
+        break
+
+    # Narrative backup for parcel count if the table parser did not catch it.
+    if not any(r.get("field_key") == "district_size_parcels" for r in results):
+        full_text = flatten_parsed_docs_to_full_text(parsed_docs)
+        m = re.search(r"(?:all\s+of\s+the\s+)?([0-9][0-9,]*)\s+parcels\s+of\s+Taxable\s+Property", full_text, flags=re.I)
+        if m:
+            val = _clean_number(m.group(1))
+            if val is not None:
+                results.append({
+                    "field_key": "district_size_parcels",
+                    "label": "District Size (Parcels)",
+                    "scorecard_key": "district_size_parcels",
+                    "value": val,
+                    "value_type": "number",
+                    "confidence": 0.82,
+                    "method": "Regex Narrative Scan",
+                    "tier": "Tier 1",
+                    "source_document": "Full parsed OS text",
+                    "page": None,
+                    "evidence": _normalize_space(full_text[max(0, m.start()-450):m.end()+450]),
+                    "preferred_source": "OS development status / taxable parcels disclosure",
+                    "guidance": "Narrative parcel count extracted from OS. Verify taxable vs developed parcel definition.",
+                })
+
+    return results
+
+
 # -----------------------------------------------------------------------------
 # Regex extraction
 # -----------------------------------------------------------------------------
@@ -760,7 +938,11 @@ def regex_extract_fields(parsed_docs: List[Dict[str, Any]], section_id: str) -> 
                         "guidance": field.guidance,
                     })
 
-    # C) Special narrative-derived field for conveyance classification.
+    # C) Special table-derived fields for taxpayer concentration.
+    if section_id == "taxbase_concentration":
+        results.extend(_extract_tax_levy_table_candidates(parsed_docs))
+
+    # D) Special narrative-derived field for conveyance classification.
     if section_id == "taxbase_concentration":
         for page in pages:
             text = _normalize_space(_safe_text(page.get("text", "")))
