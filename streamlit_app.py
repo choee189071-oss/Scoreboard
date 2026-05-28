@@ -3,6 +3,7 @@ import pandas as pd
 import re
 import os
 import json
+import io
 import requests
 from datetime import datetime
 
@@ -350,20 +351,237 @@ def classify_document_from_text(file_name: str, parsed_text: str, tables=None) -
     return name_guess
 
 
+
+# =============================================================================
+# Robust PDF Text Recovery Layer
+# =============================================================================
+
+def _clone_uploaded_file_from_bytes(uploaded_file, file_bytes):
+    """
+    Create a fresh file-like object from uploaded bytes.
+
+    Why this matters:
+    Streamlit UploadedFile behaves like a file pointer. If .read() was already
+    called once, later parsers may see an empty stream unless we seek(0).
+    This clone guarantees each parser receives a fresh stream starting at byte 0.
+    """
+    clone = io.BytesIO(file_bytes or b"")
+    clone.name = getattr(uploaded_file, "name", "uploaded_file")
+    clone.type = getattr(uploaded_file, "type", "")
+    return clone
+
+
+def _extract_pdf_pages_with_pymupdf(pdf_bytes):
+    """Extract page-level text from a PDF using PyMuPDF if available."""
+    try:
+        import fitz  # PyMuPDF
+    except Exception as exc:
+        return [], f"PyMuPDF not available: {exc}"
+
+    try:
+        pages = []
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for i, page in enumerate(doc):
+            text = (page.get_text("text") or "").strip()
+            if text:
+                pages.append({"page": i + 1, "text": text, "method": "pymupdf"})
+        doc.close()
+        return pages, None
+    except Exception as exc:
+        return [], f"PyMuPDF extraction failed: {exc}"
+
+
+def _extract_pdf_pages_with_pdfplumber(pdf_bytes):
+    """Extract page-level text from a PDF using pdfplumber if available."""
+    try:
+        import pdfplumber
+    except Exception as exc:
+        return [], f"pdfplumber not available: {exc}"
+
+    try:
+        pages = []
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for i, page in enumerate(pdf.pages):
+                text = (page.extract_text() or "").strip()
+                if text:
+                    pages.append({"page": i + 1, "text": text, "method": "pdfplumber"})
+        return pages, None
+    except Exception as exc:
+        return [], f"pdfplumber extraction failed: {exc}"
+
+
+def _extract_pdf_pages_with_pypdf(pdf_bytes):
+    """Last lightweight text-layer fallback using pypdf / PyPDF2."""
+    reader_cls = None
+    import_error = None
+
+    try:
+        from pypdf import PdfReader
+        reader_cls = PdfReader
+    except Exception as exc:
+        import_error = f"pypdf not available: {exc}"
+
+    if reader_cls is None:
+        try:
+            from PyPDF2 import PdfReader
+            reader_cls = PdfReader
+        except Exception as exc:
+            return [], f"{import_error}; PyPDF2 not available: {exc}"
+
+    try:
+        pages = []
+        reader = reader_cls(io.BytesIO(pdf_bytes))
+        for i, page in enumerate(reader.pages):
+            text = (page.extract_text() or "").strip()
+            if text:
+                pages.append({"page": i + 1, "text": text, "method": "pypdf"})
+        return pages, None
+    except Exception as exc:
+        return [], f"pypdf/PyPDF2 extraction failed: {exc}"
+
+
+def recover_pdf_text_pages(uploaded_file, file_bytes=None):
+    """
+    Robustly recover page-level text from an uploaded PDF.
+
+    Returns:
+        pages: [{"page": 1, "text": "...", "method": "..."}]
+        debug: parser diagnostics for Streamlit display
+
+    This does not OCR image-only PDFs. It fixes the common issue where the app
+    has raw PDF bytes but parsed text/pages are empty.
+    """
+    debug = {
+        "file_name": getattr(uploaded_file, "name", ""),
+        "raw_bytes": 0,
+        "recovery_method": "",
+        "recovered_pages": 0,
+        "recovered_text_characters": 0,
+        "recovery_warnings": [],
+    }
+
+    if file_bytes is None:
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+        file_bytes = uploaded_file.read()
+
+    file_bytes = file_bytes or b""
+    debug["raw_bytes"] = len(file_bytes)
+
+    if not file_bytes:
+        debug["recovery_warnings"].append("No PDF bytes available to recover.")
+        return [], debug
+
+    extractors = [
+        _extract_pdf_pages_with_pymupdf,
+        _extract_pdf_pages_with_pdfplumber,
+        _extract_pdf_pages_with_pypdf,
+    ]
+
+    for extractor in extractors:
+        pages, warning = extractor(file_bytes)
+        if warning:
+            debug["recovery_warnings"].append(warning)
+
+        if pages:
+            method = pages[0].get("method", extractor.__name__)
+            debug["recovery_method"] = method
+            debug["recovered_pages"] = len(pages)
+            debug["recovered_text_characters"] = sum(len(p.get("text", "")) for p in pages)
+            return pages, debug
+
+    debug["recovery_method"] = "none"
+    return [], debug
+
+
+def _merge_recovered_pdf_text(parsed_doc, recovered_pages, recovery_debug):
+    """
+    Merge recovered PDF page text into the parsed_doc shape used by the rest of the app.
+    """
+    if not recovered_pages:
+        parsed_doc.setdefault("warnings", [])
+        parsed_doc["warnings"].append(
+            "PDF text recovery ran, but no text layer was found. This may require OCR."
+        )
+        parsed_doc["pdf_recovery_debug"] = recovery_debug
+        return parsed_doc
+
+    recovered_text = "\n\n".join(
+        f"--- PAGE {p.get('page')} ---\n{p.get('text', '')}"
+        for p in recovered_pages
+        if str(p.get("text", "")).strip()
+    )
+
+    existing_text = parsed_doc.get("text", "") or ""
+    if len(recovered_text) > len(existing_text):
+        parsed_doc["text"] = recovered_text
+        parsed_doc["pages"] = recovered_pages
+        parsed_doc["page_texts"] = recovered_pages
+        parsed_doc["pdf_text_recovered"] = True
+        parsed_doc["pdf_recovery_debug"] = recovery_debug
+    else:
+        parsed_doc.setdefault("pdf_recovery_debug", recovery_debug)
+
+    return parsed_doc
+
+
 def parse_uploaded_documents(uploaded_files):
     parsed_docs = []
 
     for uploaded_file in uploaded_files:
-        parsed_doc = read_uploaded_file_to_context(uploaded_file)
+        # Save bytes once, then give every parser a fresh stream.
+        # This prevents the "document exists but pages_scanned/full_text_characters = 0" bug.
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+
+        file_bytes = uploaded_file.read() or b""
+        fresh_file = _clone_uploaded_file_from_bytes(uploaded_file, file_bytes)
+
+        try:
+            parsed_doc = read_uploaded_file_to_context(fresh_file)
+        except Exception as exc:
+            parsed_doc = {
+                "file_name": getattr(uploaded_file, "name", "uploaded_file"),
+                "text": "",
+                "tables": [],
+                "warnings": [f"Primary parser failed: {exc}"],
+            }
+
+        if parsed_doc is None:
+            parsed_doc = {}
+
+        parsed_doc.setdefault("file_name", getattr(uploaded_file, "name", "uploaded_file"))
+        parsed_doc.setdefault("text", "")
+        parsed_doc.setdefault("tables", [])
+        parsed_doc.setdefault("warnings", [])
+
+        # If the primary parser returns empty text for a PDF, recover directly from raw PDF bytes.
+        is_pdf = str(getattr(uploaded_file, "name", "")).lower().endswith(".pdf")
+        if is_pdf and len(str(parsed_doc.get("text", "") or "").strip()) == 0:
+            recovered_pages, recovery_debug = recover_pdf_text_pages(uploaded_file, file_bytes=file_bytes)
+            parsed_doc = _merge_recovered_pdf_text(parsed_doc, recovered_pages, recovery_debug)
+
+        # Even when the primary parser found some text, add page-level recovered text if available.
+        # This gives hybrid extractors better page references and candidate windows.
+        elif is_pdf and not parsed_doc.get("pages") and not parsed_doc.get("page_texts"):
+            recovered_pages, recovery_debug = recover_pdf_text_pages(uploaded_file, file_bytes=file_bytes)
+            if recovered_pages:
+                parsed_doc["pages"] = recovered_pages
+                parsed_doc["page_texts"] = recovered_pages
+                parsed_doc["pdf_recovery_debug"] = recovery_debug
 
         detected_type = classify_document_from_text(
-            file_name=uploaded_file.name,
+            file_name=getattr(uploaded_file, "name", parsed_doc.get("file_name", "")),
             parsed_text=parsed_doc.get("text", ""),
             tables=parsed_doc.get("tables", []),
         )
 
         parsed_doc["detected_document_type"] = detected_type
-        parsed_doc["filename_guess_document_type"] = classify_uploaded_file(uploaded_file.name)
+        parsed_doc["filename_guess_document_type"] = classify_uploaded_file(getattr(uploaded_file, "name", ""))
         parsed_docs.append(parsed_doc)
 
     return parsed_docs
@@ -423,6 +641,8 @@ def uploaded_summary_table(parsed_docs):
                 "Filename Guess": doc.get("filename_guess_document_type"),
                 "Detected Document Type": doc.get("detected_document_type"),
                 "Parsed Text Length": len(doc.get("text", "")),
+                "Pages Recovered": (doc.get("pdf_recovery_debug", {}) or {}).get("recovered_pages", len(doc.get("pages", []) or doc.get("page_texts", []) or [])),
+                "PDF Recovery Method": (doc.get("pdf_recovery_debug", {}) or {}).get("recovery_method", ""),
                 "Tables Detected": len(doc.get("tables", [])),
             }
             for doc in parsed_docs or []
