@@ -3113,6 +3113,45 @@ def get_default_scorecard_inputs():
 def render_scorecard_results(results: dict):
     st.success("Scorecard calculated.")
 
+    required_fields_for_quality = [
+        "median_household_ebi_percent_of_us",
+        "unemployment_rate_difference_vs_us",
+        "msa_participation",
+        "real_estate_market_volatility",
+        "population_growth_difference_vs_us",
+        "top10_taxpayers_percent_of_total_levy",
+        "largest_taxpayer_percent_of_total_levy",
+        "district_size_parcels",
+        "conveyance_to_homeowners",
+        "est_value_to_lien",
+        "maximum_loss_to_maturity_percent",
+    ]
+    quality = None
+    try:
+        records = [_get_input_record(k) for k in required_fields_for_quality]
+        found = [r for r in records if not is_missing_master_value(r.get("value"))]
+        verified = [r for r in found if r.get("bucket") == "source_verified"]
+        ai_est = [r for r in found if r.get("bucket") == "ai_inferred"]
+        sector = [r for r in found if r.get("bucket") == "sector_median"]
+        missing = [r for r in records if is_missing_master_value(r.get("value"))]
+        total = len(records) or 1
+        quality_pct = round((len(verified) * 1.0 + len(ai_est) * 0.6 + len(sector) * 0.3) / total * 100)
+        quality = {"verified": len(verified), "ai": len(ai_est), "sector": len(sector), "missing": len(missing), "quality_pct": quality_pct, "found": len(found), "total": total}
+    except Exception:
+        quality = None
+
+    if quality:
+        st.markdown("### Data Quality Summary")
+        st.progress(quality["found"] / quality["total"], text=f"{quality['found']} / {quality['total']} required inputs populated · overall data confidence {quality['quality_pct']}%")
+        q1, q2, q3, q4, q5 = st.columns(5)
+        q1.metric("Source Verified", quality["verified"])
+        q2.metric("AI Estimated", quality["ai"])
+        q3.metric("Sector Median", quality["sector"])
+        q4.metric("Missing", quality["missing"])
+        q5.metric("Data Confidence", f"{quality['quality_pct']}%")
+        if quality["missing"] or quality["ai"] or quality["sector"]:
+            st.warning("Indicative rating is provisional because some inputs are missing, AI-estimated, or benchmark-based. Verify source documents before treating the output as final.")
+
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Economic", results.get("economic_fundamentals_assessment"))
     c2.metric("District", results.get("district_characteristics_assessment"))
@@ -4044,81 +4083,284 @@ def approve_fallback_value(scorecard_key, value, status, source_method, confiden
     )
 
 
-def render_tiered_fallback_for_field(scorecard_key, label=None, key_prefix="fallback"):
+
+
+def _provenance_bucket_from_status(status):
+    status_l = str(status or "").lower()
+    if any(x in status_l for x in ["source verified", "verified", "auto pulled", "ai extracted", "manual input"]):
+        return "source_verified"
+    if "ai inferred" in status_l or "rule" in status_l or "needs_review" in status_l:
+        return "ai_inferred"
+    if "sector median" in status_l or "benchmark" in status_l or "default" in status_l:
+        return "sector_median"
+    return "missing"
+
+
+def _format_confidence_pct(confidence):
+    if confidence is None or confidence == "":
+        return ""
+    try:
+        c = float(confidence)
+        if c <= 1:
+            c *= 100
+        return f"{c:.0f}%"
+    except Exception:
+        return str(confidence)
+
+
+def _get_input_record(scorecard_key):
+    value = get_master_value(scorecard_key)
+    meta = (st.session_state.get("approved_input_metadata", {}) or {}).get(scorecard_key, {}) or {}
+    status = meta.get("status", "Missing") if not is_missing_master_value(value) else "Missing"
+    source_method = meta.get("source_method", "")
+    source_document = meta.get("source_document", "")
+    confidence = meta.get("confidence", None)
+    return {
+        "key": scorecard_key,
+        "label": FALLBACK_FIELD_LABELS.get(scorecard_key, scorecard_key),
+        "value": value,
+        "status": status,
+        "source_method": source_method,
+        "source_document": source_document,
+        "confidence": confidence,
+        "bucket": _provenance_bucket_from_status(status),
+        "notes": meta.get("notes", ""),
+        "timestamp": meta.get("review_timestamp", ""),
+    }
+
+
+def _render_source_link_or_text(source_document):
+    if not source_document:
+        st.caption("Source: not recorded")
+        return
+    src = str(source_document)
+    if src.startswith("http://") or src.startswith("https://"):
+        st.markdown(f"Source: [Open source link]({src})")
+    else:
+        st.caption(f"Source: {src}")
+
+
+def render_approved_input_summary_card(record, key_prefix="approved_card"):
+    """P1: once a field has an approved/current value, show only the chosen value.
+    Alternatives are hidden by default so analysts do not confuse real/current values with fallback choices.
+    """
+    value = record.get("value")
+    status = record.get("status")
+    bucket = record.get("bucket")
+    confidence = _format_confidence_pct(record.get("confidence"))
+
+    if bucket == "source_verified":
+        st.success(f"✅ Current approved value: **{value}** — {status}.")
+    elif bucket == "ai_inferred":
+        st.warning(f"⚠ Current approved value: **{value}** — {status}. This is not source-verified.")
+    elif bucket == "sector_median":
+        st.info(f"⚪ Current approved value: **{value}** — {status}. Benchmark placeholder only.")
+    else:
+        st.info(f"Current value: **{value}** — {status}.")
+
+    cols = st.columns(3)
+    cols[0].metric("Value", value)
+    cols[1].metric("Status", status)
+    cols[2].metric("Confidence", confidence or "Not recorded")
+    if record.get("source_method"):
+        st.caption(f"Method: {record.get('source_method')}")
+    _render_source_link_or_text(record.get("source_document"))
+    if record.get("notes"):
+        with st.expander("Review notes", expanded=False):
+            st.write(record.get("notes"))
+
+
+def render_fallback_options_for_field(scorecard_key, label=None, key_prefix="fallback"):
+    """Show fallback choices only for missing fields, or under an explicit alternatives expander."""
     label = label or FALLBACK_FIELD_LABELS.get(scorecard_key, scorecard_key)
     deal_setup = st.session_state.get("deal_setup", {}) or {}
-    current_value = get_master_value(scorecard_key)
-    current_status = get_master_status(scorecard_key)
-
-    st.markdown(f"#### {label}")
-    st.caption("Fallback order: Tier 1 source-verified data → Tier 2 AI/rule-based inference → Tier 3 sector median benchmark.")
-
-    if not is_missing_master_value(current_value):
-        st.success(f"Tier 1 / current approved value: {current_value} ({current_status}).")
-    else:
-        st.info("No source-verified approved value is currently available for this field.")
 
     tier2 = infer_scorecard_value_from_context(scorecard_key, deal_setup)
     tier3_value = get_sector_median_value(scorecard_key, deal_setup.get("bond_type", "Special Assessment Debt"))
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns([1.1, 1.1, 0.9])
     with c1:
-        st.warning(
-            "Tier 2 — AI / rule-based inference. Use only after checking available sources; this is not source-verified."
-        )
+        st.warning("Tier 2 — AI / rule-based estimate. Requires analyst review; not source-verified.")
         if tier2.get("value") is not None:
-            st.metric("AI Inferred Value", tier2.get("value"))
+            st.metric("AI Estimated Value", tier2.get("value"))
             st.caption(f"Confidence: {tier2.get('confidence', 0) * 100:.0f}%")
             st.caption(tier2.get("rationale", ""))
-            if st.button(f"Approve Tier 2 AI Inference — {label}", key=f"{key_prefix}_approve_tier2_{scorecard_key}"):
+            if st.button(f"Approve Tier 2 Estimate", key=f"{key_prefix}_approve_tier2_{scorecard_key}"):
                 approve_fallback_value(
                     scorecard_key=scorecard_key,
                     value=tier2.get("value"),
                     status="AI Inferred",
                     source_method="AI / Rule-Based Inference",
                     confidence=tier2.get("confidence", 0.55),
-                    notes="Tier 2 fallback approved by analyst. Warning: not source-verified; double-check assumptions and sources.",
+                    notes=f"Tier 2 fallback approved for {label}. Warning: not source-verified; double-check assumptions and sources.",
                 )
-                st.success("Tier 2 inferred value approved into master scorecard inputs.")
+                st.success("Tier 2 estimate approved into master scorecard inputs.")
                 rerun_after_approve()
         else:
             st.caption("No Tier 2 inference available for this field.")
 
     with c2:
-        st.info(
-            "Tier 3 — sector median / benchmark fallback. Lowest confidence; useful only to keep the workflow moving."
-        )
+        st.info("Tier 3 — sector median / benchmark. Lowest confidence; use only to keep workflow moving.")
         if tier3_value is not None:
             st.metric("Sector Median / Benchmark", tier3_value)
             st.caption("Confidence: 30%")
-            st.caption("Use when deal-specific data is unavailable and the analyst wants a conservative placeholder.")
-            if st.button(f"Approve Tier 3 Sector Median — {label}", key=f"{key_prefix}_approve_tier3_{scorecard_key}"):
+            st.caption("Conservative placeholder when deal-specific data is unavailable.")
+            if st.button(f"Approve Tier 3 Benchmark", key=f"{key_prefix}_approve_tier3_{scorecard_key}"):
                 approve_fallback_value(
                     scorecard_key=scorecard_key,
                     value=tier3_value,
                     status="Sector Median",
                     source_method="Sector Median Benchmark",
                     confidence=0.30,
-                    notes="Tier 3 fallback approved by analyst. Warning: benchmark placeholder, not deal-specific source data.",
+                    notes=f"Tier 3 fallback approved for {label}. Warning: benchmark placeholder, not deal-specific source data.",
                 )
-                st.success("Tier 3 benchmark value approved into master scorecard inputs.")
+                st.success("Tier 3 benchmark approved into master scorecard inputs.")
                 rerun_after_approve()
         else:
             st.caption("No sector median benchmark configured for this field.")
 
+    with c3:
+        st.markdown("##### Manual Input")
+        st.caption("Best when the analyst has verified OS / Excel values outside the parser.")
+        manual_value = st.text_input("Verified manual value", key=f"{key_prefix}_manual_value_{scorecard_key}")
+        manual_source = st.text_input("Source / page / URL", key=f"{key_prefix}_manual_source_{scorecard_key}")
+        if st.button("Approve Manual Value", key=f"{key_prefix}_approve_manual_{scorecard_key}"):
+            if str(manual_value).strip():
+                safe_add_approved_input(
+                    scorecard_key=scorecard_key,
+                    value=parse_numeric_input(manual_value) if any(ch.isdigit() for ch in str(manual_value)) else manual_value,
+                    status="Manual Input",
+                    source_method="Analyst Manual Entry",
+                    source_document=manual_source,
+                    confidence=1.0,
+                    notes=f"Manual value approved for {label}. Analyst should retain supporting source evidence.",
+                )
+                st.success("Manual value approved into master scorecard inputs.")
+                rerun_after_approve()
+            else:
+                st.error("Enter a manual value before approving.")
+
+
+def render_tiered_fallback_for_field(scorecard_key, label=None, key_prefix="fallback"):
+    """Compatibility wrapper. New behavior: if approved exists, hide alternatives by default."""
+    label = label or FALLBACK_FIELD_LABELS.get(scorecard_key, scorecard_key)
+    record = _get_input_record(scorecard_key)
+    st.markdown(f"#### {label}")
+
+    if not is_missing_master_value(record.get("value")):
+        render_approved_input_summary_card(record, key_prefix=f"{key_prefix}_{scorecard_key}")
+        with st.expander("Show alternative estimates / replace current value", expanded=False):
+            st.warning("Only replace an approved value if you have checked source quality. This section is hidden by default to avoid mixing real/current values with fallbacks.")
+            render_fallback_options_for_field(scorecard_key, label=label, key_prefix=f"{key_prefix}_alt")
+    else:
+        st.error("Missing — no approved source-verified value is currently available.")
+        render_fallback_options_for_field(scorecard_key, label=label, key_prefix=key_prefix)
+
+
+def render_data_quality_summary(fields, key_prefix="data_quality"):
+    records = [_get_input_record(k) for k in fields]
+    found = [r for r in records if not is_missing_master_value(r.get("value"))]
+    source_verified = [r for r in found if r["bucket"] == "source_verified"]
+    ai_inferred = [r for r in found if r["bucket"] == "ai_inferred"]
+    sector_median = [r for r in found if r["bucket"] == "sector_median"]
+    missing = [r for r in records if is_missing_master_value(r.get("value"))]
+
+    total = len(records) or 1
+    # Quality-weighted confidence: verified/manual=1.0, AI inferred=0.6, sector=0.3, missing=0.
+    quality_score = (len(source_verified) * 1.0 + len(ai_inferred) * 0.6 + len(sector_median) * 0.3) / total
+    overall_pct = round(quality_score * 100)
+    acquisition_pct = round(len(found) / total * 100)
+
+    st.markdown("### Data Acquisition Summary")
+    st.progress(len(found) / total, text=f"{len(found)} / {total} required inputs populated · acquisition progress {acquisition_pct}%")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Source Verified", len(source_verified))
+    c2.metric("AI Estimated", len(ai_inferred))
+    c3.metric("Sector Median", len(sector_median))
+    c4.metric("Missing", len(missing))
+    c5.metric("Data Confidence", f"{overall_pct}%")
+
+    if sector_median or ai_inferred:
+        st.warning("Some populated inputs are estimates or benchmarks. Final score/rating should be treated as provisional until source-verified.")
+    if missing:
+        st.error("Some required inputs are still missing. Use source scan, upload mapping, manual entry, or an explicitly marked fallback.")
+
+    with st.expander("Source-verified / current approved inputs", expanded=True):
+        if not found:
+            st.info("No approved inputs yet.")
+        else:
+            rows = []
+            for r in found:
+                rows.append({
+                    "Field": r["label"],
+                    "Value": r["value"],
+                    "Status": r["status"],
+                    "Method": r["source_method"],
+                    "Confidence": _format_confidence_pct(r["confidence"]),
+                    "Source": r["source_document"],
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    if missing:
+        with st.expander("Missing inputs and available fallback actions", expanded=True):
+            for r in missing:
+                st.markdown(f"#### ❌ {r['label']}")
+                st.caption("No approved value found. Choose one fallback path only if source-verified data is unavailable.")
+                render_fallback_options_for_field(r["key"], label=r["label"], key_prefix=f"{key_prefix}_missing")
+                st.markdown("---")
+
+    if found:
+        with st.expander("Alternative estimates / replace approved values", expanded=False):
+            st.warning("Hidden by default: use only if you need to replace a current approved value.")
+            for r in found:
+                st.markdown(f"#### {r['label']}")
+                render_approved_input_summary_card(r, key_prefix=f"{key_prefix}_approved")
+                with st.expander(f"Replace / show alternatives for {r['label']}", expanded=False):
+                    render_fallback_options_for_field(r["key"], label=r["label"], key_prefix=f"{key_prefix}_replace")
+                st.markdown("---")
+
+    with st.expander("Audit trail", expanded=False):
+        meta = st.session_state.get("approved_input_metadata", {}) or {}
+        rows = []
+        for k, m in meta.items():
+            rows.append({
+                "Field": FALLBACK_FIELD_LABELS.get(k, k),
+                "Value": (st.session_state.get("approved_inputs", {}) or {}).get(k),
+                "Status": m.get("status"),
+                "Method": m.get("source_method"),
+                "Confidence": _format_confidence_pct(m.get("confidence")),
+                "Source": m.get("source_document"),
+                "Reviewed By": m.get("reviewed_by"),
+                "Time": m.get("review_timestamp"),
+                "Notes": m.get("notes"),
+            })
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        else:
+            st.info("No approved input audit trail yet.")
+
+    return {
+        "source_verified": len(source_verified),
+        "ai_inferred": len(ai_inferred),
+        "sector_median": len(sector_median),
+        "missing": len(missing),
+        "data_confidence_pct": overall_pct,
+        "acquisition_progress_pct": acquisition_pct,
+    }
+
 
 def render_tiered_missing_data_fallback_center(fields, key_prefix="fallback_center"):
-    with st.expander("Tiered Missing-Data Fallback Center", expanded=False):
-        st.warning(
-            "Use this only when source-verified data is unavailable. Tier 2 and Tier 3 values are flagged, lower-confidence assumptions and should be double-checked before use."
-        )
-        for field_key in fields:
-            render_tiered_fallback_for_field(
-                field_key,
-                label=FALLBACK_FIELD_LABELS.get(field_key, field_key),
-                key_prefix=key_prefix,
-            )
-            st.markdown("---")
+    """P1-P3 redesigned page.
+    Old 'Tiered Missing-Data Fallback Center' is now a Data Acquisition Summary:
+    - Approved values are shown cleanly.
+    - Missing values reveal AI/sector/manual fallback actions.
+    - Alternatives are hidden once a field is populated.
+    - Audit trail + data-quality metrics are available.
+    """
+    with st.expander("Data Acquisition Summary", expanded=False):
+        st.info("This panel separates source-verified/current values from AI estimates and sector benchmarks. Approved values are shown first; fallback options appear only for missing fields or inside replacement expanders.")
+        return render_data_quality_summary(fields, key_prefix=key_prefix)
 
 # =============================================================================
 # Sidebar
