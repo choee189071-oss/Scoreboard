@@ -151,6 +151,7 @@ def _read_pdf_full(uploaded_file) -> Dict[str, Any]:
         "text": full_text,
         "pages": pages,
         "tables": tables,
+        "raw_bytes": raw_bytes,
         "warnings": warnings,
         "file_type": "pdf",
         "page_count": len(pages),
