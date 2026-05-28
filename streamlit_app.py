@@ -4291,67 +4291,82 @@ with tab_calcs:
             st.warning("Auto context completed. No documents uploaded, so document extraction was skipped.")
 
     st.markdown("---")
-    st.subheader("B. Credit Metric Resolution & Analytical Engines")
-    st.caption("Use safe semi-auto tools, AI/table extraction, fallback uploads, and calculators to resolve missing credit metrics. Every AI/inferred value remains reviewable before it enters the scorecard.")
-    resolver_tab1, resolver_tab2, resolver_tab3 = st.tabs(["Economic / Local Market", "Assessed Value / Tax Base", "Housing Proxy"] )
-    with resolver_tab1:
-        render_local_unemployment_resolver(deal_setup, key_prefix="data_workspace")
-    with resolver_tab2:
-        render_assessed_value_upload_parser(key_prefix="data_workspace")
-    with resolver_tab3:
-        render_housing_market_proxy_resolver(key_prefix="data_workspace")
-
-    st.markdown("#### Economic Fundamentals Auto-Fill")
+    st.subheader("B. Unified Credit Inputs & Analytical Workspace")
     st.caption(
-        "Population Growth is pulled from Census ACS; MSA Participation and Real Estate Market Volatility are reviewable candidates. "
-        "Approve candidates in Reliability Review before they enter the final scorecard."
+        "All data resolvers and analytical engines now live in one tab group: market context, tax base, concentration, leverage, and cashflow stress. "
+        "Flow: source/AI/table extraction → analyst review/approve → calculator or scorecard sync."
     )
-    if st.button("Run Economic Fundamentals Engines", key="run_economic_fundamentals_engines"):
-        results = run_economic_fundamentals_engines(
-            deal_setup,
-            census_api_key=census_api_key or default_census_key or None,
-            key_prefix="data_workspace",
-        )
-        st.success("Economic fundamentals engines completed. Review candidate fields in Reliability Review.")
-        st.json(results)
-
-    if st.session_state.get("auto_data_results"):
-        st.subheader("Auto Context Results")
-        auto_context_df = auto_data_results_to_dataframe(st.session_state["auto_data_results"])
-        auto_context_df = auto_context_df.fillna("").replace({None: "", "None": "", "nan": "", "NaN": ""})
-        st.dataframe(auto_context_df, use_container_width=True)
-
-    if st.session_state.get("parsed_documents"):
-        st.subheader("Parsed Document Preview")
-        for doc in st.session_state.get("parsed_documents", []):
-            title = f"{doc.get('file_name')} — {doc.get('detected_document_type', 'Unclassified')}"
-            with st.expander(title, expanded=False):
-                if doc.get("warnings"):
-                    for warning in doc.get("warnings"):
-                        st.warning(warning)
-                st.text_area("Parsed Text Preview", doc.get("text", "")[:5000], height=220)
-                for table in doc.get("tables", []):
-                    st.write(table.get("table_name"))
-                    st.dataframe(pd.DataFrame(table.get("preview", [])), use_container_width=True)
-
-
-
-
-    st.markdown("---")
-    st.markdown("### District & Structural Analytical Engines")
-    st.caption("These calculators now live inside the same credit-metric workflow as the resolvers above: extract or source data → approve/pre-fill → calculate → sync to scorecard.")
-
     st.info(
-        "Recommended flow: AI/Public Source Scout or Upload Mapping → Analyst Review/Approve → Run Calculator → Review in Scorecard/Reliability Review."
+        "Recommended flow: Pull/source data → verify source links and evidence → approve/pre-fill → run calculator → review in Scorecard/Reliability Review."
     )
 
-    calc_tab1, calc_tab2, calc_tab3 = st.tabs(
+    (
+        unified_tab_market,
+        unified_tab_assessed,
+        unified_tab_housing,
+        unified_tab_taxbase,
+        unified_tab_leverage,
+        unified_tab_cashflow,
+    ) = st.tabs(
         [
+            "Market & Economic Context",
+            "Assessed Value / Tax Base",
+            "Housing Proxy",
             "Tax Base & Concentration",
             "Leverage & Value-to-Lien",
             "Cashflow & MLTM Stress",
         ]
     )
+
+    with unified_tab_market:
+        st.subheader("Market & Economic Context")
+        render_local_unemployment_resolver(deal_setup, key_prefix="data_workspace")
+
+        st.markdown("#### Economic Fundamentals Auto-Fill")
+        st.caption(
+            "Population Growth is pulled from Census ACS; MSA Participation is generated as a reviewable inference. "
+            "Approve candidates in Reliability Review before they enter the final scorecard."
+        )
+        if st.button("Run Economic Fundamentals Engines", key="run_economic_fundamentals_engines"):
+            results = run_economic_fundamentals_engines(
+                deal_setup,
+                census_api_key=census_api_key or default_census_key or None,
+                key_prefix="data_workspace",
+            )
+            st.success("Economic fundamentals engines completed. Review candidate fields in Reliability Review.")
+            st.json(results)
+
+        if st.session_state.get("auto_data_results"):
+            st.subheader("Auto Context Results")
+            auto_context_df = auto_data_results_to_dataframe(st.session_state["auto_data_results"])
+            auto_context_df = auto_context_df.fillna("").replace({None: "", "None": "", "nan": "", "NaN": ""})
+            st.dataframe(auto_context_df, use_container_width=True)
+
+        if st.session_state.get("parsed_documents"):
+            st.subheader("Parsed Document Preview")
+            for doc in st.session_state.get("parsed_documents", []):
+                title = f"{doc.get('file_name')} — {doc.get('detected_document_type', 'Unclassified')}"
+                with st.expander(title, expanded=False):
+                    if doc.get("warnings"):
+                        for warning in doc.get("warnings"):
+                            st.warning(warning)
+                    st.text_area("Parsed Text Preview", doc.get("text", "")[:5000], height=220, key=f"market_preview_{doc.get('file_name')}")
+                    for table in doc.get("tables", []):
+                        st.write(table.get("table_name"))
+                        st.dataframe(pd.DataFrame(table.get("preview", [])), use_container_width=True)
+
+    with unified_tab_assessed:
+        st.subheader("Assessed Value / Tax Base Resolver")
+        render_assessed_value_upload_parser(key_prefix="data_workspace")
+
+    with unified_tab_housing:
+        st.subheader("Housing Market Trend / Distress Proxy")
+        render_housing_market_proxy_resolver(key_prefix="data_workspace")
+
+    # The last three unified tabs are the analytical engines.
+    calc_tab1 = unified_tab_taxbase
+    calc_tab2 = unified_tab_leverage
+    calc_tab3 = unified_tab_cashflow
 
     with calc_tab1:
         st.subheader("Taxpayer Concentration Builder")
