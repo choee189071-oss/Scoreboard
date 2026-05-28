@@ -443,6 +443,211 @@ def display_value(value):
     return value
 
 
+def is_missing_master_value(value):
+    """True when a master scorecard value should be treated as missing."""
+    if value is None:
+        return True
+
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+
+    if isinstance(value, str) and value.strip().lower() in ["", "none", "nan", "null", "n/a", "missing"]:
+        return True
+
+    return False
+
+
+def get_master_value(scorecard_key, fallback=None):
+    """
+    Single source of truth reader.
+
+    Priority:
+    1. approved_inputs value if present
+    2. fallback only if explicitly supplied
+
+    This prevents old static defaults from appearing as if they were approved data.
+    """
+    approved = st.session_state.get("approved_inputs", {}) or {}
+
+    if scorecard_key in approved and not is_missing_master_value(approved.get(scorecard_key)):
+        return approved.get(scorecard_key)
+
+    return fallback
+
+
+def get_master_status(scorecard_key):
+    meta = st.session_state.get("approved_input_metadata", {}) or {}
+    return (meta.get(scorecard_key, {}) or {}).get("status", "Missing")
+
+
+def set_manual_override(scorecard_key, value, source_method="Scorecard Manual Override"):
+    """
+    Manual override has highest priority.
+    It writes to approved_inputs and marks metadata as Manual Input.
+    """
+    add_approved_input(
+        scorecard_key=scorecard_key,
+        value=value,
+        status="Manual Input",
+        source_method=source_method,
+        confidence=1.0,
+        notes="Manual override from scorecard input.",
+    )
+
+
+def can_auto_update_scorecard_key(scorecard_key):
+    """
+    Prevent AI/API/calculator from overwriting analyst manual overrides.
+    """
+    return get_master_status(scorecard_key) != "Manual Input"
+
+
+def safe_add_approved_input(
+    scorecard_key,
+    value,
+    status,
+    source_method,
+    source_document=None,
+    confidence=None,
+    notes=None,
+):
+    """
+    Writes approved values unless analyst has manually overridden that field.
+    """
+    if not can_auto_update_scorecard_key(scorecard_key):
+        return
+
+    add_approved_input(
+        scorecard_key=scorecard_key,
+        value=value,
+        status=status,
+        source_method=source_method,
+        source_document=source_document,
+        confidence=confidence,
+        notes=notes,
+    )
+
+
+def nullable_number_input(label, scorecard_key, default=None, step=0.1, min_value=None, max_value=None, integer=False):
+    """
+    Scorecard input that respects missing data.
+
+    Missing means blank text input, not fake default.
+    If analyst enters a value, it becomes Manual Input and overrides future AI/API pulls.
+    """
+    current_value = get_master_value(scorecard_key, fallback=None)
+
+    if is_missing_master_value(current_value):
+        current_text = ""
+    else:
+        if integer:
+            try:
+                current_text = str(int(parse_numeric_input(current_value, default or 0)))
+            except Exception:
+                current_text = str(current_value)
+        else:
+            current_text = str(current_value)
+
+    raw_value = st.text_input(
+        label,
+        value=current_text,
+        placeholder="Missing data",
+        key=f"scorecard_input_{scorecard_key}",
+    )
+
+    if raw_value.strip() == "":
+        return None
+
+    parsed = parse_numeric_input(raw_value, default if default is not None else 0.0)
+
+    if min_value is not None and parsed < min_value:
+        st.warning(f"{label} is below minimum value {min_value}.")
+    if max_value is not None and parsed > max_value:
+        st.warning(f"{label} is above maximum value {max_value}.")
+
+    value_to_store = int(parsed) if integer else parsed
+
+    # If user edited the input, treat it as manual override.
+    # This gives the analyst-controlled value priority over future AI/API values.
+    if str(raw_value).strip() != str(current_text).strip():
+        set_manual_override(scorecard_key, value_to_store)
+
+    return value_to_store
+
+
+def nullable_selectbox(label, scorecard_key, options):
+    """
+    Selectbox that shows blank when missing and writes user selections as Manual Input.
+    """
+    current_value = get_master_value(scorecard_key, fallback=None)
+    full_options = [""] + options
+
+    if is_missing_master_value(current_value):
+        index = 0
+    elif current_value in full_options:
+        index = full_options.index(current_value)
+    else:
+        index = 0
+
+    selected = st.selectbox(
+        label,
+        full_options,
+        index=index,
+        format_func=lambda x: "Missing data" if x == "" else x,
+        key=f"scorecard_select_{scorecard_key}",
+    )
+
+    if selected == "":
+        return None
+
+    if selected != current_value:
+        set_manual_override(scorecard_key, selected)
+
+    return selected
+
+
+def fill_missing_scorecard_defaults_for_calculation(inputs):
+    """
+    Reliability-aware scoring fallback.
+
+    The UI stays blank for missing values.
+    Only at calculation time do we apply conservative/benchmark defaults
+    so the scoring function does not crash.
+    """
+    fallback_values = {
+        "median_household_ebi_percent_of_us": 100.0,
+        "unemployment_rate_difference_vs_us": 0.0,
+        "msa_participation": "Yes; Not Broad & Diverse",
+        "real_estate_market_volatility": "Elevated Volatility; Stable Prices; Affordability Worse Than National Figures",
+        "population_growth_difference_vs_us": 0.0,
+        "top10_taxpayers_percent_of_total_levy": 25.0,
+        "largest_taxpayer_percent_of_total_levy": 8.0,
+        "district_size_parcels": 400,
+        "conveyance_to_homeowners": "Fairly Developed with Significant Conveyance (Some Developer Concentration)",
+        "est_value_to_lien": 10.0,
+        "maximum_loss_to_maturity_percent": 20.0,
+        "negative_override_notches": 0,
+        "holistic_adjustment_notches": 0,
+        "rating_cap": "None",
+    }
+
+    filled = {}
+    missing_used = []
+
+    for key, fallback in fallback_values.items():
+        value = inputs.get(key)
+        if is_missing_master_value(value):
+            filled[key] = fallback
+            missing_used.append(key)
+        else:
+            filled[key] = value
+
+    return filled, missing_used
+
+
 
 
 def add_approved_input(
@@ -471,7 +676,7 @@ def add_approved_input(
 
 def merge_approved_inputs(new_inputs: dict, status="Auto Pulled", source_method="Auto Data Connector"):
     for key, value in (new_inputs or {}).items():
-        add_approved_input(
+        safe_add_approved_input(
             scorecard_key=key,
             value=value,
             status=status,
@@ -678,7 +883,7 @@ def render_data_reliability_cards(matrix_df):
 
 
 def approve_candidate_to_scorecard(candidate, status="AI Extracted"):
-    add_approved_input(
+    safe_add_approved_input(
         scorecard_key=candidate.get("scorecard_key"),
         value=candidate.get("value"),
         status=status,
@@ -690,29 +895,26 @@ def approve_candidate_to_scorecard(candidate, status="AI Extracted"):
 
 
 def get_default_scorecard_inputs():
-    approved = st.session_state.get("approved_inputs", {}) or {}
-
+    """
+    Single source of truth.
+    No stale demo defaults are injected here.
+    Missing values stay None and render blank in the Scorecard UI.
+    """
     return {
-        "median_household_ebi_percent_of_us": approved.get("median_household_ebi_percent_of_us", 144.0),
-        "unemployment_rate_difference_vs_us": approved.get("unemployment_rate_difference_vs_us", -0.3),
-        "msa_participation": approved.get("msa_participation", "Yes; Broad & Diverse"),
-        "real_estate_market_volatility": approved.get(
-            "real_estate_market_volatility",
-            "Low Volatility; Stable Prices; Low Distress",
-        ),
-        "population_growth_difference_vs_us": approved.get("population_growth_difference_vs_us", 0.5),
-        "top10_taxpayers_percent_of_total_levy": approved.get("top10_taxpayers_percent_of_total_levy", 16.1),
-        "largest_taxpayer_percent_of_total_levy": approved.get("largest_taxpayer_percent_of_total_levy", 6.1),
-        "district_size_parcels": approved.get("district_size_parcels", 5900),
-        "conveyance_to_homeowners": approved.get(
-            "conveyance_to_homeowners",
-            "Fairly Developed with Significant Conveyance (Some Developer Concentration)",
-        ),
-        "est_value_to_lien": approved.get("est_value_to_lien", 15.5),
-        "maximum_loss_to_maturity_percent": approved.get("maximum_loss_to_maturity_percent", 13.9),
-        "negative_override_notches": approved.get("negative_override_notches", 0),
-        "holistic_adjustment_notches": approved.get("holistic_adjustment_notches", 0),
-        "rating_cap": approved.get("rating_cap", "None"),
+        "median_household_ebi_percent_of_us": get_master_value("median_household_ebi_percent_of_us"),
+        "unemployment_rate_difference_vs_us": get_master_value("unemployment_rate_difference_vs_us"),
+        "msa_participation": get_master_value("msa_participation"),
+        "real_estate_market_volatility": get_master_value("real_estate_market_volatility"),
+        "population_growth_difference_vs_us": get_master_value("population_growth_difference_vs_us"),
+        "top10_taxpayers_percent_of_total_levy": get_master_value("top10_taxpayers_percent_of_total_levy"),
+        "largest_taxpayer_percent_of_total_levy": get_master_value("largest_taxpayer_percent_of_total_levy"),
+        "district_size_parcels": get_master_value("district_size_parcels"),
+        "conveyance_to_homeowners": get_master_value("conveyance_to_homeowners"),
+        "est_value_to_lien": get_master_value("est_value_to_lien"),
+        "maximum_loss_to_maturity_percent": get_master_value("maximum_loss_to_maturity_percent"),
+        "negative_override_notches": get_master_value("negative_override_notches", 0),
+        "holistic_adjustment_notches": get_master_value("holistic_adjustment_notches", 0),
+        "rating_cap": get_master_value("rating_cap", "None"),
     }
 
 
@@ -1121,35 +1323,43 @@ with tab_scorecard:
     st.header("Special Assessment Debt Scorecard")
 
     defaults_for_scorecard = get_default_scorecard_inputs()
-    st.info("Values below may be prefilled from approved Reliability Review inputs. You can still manually override them.")
+    st.info(
+        "This page reads from the approved master scorecard data. Missing values stay blank. "
+        "Manual edits here become Manual Input and will not be overwritten by later AI/API pulls."
+    )
 
     with st.expander("A. Economic Fundamentals Assessment", expanded=True):
         col1, col2 = st.columns(2)
 
         with col1:
-            median_household_ebi_percent_of_us = st.number_input(
+            median_household_ebi_percent_of_us = nullable_number_input(
                 "Median Household EBI (% of U.S.)",
+                "median_household_ebi_percent_of_us",
+                default=100.0,
+                step=1.0,
                 min_value=0.0,
                 max_value=500.0,
-                value=parse_numeric_input(defaults_for_scorecard["median_household_ebi_percent_of_us"], 144.0),
-                step=1.0,
             )
-            unemployment_rate_difference_vs_us = st.number_input(
+            unemployment_rate_difference_vs_us = nullable_number_input(
                 "Unemployment Rate Difference vs U.S. (%)",
-                value=parse_numeric_input(defaults_for_scorecard["unemployment_rate_difference_vs_us"], -0.3),
+                "unemployment_rate_difference_vs_us",
+                default=0.0,
                 step=0.1,
             )
-            population_growth_difference_vs_us = st.number_input(
+            population_growth_difference_vs_us = nullable_number_input(
                 "Population Growth Difference vs U.S. (%)",
-                value=parse_numeric_input(defaults_for_scorecard["population_growth_difference_vs_us"], 0.5),
+                "population_growth_difference_vs_us",
+                default=0.0,
                 step=0.1,
             )
 
         with col2:
             msa_options = ["Yes; Broad & Diverse", "Yes; Not Broad & Diverse", "No"]
-            msa_default = defaults_for_scorecard.get("msa_participation", msa_options[0])
-            msa_index = msa_options.index(msa_default) if msa_default in msa_options else 0
-            msa_participation = st.selectbox("MSA Participation", msa_options, index=msa_index)
+            msa_participation = nullable_selectbox(
+                "MSA Participation",
+                "msa_participation",
+                msa_options,
+            )
 
             re_options = [
                 "Low Volatility; Stable Prices; Low Distress",
@@ -1157,33 +1367,39 @@ with tab_scorecard:
                 "Falling Local Home Prices; High Price Volatility; Low Affordability; Rising Distress",
                 "Falling Local Home Prices; High Price Volatility; Significantly Worse Affordability; Rising Distress",
             ]
-            re_default = defaults_for_scorecard.get("real_estate_market_volatility", re_options[0])
-            re_index = re_options.index(re_default) if re_default in re_options else 0
-            real_estate_market_volatility = st.selectbox("Real Estate Market Volatility", re_options, index=re_index)
+            real_estate_market_volatility = nullable_selectbox(
+                "Real Estate Market Volatility",
+                "real_estate_market_volatility",
+                re_options,
+            )
 
     with st.expander("B. District Characteristics Assessment", expanded=True):
         col3, col4 = st.columns(2)
 
         with col3:
-            top10_taxpayers_percent_of_total_levy = st.number_input(
+            top10_taxpayers_percent_of_total_levy = nullable_number_input(
                 "Top 10 Taxpayers as % of Total Levy",
+                "top10_taxpayers_percent_of_total_levy",
+                default=25.0,
+                step=0.1,
                 min_value=0.0,
                 max_value=100.0,
-                value=parse_numeric_input(defaults_for_scorecard["top10_taxpayers_percent_of_total_levy"], 16.1),
-                step=0.1,
             )
-            largest_taxpayer_percent_of_total_levy = st.number_input(
+            largest_taxpayer_percent_of_total_levy = nullable_number_input(
                 "Largest Taxpayer as % of Total Levy",
+                "largest_taxpayer_percent_of_total_levy",
+                default=8.0,
+                step=0.1,
                 min_value=0.0,
                 max_value=100.0,
-                value=parse_numeric_input(defaults_for_scorecard["largest_taxpayer_percent_of_total_levy"], 6.1),
-                step=0.1,
             )
-            district_size_parcels = st.number_input(
+            district_size_parcels = nullable_number_input(
                 "District Size (Parcels)",
-                min_value=0,
-                value=int(parse_numeric_input(defaults_for_scorecard["district_size_parcels"], 5900)),
+                "district_size_parcels",
+                default=400,
                 step=100,
+                min_value=0,
+                integer=True,
             )
 
         with col4:
@@ -1194,24 +1410,28 @@ with tab_scorecard:
                 "Developed; Significant Undeveloped Parcels Comprise Minority (Large Developer Concentration)",
                 "Undeveloped with Limited Vertical Construction; High Concentration",
             ]
-            conv_default = defaults_for_scorecard.get("conveyance_to_homeowners", conveyance_options[2])
-            conv_index = conveyance_options.index(conv_default) if conv_default in conveyance_options else 2
-            conveyance_to_homeowners = st.selectbox("Conveyance to Homeowners", conveyance_options, index=conv_index)
+            conveyance_to_homeowners = nullable_selectbox(
+                "Conveyance to Homeowners",
+                "conveyance_to_homeowners",
+                conveyance_options,
+            )
 
-            est_value_to_lien = st.number_input(
+            est_value_to_lien = nullable_number_input(
                 "Est. Value-to-Lien",
-                min_value=0.0,
-                value=parse_numeric_input(defaults_for_scorecard["est_value_to_lien"], 15.5),
+                "est_value_to_lien",
+                default=10.0,
                 step=0.1,
+                min_value=0.0,
             )
 
     with st.expander("C. Financial Profile Assessment", expanded=True):
-        maximum_loss_to_maturity_percent = st.number_input(
+        maximum_loss_to_maturity_percent = nullable_number_input(
             "Maximum Loss-to-Maturity (MLTM) %",
+            "maximum_loss_to_maturity_percent",
+            default=20.0,
+            step=0.1,
             min_value=0.0,
             max_value=100.0,
-            value=parse_numeric_input(defaults_for_scorecard["maximum_loss_to_maturity_percent"], 13.9),
-            step=0.1,
         )
 
     with st.expander("D. Overriding Factors / Caps / Holistic Analysis", expanded=False):
@@ -1253,8 +1473,18 @@ with tab_scorecard:
     }
 
     if st.button("Calculate Scorecard", type="primary"):
-        results = calculate_special_assessment_scorecard(scorecard_inputs)
+        calculation_inputs, missing_used = fill_missing_scorecard_defaults_for_calculation(scorecard_inputs)
+
+        if missing_used:
+            st.warning(
+                "Some fields are still missing. Conservative/benchmark fallback values were used only for this calculation: "
+                + ", ".join(missing_used)
+            )
+
+        results = calculate_special_assessment_scorecard(calculation_inputs)
         st.session_state["last_scorecard_results"] = results
+        st.session_state["last_scorecard_calculation_inputs"] = calculation_inputs
+        st.session_state["last_scorecard_missing_fallbacks"] = missing_used
         render_scorecard_results(results)
 
 
@@ -1291,14 +1521,14 @@ with tab_calcs:
 
         if st.button("Calculate Taxpayer Concentration"):
             concentration = calculate_taxpayer_concentration(taxpayer_df)
-            add_approved_input(
+            safe_add_approved_input(
                 "top10_taxpayers_percent_of_total_levy",
                 concentration["top10_taxpayers_percent_of_total_levy"],
                 status="Calculated",
                 source_method="Taxpayer Concentration Builder",
                 confidence=1.0,
             )
-            add_approved_input(
+            safe_add_approved_input(
                 "largest_taxpayer_percent_of_total_levy",
                 concentration["largest_taxpayer_percent_of_total_levy"],
                 status="Calculated",
@@ -1324,7 +1554,7 @@ with tab_calcs:
 
         if st.button("Calculate Value-to-Lien"):
             vtl_results = calculate_value_to_lien(assessed_value, direct_debt, overlapping_debt, include_overlapping_debt)
-            add_approved_input(
+            safe_add_approved_input(
                 "est_value_to_lien",
                 vtl_results["estimated_value_to_lien"],
                 status="Calculated",
@@ -1374,7 +1604,7 @@ with tab_calcs:
 
         if st.button("Calculate MLTM"):
             mltm_results = calculate_mltm_from_cashflow(cashflow_df, initial_reserve_fund=initial_reserve_fund)
-            add_approved_input(
+            safe_add_approved_input(
                 "maximum_loss_to_maturity_percent",
                 mltm_results["maximum_loss_to_maturity_percent"],
                 status="Calculated",
