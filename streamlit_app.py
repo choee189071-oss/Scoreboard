@@ -1676,44 +1676,142 @@ def build_current_source_status_table():
 
 def extract_assessed_value_candidates_from_documents(parsed_docs):
     """
-    Conservative regex extractor for OS / Appendix text.
-    It creates candidates only; analyst must approve before the value becomes source data.
+    Full-document OS / Appendix assessed-value resolver.
+
+    This deliberately scans the entire parsed OS text and uses broad language patterns,
+    because CFD official statements often phrase the value as:
+    - preliminary assessed value
+    - assessed value of all taxable property
+    - Fiscal Year XXXX assessed value of all taxable property
+    - total assessed valuation / taxable assessed value
+
+    The function only creates candidates; analyst approval is still required.
     """
     candidates = []
+
+    # Higher priority = better candidate when several assessed-value numbers are found.
     patterns = [
-        r"(?:total\s+)?assessed\s+valuation[^\n\r$]{0,80}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
-        r"(?:total\s+)?assessed\s+value[^\n\r$]{0,80}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
-        r"taxable\s+assessed\s+value[^\n\r$]{0,80}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
-        r"full\s+cash\s+value[^\n\r$]{0,80}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+        {
+            "label": "All taxable property assessed value",
+            "priority": 100,
+            "confidence": 0.86,
+            "pattern": r"assessed\s+value\s+of\s+all\s+(?:the\s+)?taxable\s+property[^$0-9]{0,260}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+        },
+        {
+            "label": "Fiscal-year assessed value of all taxable property",
+            "priority": 98,
+            "confidence": 0.86,
+            "pattern": r"fiscal\s+year\s+\d{4}(?:-\d{2})?[^.]{0,300}?assessed\s+value\s+of\s+all\s+(?:the\s+)?taxable\s+property[^$0-9]{0,260}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+        },
+        {
+            "label": "Total assessed value",
+            "priority": 92,
+            "confidence": 0.82,
+            "pattern": r"(?:total|aggregate)\s+assessed\s+value[^$0-9]{0,240}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+        },
+        {
+            "label": "Taxable assessed value",
+            "priority": 90,
+            "confidence": 0.80,
+            "pattern": r"taxable\s+assessed\s+value[^$0-9]{0,240}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+        },
+        {
+            "label": "Total assessed valuation",
+            "priority": 88,
+            "confidence": 0.78,
+            "pattern": r"(?:total|aggregate)?\s*assessed\s+valuation[^$0-9]{0,240}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+        },
+        {
+            "label": "Preliminary assessed value",
+            "priority": 74,
+            "confidence": 0.72,
+            "pattern": r"preliminary\s+assessed\s+value[^$0-9]{0,300}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+        },
+        {
+            "label": "Developed property assessed value",
+            "priority": 70,
+            "confidence": 0.70,
+            "pattern": r"developed\s+property[^.]{0,320}?assessed\s+value[^$0-9]{0,240}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+        },
+        {
+            "label": "Assessor office assessed value",
+            "priority": 68,
+            "confidence": 0.70,
+            "pattern": r"assessor(?:'s)?\s+office[^.]{0,320}?assessed\s+value[^$0-9]{0,240}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+        },
+        {
+            "label": "Full cash value",
+            "priority": 58,
+            "confidence": 0.62,
+            "pattern": r"full\s+cash\s+value[^$0-9]{0,180}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+        },
+        {
+            "label": "Generic assessed value",
+            "priority": 45,
+            "confidence": 0.58,
+            "pattern": r"assessed\s+value[^$0-9]{0,180}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+        },
     ]
+
+    vtl_ratio_pattern = r"(?:estimated\s+)?assessed\s+value\s*[- ]?to\s*[- ]?lien\s+ratio[^0-9]{0,160}(\d+(?:\.\d+)?)\s*(?:-?to-?1|x|:1)"
+
     for doc in parsed_docs or []:
         text = doc.get("text", "") or ""
+        if not text.strip():
+            continue
+
+        # Keep the full OS, not just the first N characters. Normalize whitespace
+        # so sentence-spanning patterns can match across line breaks.
         compact = re.sub(r"\s+", " ", text)
-        for pat in patterns:
-            for m in re.finditer(pat, compact, flags=re.IGNORECASE):
+        source_doc = doc.get("file_name", "Uploaded document")
+
+        for spec in patterns:
+            for m in re.finditer(spec["pattern"], compact, flags=re.IGNORECASE | re.DOTALL):
                 raw = m.group(1)
                 val = parse_numeric_input(raw, default=0.0)
-                if val <= 0:
+                if val <= 0 or val < 100000:
                     continue
-                start = max(0, m.start() - 180)
-                end = min(len(compact), m.end() + 180)
+
+                start = max(0, m.start() - 300)
+                end = min(len(compact), m.end() + 300)
+                excerpt = compact[start:end]
+
+                ratio_match = re.search(vtl_ratio_pattern, excerpt, flags=re.IGNORECASE | re.DOTALL)
+                ratio = float(ratio_match.group(1)) if ratio_match else None
+
                 candidates.append({
                     "value": float(val),
-                    "source_document": doc.get("file_name", "Uploaded document"),
-                    "excerpt": compact[start:end],
-                    "confidence": 0.62,
+                    "source_document": source_doc,
+                    "excerpt": excerpt,
+                    "confidence": float(spec["confidence"]),
                     "raw_value": raw,
+                    "match_label": spec["label"],
+                    "priority": int(spec["priority"]),
+                    "nearby_value_to_lien_ratio": ratio,
                 })
-    # Deduplicate by value/document and favor larger values that look like total AV.
+
+    # Deduplicate by value/document/label and prefer more specific phrases.
     seen = set()
     deduped = []
-    for c in sorted(candidates, key=lambda x: x["value"], reverse=True):
-        key = (round(c["value"], 0), c["source_document"])
+    for c in sorted(candidates, key=lambda x: (x.get("priority", 0), x.get("confidence", 0), x.get("value", 0)), reverse=True):
+        key = (round(c["value"], 0), c["source_document"], c.get("match_label", ""))
         if key not in seen:
             seen.add(key)
             deduped.append(c)
-    return deduped[:8]
 
+    # If an "all taxable property" candidate exists, surface it first. This is usually
+    # the best total tax-base input for the VTL/tax-base workflow.
+    deduped = sorted(
+        deduped,
+        key=lambda x: (
+            1 if "all taxable" in str(x.get("match_label", "")).lower() else 0,
+            x.get("priority", 0),
+            x.get("confidence", 0),
+            x.get("value", 0),
+        ),
+        reverse=True,
+    )
+    return deduped[:12]
 
 def approve_total_assessed_value(value, source_method, source_document="", confidence=0.75, notes=""):
     safe_add_approved_input(
@@ -3251,6 +3349,8 @@ def run_document_extraction_pipeline(deal_setup, selected_targets, api_key, mode
 def _compact_text(value, max_len=12000):
     text = str(value or "")
     text = re.sub(r"\s+", " ", text).strip()
+    if max_len is None:
+        return text
     return text[:max_len]
 
 
@@ -3439,10 +3539,16 @@ def scan_taxpayer_table_candidates(parsed_docs):
 
 def scan_vtl_inputs_from_documents(parsed_docs):
     """Find assessed value / direct debt / overlapping debt candidates from text and tables."""
-    text = ' '.join([_compact_text(doc.get('text', ''), 30000) for doc in parsed_docs or []])
+    text = ' '.join([_compact_text(doc.get('text', ''), None) for doc in parsed_docs or []])
     patterns = {
-        'assessed_value': [r'assessed valuation[^$\d]{0,80}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)',
-                           r'assessed value[^$\d]{0,80}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)'],
+        'assessed_value': [
+            r'assessed\s+value\s+of\s+all\s+(?:the\s+)?taxable\s+property[^$\d]{0,260}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)',
+            r'preliminary\s+assessed\s+value[^$\d]{0,300}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)',
+            r'total\s+assessed\s+value[^$\d]{0,240}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)',
+            r'taxable\s+assessed\s+value[^$\d]{0,240}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)',
+            r'assessed valuation[^$\d]{0,240}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)',
+            r'assessed value[^$\d]{0,180}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)'
+        ],
         'direct_debt': [r'direct debt[^$\d]{0,80}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)',
                         r'bonds outstanding[^$\d]{0,80}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)'],
         'overlapping_debt': [r'overlapping debt[^$\d]{0,80}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)'],
