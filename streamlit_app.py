@@ -3779,27 +3779,51 @@ def render_hybrid_section_workflow(
         # like a failed extraction when only a non-scorecard/context field is absent.
         section_fields = {getattr(f, "key", None): f for f in section.get("fields", []) or []}
 
-        def _is_required_missing(item):
-            field = section_fields.get(item.get("field_key"))
-            # In this workspace, fields with a scorecard_key are required for
-            # scorecard/calculator sync. Fields without one are helpful context.
-            return bool(getattr(field, "scorecard_key", None))
+        DERIVED_OUTPUT_FIELD_KEYS = {
+            "maximum_loss_to_maturity_percent",
+        }
 
-        missing_required = [m for m in missing if _is_required_missing(m)]
-        missing_optional = [m for m in missing if not _is_required_missing(m)]
+        CALCULATOR_INPUT_FIELD_KEYS = {
+            # This table is needed for MLTM calculation, but it should be shown
+            # as a calculator-input gap rather than as a failed AI extraction.
+            "mltm_cashflow_table",
+        }
 
-        if len(missing_required) == 0 and len(candidates) > 0:
+        def _missing_role(item):
+            field_key = item.get("field_key")
+            field = section_fields.get(field_key)
+
+            if field_key in DERIVED_OUTPUT_FIELD_KEYS:
+                return "derived_output"
+
+            if field_key in CALCULATOR_INPUT_FIELD_KEYS:
+                return "calculator_input"
+
+            if bool(getattr(field, "scorecard_key", None)):
+                return "required_scorecard"
+
+            return "optional_context"
+
+        missing_required = [m for m in missing if _missing_role(m) == "required_scorecard"]
+        missing_calculator_inputs = [m for m in missing if _missing_role(m) == "calculator_input"]
+        missing_derived_outputs = [m for m in missing if _missing_role(m) == "derived_output"]
+        missing_optional = [m for m in missing if _missing_role(m) == "optional_context"]
+
+        if len(missing_required) == 0 and len(missing_calculator_inputs) == 0 and len(candidates) > 0:
             resolver_status = "✅ Scorecard Ready"
+        elif len(missing_required) == 0 and len(missing_calculator_inputs) > 0 and len(candidates) > 0:
+            resolver_status = "🧮 Needs Calculator Input"
         elif len(candidates) > 0:
             resolver_status = "⚠️ Needs Required Fields"
         else:
             resolver_status = "❌ No Candidates Yet"
 
-        summary_cols = st.columns(5)
+        summary_cols = st.columns(6)
         summary_cols[0].metric("Candidates Found", len(candidates))
         summary_cols[1].metric("Resolver Status", resolver_status)
         summary_cols[2].metric("Required Missing", len(missing_required))
-        summary_cols[3].metric("Optional Missing", len(missing_optional))
+        summary_cols[3].metric("Calculator Inputs", len(missing_calculator_inputs))
+        summary_cols[4].metric("Optional Missing", len(missing_optional))
         ai_extracted = bool(result.get("ai_candidates"))
         ai_attempted = bool((result.get("scan_debug") or {}).get("ai_requested"))
         if ai_extracted:
@@ -3808,7 +3832,7 @@ def render_hybrid_section_workflow(
             ai_label = "Tried — no values"
         else:
             ai_label = "No"
-        summary_cols[4].metric("AI Fallback", ai_label)
+        summary_cols[5].metric("AI Fallback", ai_label)
 
         st.caption(f"Candidate Pages: {len(candidate_pages)} evidence windows found")
 
@@ -3860,22 +3884,32 @@ def render_hybrid_section_workflow(
                         st.success("Approved and synced where applicable. Scorecard widgets update after rerun.")
                         rerun_after_approve()
 
-        if missing_required or missing_optional:
-            st.markdown("#### Missing After Hybrid Scan")
+        if missing_required or missing_calculator_inputs or missing_optional or missing_derived_outputs:
+            st.markdown("#### Follow-up After Hybrid Scan")
 
             if missing_required:
-                st.error("Required fields are still missing. These affect scorecard/calculator readiness.")
+                st.error("Required scorecard fields are still missing. These affect scorecard readiness.")
                 required_df = pd.DataFrame(missing_required)
                 st.dataframe(required_df, use_container_width=True, hide_index=True)
+
+            if missing_calculator_inputs:
+                st.warning("Calculator input fields are still missing. The extractor may be complete, but the calculator needs a mapped table or manual input before it can compute the final output.")
+                calculator_df = pd.DataFrame(missing_calculator_inputs)
+                st.dataframe(calculator_df, use_container_width=True, hide_index=True)
+
+            if missing_derived_outputs:
+                st.info("Derived output fields are not extracted from the OS. They will be produced by the calculator after inputs are approved.")
+                derived_df = pd.DataFrame(missing_derived_outputs)
+                st.dataframe(derived_df, use_container_width=True, hide_index=True)
 
             if missing_optional:
                 st.info("Optional/context fields are missing, but the section may still be scorecard-ready.")
                 optional_df = pd.DataFrame(missing_optional)
                 st.dataframe(optional_df, use_container_width=True, hide_index=True)
 
-            st.caption("For missing fields: try a more specific OS/appendix, upload a mapped table, enter manually, or use explicitly labelled fallback assumptions.")
+            st.caption("For remaining gaps: upload a mapped table, enter values manually, run the relevant calculator, or use explicitly labelled fallback assumptions.")
         elif candidates:
-            st.success("All required fields for this resolver have candidates. Review and approve the values below before syncing to calculators/scorecard.")
+            st.success("All required extraction fields for this resolver have candidates. Review and approve the values below before syncing to calculators/scorecard.")
 
 
 # =============================================================================
