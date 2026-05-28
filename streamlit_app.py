@@ -3779,7 +3779,15 @@ def render_hybrid_section_workflow(
         summary_cols[0].metric("Candidates Found", len(candidates))
         summary_cols[1].metric("Still Missing", len(missing))
         summary_cols[2].metric("Candidate Pages", len(candidate_pages))
-        summary_cols[3].metric("AI Used", "Yes" if result.get("ai_candidates") else "No")
+        ai_extracted = bool(result.get("ai_candidates"))
+        ai_attempted = bool((result.get("scan_debug") or {}).get("ai_requested"))
+        if ai_extracted:
+            ai_label = "Yes — extracted"
+        elif ai_attempted:
+            ai_label = "Tried — no values"
+        else:
+            ai_label = "No"
+        summary_cols[3].metric("AI Fallback", ai_label)
 
         scan_debug = result.get("scan_debug") or {}
         with st.expander("Debug: document scan coverage", expanded=False):
