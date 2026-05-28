@@ -297,6 +297,10 @@ def assess_real_estate_market_volatility(real_estate_market_volatility: Any) -> 
         "very_strong_low_volatility_stable_prices_low_distress": 1,
         "very_strong_low_volatility": 1,
         "stable_low_volatility": 1,
+        "moderate": 3,
+        "moderate_volatility": 3,
+        "average_volatility": 3,
+        "average": 3,
         "elevated_volatility_stable_prices_affordability_worse_than_national_figures": 3,
         "elevated_volatility": 3,
         "average": 3,
@@ -385,6 +389,12 @@ def assess_conveyance_to_homeowners(conveyance_to_homeowners: Any) -> int:
         "built_out_all_end_users": 1,
         "most_conveyed": 2,
         "built_out_most_end_users": 2,
+        "substantially_complete": 2,
+        "substantially_completed": 2,
+        "substantially_built_out": 2,
+        "substantially_developed": 2,
+        "complete": 2,
+        "completed": 2,
         "fairly_developed_with_significant_conveyance_some_developer_concentration": 3,
         "fairly_developed": 3,
         "mature_some_developer_concentration": 3,
@@ -518,12 +528,21 @@ def calculate_financial_profile_assessment(
     else:
         top10_bucket = ">=40%"
 
+    # Balanced prototype matrix.
+    #
+    # The original prototype matrix double-counted taxpayer concentration very
+    # heavily because Top-10 concentration already enters the District
+    # Characteristics score, and then again controls the Financial Profile score.
+    # This calibrated matrix still penalizes concentration, but lets very strong
+    # MLTM / loss-absorption capacity improve the financial assessment.
+    #
+    # Direction remains: 1 = strongest, 5 = weakest.
     matrix = {
-        "<=5%":   {">=40%": 1,   "35%-40%": 1,   "30%-35%": 1,   "25%-30%": 1.5, "20%-25%": 2,   "15%-20%": 2.5, "10%-15%": 3,   "5%-10%": 3.5, "<=5%": 4.5},
-        "5%-15%":  {">=40%": 1.5, "35%-40%": 1.5, "30%-35%": 1.5, "25%-30%": 2,   "20%-25%": 2.5, "15%-20%": 3,   "10%-15%": 3.5, "5%-10%": 3.5, "<=5%": 4.5},
-        "15%-25%": {">=40%": 2.5, "35%-40%": 2.5, "30%-35%": 2.5, "25%-30%": 3,   "20%-25%": 3.5, "15%-20%": 3.5, "10%-15%": 3.5, "5%-10%": 4.5, "<=5%": 4.5},
-        "25%-40%": {">=40%": 2.5, "35%-40%": 3.5, "30%-35%": 3.5, "25%-30%": 3.5, "20%-25%": 4,   "15%-20%": 4.5, "10%-15%": 4.5, "5%-10%": 4.5, "<=5%": 5},
-        ">=40%":  {">=40%": 3.5, "35%-40%": 4,   "30%-35%": 4,   "25%-30%": 4.5, "20%-25%": 4.5, "15%-20%": 5,   "10%-15%": 5,   "5%-10%": 5,   "<=5%": 5},
+        "<=5%":   {">=40%": 1.0, "35%-40%": 1.0, "30%-35%": 1.0, "25%-30%": 1.5, "20%-25%": 2.0, "15%-20%": 2.5, "10%-15%": 3.0, "5%-10%": 3.5, "<=5%": 4.5},
+        "5%-15%":  {">=40%": 1.5, "35%-40%": 1.5, "30%-35%": 1.5, "25%-30%": 2.0, "20%-25%": 2.5, "15%-20%": 3.0, "10%-15%": 3.5, "5%-10%": 3.5, "<=5%": 4.5},
+        "15%-25%": {">=40%": 2.0, "35%-40%": 2.0, "30%-35%": 2.5, "25%-30%": 3.0, "20%-25%": 3.5, "15%-20%": 3.5, "10%-15%": 3.5, "5%-10%": 4.0, "<=5%": 4.5},
+        "25%-40%": {">=40%": 2.5, "35%-40%": 3.0, "30%-35%": 3.0, "25%-30%": 3.5, "20%-25%": 4.0, "15%-20%": 4.0, "10%-15%": 4.5, "5%-10%": 4.5, "<=5%": 5.0},
+        ">=40%":  {">=40%": 2.5, "35%-40%": 3.0, "30%-35%": 3.5, "25%-30%": 4.0, "20%-25%": 4.5, "15%-20%": 4.5, "10%-15%": 5.0, "5%-10%": 5.0, "<=5%": 5.0},
     }
 
     numeric_assessment = matrix[top10_bucket][mltm_bucket]
@@ -534,6 +553,7 @@ def calculate_financial_profile_assessment(
         "maximum_loss_to_maturity_bucket": mltm_bucket,
         "financial_profile_assessment": numeric_assessment,
         "financial_profile_assessment_category": assessment_to_category(numeric_assessment),
+        "financial_profile_matrix_note": "Balanced prototype matrix: Top-10 concentration is already counted in District Characteristics; MLTM remains the main financial loss-capacity driver.",
     }
 
 
