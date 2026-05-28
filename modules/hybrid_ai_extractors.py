@@ -305,6 +305,7 @@ HYBRID_SECTIONS: Dict[str, Dict[str, Any]] = {
 # Basic utilities
 # -----------------------------------------------------------------------------
 
+
 def _safe_text(value: Any) -> str:
     if value is None:
         return ""
@@ -350,33 +351,146 @@ def _coerce_value(raw: Any, value_type: str) -> Any:
     return raw
 
 
-def _pages_from_docs(parsed_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+_TEXT_KEYS = (
+    "text",
+    "content",
+    "raw_text",
+    "full_text",
+    "extracted_text",
+    "page_text",
+    "parsed_text",
+    "markdown",
+    "context",
+    "ocr_text",
+)
+
+_PAGE_LIST_KEYS = (
+    "pages",
+    "page_texts",
+    "page_text",
+    "parsed_pages",
+    "ocr_pages",
+)
+
+
+def _split_marked_pages(text: str, file_name: str = "Uploaded document") -> List[Dict[str, Any]]:
+    """Split text containing markers like --- PAGE 12 --- into page dicts."""
+    text = _safe_text(text)
+    if not text.strip():
+        return []
+    # Matches both "--- PAGE 12 ---" and "--- Uploaded.pdf PAGE 12 ---".
+    marker_re = re.compile(r"---\s*(?:[^\n\r]{0,120}?\s+)?PAGE\s+(\d{1,5})\s*---", flags=re.I)
+    matches = list(marker_re.finditer(text))
+    if not matches:
+        return [{"document": file_name, "page": 1, "text": text}]
     pages: List[Dict[str, Any]] = []
-    for doc in parsed_docs or []:
-        file_name = doc.get("file_name", "Uploaded document")
-        doc_pages = doc.get("pages") or []
-        if doc_pages:
-            for i, page in enumerate(doc_pages):
-                if isinstance(page, dict):
-                    pages.append({
-                        "document": file_name,
-                        "page": int(page.get("page") or i + 1),
-                        "text": _safe_text(page.get("text", "")),
-                    })
-                else:
-                    pages.append({"document": file_name, "page": i + 1, "text": _safe_text(page)})
-        else:
-            text = _safe_text(doc.get("text", ""))
-            # Split existing page markers if present; otherwise one document-sized chunk.
-            matches = list(re.finditer(r"---\s*PAGE\s+(\d+)\s*---", text, flags=re.I))
-            if matches:
-                for idx, match in enumerate(matches):
-                    start = match.end()
-                    end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-                    pages.append({"document": file_name, "page": int(match.group(1)), "text": text[start:end]})
-            else:
-                pages.append({"document": file_name, "page": 1, "text": text})
+    for idx, match in enumerate(matches):
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        page_text = text[start:end]
+        try:
+            page_no = int(match.group(1))
+        except Exception:
+            page_no = idx + 1
+        pages.append({"document": file_name, "page": page_no, "text": page_text})
     return pages
+
+
+def _extract_pages_from_page_list(obj: Any, file_name: str) -> List[Dict[str, Any]]:
+    pages: List[Dict[str, Any]] = []
+    if not isinstance(obj, list):
+        return pages
+    for i, page in enumerate(obj):
+        page_no = i + 1
+        txt = ""
+        if isinstance(page, dict):
+            page_no = int(page.get("page") or page.get("page_number") or page.get("page_no") or i + 1)
+            for key in _TEXT_KEYS:
+                if isinstance(page.get(key), str) and page.get(key).strip():
+                    txt = page.get(key)
+                    break
+            # Some parsers use nested text arrays.
+            if not txt and isinstance(page.get("lines"), list):
+                txt = "\n".join(_safe_text(x.get("text") if isinstance(x, dict) else x) for x in page.get("lines"))
+        else:
+            txt = _safe_text(page)
+        if txt.strip():
+            pages.append({"document": file_name, "page": page_no, "text": txt})
+    return pages
+
+
+def _pages_from_docs(parsed_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Robustly convert parsed document objects into page-level text.
+
+    Important: candidate-page detection is not allowed to be a gate for regex/AI.
+    This function tries every common parser shape so the hybrid resolver can always
+    build full OS text when any text exists.
+    """
+    pages: List[Dict[str, Any]] = []
+    for doc_idx, doc in enumerate(parsed_docs or []):
+        if not isinstance(doc, dict):
+            txt = _safe_text(doc)
+            if txt.strip():
+                pages.extend(_split_marked_pages(txt, f"Uploaded document {doc_idx + 1}"))
+            continue
+
+        file_name = doc.get("file_name") or doc.get("name") or doc.get("filename") or f"Uploaded document {doc_idx + 1}"
+
+        # 1) Page-list style parsers.
+        for list_key in _PAGE_LIST_KEYS:
+            extracted = _extract_pages_from_page_list(doc.get(list_key), file_name)
+            if extracted:
+                pages.extend(extracted)
+
+        # 2) Full-text style parsers. Always include, but dedupe later.
+        for key in _TEXT_KEYS:
+            txt = doc.get(key)
+            if isinstance(txt, str) and txt.strip():
+                pages.extend(_split_marked_pages(txt, file_name))
+
+        # 3) Nested context/payload structures.
+        for nested_key in ("document", "payload", "result", "data"):
+            nested = doc.get(nested_key)
+            if isinstance(nested, dict):
+                pages.extend(_pages_from_docs([{**nested, "file_name": file_name}]))
+
+    # Deduplicate exact document/page/text repeats while keeping order.
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for p in pages:
+        txt = _safe_text(p.get("text", ""))
+        if not txt.strip():
+            continue
+        key = (_safe_text(p.get("document")), int(p.get("page") or 1), hash(txt[:800]))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append({"document": _safe_text(p.get("document")) or "Uploaded document", "page": int(p.get("page") or 1), "text": txt})
+    return deduped
+
+
+def flatten_parsed_docs_to_full_text(parsed_docs: List[Dict[str, Any]]) -> str:
+    """
+    Build full document text independent of candidate-page detection.
+    This is the backbone of the hybrid resolver: regex must scan this text even
+    when candidate_pages == 0.
+    """
+    pages = _pages_from_docs(parsed_docs)
+    if pages:
+        return _full_text_from_pages(pages)
+    chunks: List[str] = []
+    for doc in parsed_docs or []:
+        if isinstance(doc, dict):
+            for key in _TEXT_KEYS:
+                txt = doc.get(key)
+                if isinstance(txt, str) and txt.strip():
+                    chunks.append(txt)
+        else:
+            txt = _safe_text(doc)
+            if txt.strip():
+                chunks.append(txt)
+    return "\n\n".join(chunks)
 
 
 def _full_text_from_pages(pages: List[Dict[str, Any]]) -> str:
@@ -387,6 +501,74 @@ def _evidence_window(pages: List[Dict[str, Any]], document: str, page_no: int, r
     selected = [p for p in pages if p.get("document") == document and abs(int(p.get("page", 0)) - int(page_no)) <= radius]
     text = _full_text_from_pages(selected)
     return text[:max_chars]
+
+
+def _infer_page_from_fulltext_position(full_text: str, pos: int) -> Optional[int]:
+    before = _safe_text(full_text[:pos])[-2500:]
+    matches = list(re.finditer(r"PAGE\s+(\d{1,5})\s*---", before, flags=re.I))
+    if not matches:
+        return None
+    try:
+        return int(matches[-1].group(1))
+    except Exception:
+        return None
+
+
+def _scan_field_in_full_text(field: HybridField, full_text: str) -> List[Dict[str, Any]]:
+    """Regex scan against the full OS text, not just candidate pages."""
+    results: List[Dict[str, Any]] = []
+    if not full_text.strip() or not field.regex_patterns:
+        return results
+
+    search_text = _normalize_space(full_text)
+    # Normalization changes offsets, so evidence snippets come from normalized text.
+    for pattern in field.regex_patterns:
+        for match in re.finditer(pattern, search_text, flags=re.I | re.S):
+            raw = match.group(1) if match.groups() else match.group(0)
+            value = _coerce_value(raw, field.value_type)
+            if value is None or value == "":
+                continue
+            start = max(match.start() - 520, 0)
+            end = min(match.end() + 720, len(search_text))
+            excerpt = search_text[start:end]
+            page = _infer_page_from_fulltext_position(search_text, match.start())
+            confidence = 0.90
+            lower_match = match.group(0).lower()
+            if field.key in {"all_taxable_assessed_value", "assessed_value"} and "all" in lower_match and "taxable" in lower_match:
+                confidence = 0.97
+            elif "preliminary assessed value" in lower_match or "developed property" in lower_match:
+                confidence = 0.86
+            results.append({
+                "field_key": field.key,
+                "label": field.label,
+                "scorecard_key": field.scorecard_key,
+                "value": value,
+                "value_type": field.value_type,
+                "confidence": confidence,
+                "method": "Regex Full-OS Scan",
+                "tier": "Tier 1",
+                "source_document": "Full parsed OS text",
+                "page": page,
+                "evidence": excerpt,
+                "preferred_source": field.preferred_source,
+                "guidance": field.guidance,
+            })
+    return results
+
+
+def _document_scan_debug(parsed_docs: List[Dict[str, Any]], regex_candidates: Optional[List[Dict[str, Any]]] = None, candidate_pages: Optional[List[Dict[str, Any]]] = None, ai_requested: bool = False, api_key_available: bool = False, ai_candidates: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    pages = _pages_from_docs(parsed_docs)
+    full_text = flatten_parsed_docs_to_full_text(parsed_docs)
+    return {
+        "parsed_documents": len(parsed_docs or []),
+        "pages_scanned": len(pages),
+        "full_text_characters": len(full_text),
+        "regex_candidates": len(regex_candidates or []),
+        "candidate_pages": len(candidate_pages or []),
+        "ai_requested": bool(ai_requested),
+        "api_key_available": bool(api_key_available),
+        "ai_used": bool(ai_candidates),
+    }
 
 
 def find_candidate_pages_for_fields(parsed_docs: List[Dict[str, Any]], fields: Iterable[HybridField], max_pages: int = 12) -> List[Dict[str, Any]]:
@@ -405,18 +587,18 @@ def find_candidate_pages_for_fields(parsed_docs: List[Dict[str, Any]], fields: I
             hits.append({**p, "matched_terms": matched, "page_score": score})
 
     # TOC helper: if a contents page lists a section and page number, add that page window.
-    toc_targets = ["largest taxpayers", "estimated assessed value-to-lien ratios", "estimated direct and overlapping", "debt service schedule", "reserve fund"]
-    for p in pages[:15]:
+    toc_targets = ["largest taxpayers", "estimated assessed value-to-lien ratios", "estimated direct and overlapping", "debt service schedule", "reserve fund", "assessed value"]
+    for p in pages[:20]:
         text = _safe_text(p.get("text", ""))
         for target in toc_targets:
-            m = re.search(re.escape(target) + r"[^0-9]{0,80}(\d{1,3})", text, flags=re.I)
+            m = re.search(re.escape(target) + r"[^0-9]{0,90}(\d{1,3})", text, flags=re.I)
             if m:
                 try:
                     reported_page = int(m.group(1))
                 except Exception:
                     continue
                 # Official Statement body page numbers often start after front matter; search nearby actual pages.
-                for offset in range(0, 10):
+                for offset in range(0, 12):
                     actual = reported_page + offset
                     for match_page in [q for q in pages if int(q.get("page", 0)) == actual]:
                         hits.append({**match_page, "matched_terms": [f"TOC: {target} → {reported_page}"], "page_score": 10})
@@ -429,28 +611,36 @@ def find_candidate_pages_for_fields(parsed_docs: List[Dict[str, Any]], fields: I
             dedup[key] = h
     return sorted(dedup.values(), key=lambda x: x.get("page_score", 0), reverse=True)[:max_pages]
 
-
 # -----------------------------------------------------------------------------
 # Regex extraction
 # -----------------------------------------------------------------------------
 
 def regex_extract_fields(parsed_docs: List[Dict[str, Any]], section_id: str) -> List[Dict[str, Any]]:
+    """
+    Regex extraction now ALWAYS scans the full parsed OS text first.
+    Candidate pages are useful for evidence windows, but they do not gate extraction.
+    """
     section = HYBRID_SECTIONS.get(section_id)
     if not section:
         return []
     fields: List[HybridField] = section["fields"]
     pages = _pages_from_docs(parsed_docs)
+    full_text = flatten_parsed_docs_to_full_text(parsed_docs)
     results: List[Dict[str, Any]] = []
 
-    # Search page-by-page so we can cite/source by page.
+    # A) Full-OS scan. This catches values even when page finder returns zero pages.
+    for field in fields:
+        results.extend(_scan_field_in_full_text(field, full_text))
+
+    # B) Page-by-page scan for better page/source evidence when possible.
     for field in fields:
         for page in pages:
             text = _safe_text(page.get("text", ""))
-            if not text.strip():
+            if not text.strip() or not field.regex_patterns:
                 continue
             search_text = _normalize_space(text)
             for pattern in field.regex_patterns:
-                for match in re.finditer(pattern, search_text, flags=re.I):
+                for match in re.finditer(pattern, search_text, flags=re.I | re.S):
                     raw = match.group(1) if match.groups() else match.group(0)
                     value = _coerce_value(raw, field.value_type)
                     if value is None or value == "":
@@ -459,9 +649,11 @@ def regex_extract_fields(parsed_docs: List[Dict[str, Any]], section_id: str) -> 
                     end = min(match.end() + 520, len(search_text))
                     excerpt = search_text[start:end]
                     confidence = 0.92
-                    # Extra confidence for preferred total assessed value phrase.
-                    if field.key == "all_taxable_assessed_value" and "all" in match.group(0).lower() and "taxable" in match.group(0).lower():
-                        confidence = 0.97
+                    lower_match = match.group(0).lower()
+                    if field.key in {"all_taxable_assessed_value", "assessed_value"} and "all" in lower_match and "taxable" in lower_match:
+                        confidence = 0.98
+                    elif "preliminary assessed value" in lower_match or "developed property" in lower_match:
+                        confidence = 0.86
                     results.append({
                         "field_key": field.key,
                         "label": field.label,
@@ -478,12 +670,12 @@ def regex_extract_fields(parsed_docs: List[Dict[str, Any]], section_id: str) -> 
                         "guidance": field.guidance,
                     })
 
-    # Special derived extraction for conveyance classification.
+    # C) Special narrative-derived field for conveyance classification.
     if section_id == "taxbase_concentration":
         for page in pages:
             text = _normalize_space(_safe_text(page.get("text", "")))
-            if "conveyed to individual homeowners" in text.lower():
-                # Use narrative classification but keep evidence.
+            lower = text.lower()
+            if "conveyed to individual homeowners" in lower or "sold to individual homeowners" in lower:
                 results.append({
                     "field_key": "conveyance_to_homeowners",
                     "label": "Conveyance to Homeowners",
@@ -501,13 +693,24 @@ def regex_extract_fields(parsed_docs: List[Dict[str, Any]], section_id: str) -> 
                 })
                 break
 
-    # Deduplicate: prefer higher confidence and, for assessed value, all-taxable fields.
+    # Deduplicate. Prefer page-level evidence over full-text evidence at similar confidence.
     best: Dict[str, Dict[str, Any]] = {}
     for r in results:
         key = r["field_key"]
-        if key not in best or r.get("confidence", 0) > best[key].get("confidence", 0):
+        score = float(r.get("confidence", 0) or 0)
+        if r.get("source_document") != "Full parsed OS text":
+            score += 0.01
+        if key not in best:
             best[key] = r
-    return list(best.values())
+            best[key]["_rank_score"] = score
+        elif score > float(best[key].get("_rank_score", 0) or 0):
+            best[key] = r
+            best[key]["_rank_score"] = score
+    final = []
+    for r in best.values():
+        r.pop("_rank_score", None)
+        final.append(r)
+    return final
 
 
 # -----------------------------------------------------------------------------
@@ -663,61 +866,73 @@ def run_hybrid_section_extraction(
         return {"ok": False, "error": f"Unknown hybrid section: {section_id}"}
 
     fields: List[HybridField] = section["fields"]
+    pages = _pages_from_docs(parsed_docs)
+    full_text = flatten_parsed_docs_to_full_text(parsed_docs)
+
+    # 1) Regex always scans full parsed OS text. It must NOT depend on candidate_pages.
     regex_candidates = regex_extract_fields(parsed_docs, section_id)
     found_keys = {c["field_key"] for c in regex_candidates if c.get("value") not in [None, ""]}
     missing_fields = [f for f in fields if f.key not in found_keys]
 
+    # 2) Candidate pages are evidence helpers only, not a gate.
+    candidate_pages = find_candidate_pages_for_fields(parsed_docs, fields, max_pages=10)
+
+    # 3) AI fallback. If candidate pages exist, send tight page windows; otherwise send first full-text chunk.
     ai_candidates: List[Dict[str, Any]] = []
     ai_error = None
-    candidate_pages = find_candidate_pages_for_fields(parsed_docs, fields, max_pages=10)
-    if force_ai or (missing_fields and api_key):
-        pages = _pages_from_docs(parsed_docs)
-        if candidate_pages:
-            # Build evidence window around best pages, rather than sending entire OS.
-            chunks: List[str] = []
-            for hit in candidate_pages[:5]:
-                chunks.append(_evidence_window(pages, hit.get("document"), int(hit.get("page", 1)), radius=1, max_chars=6500))
-            candidate_text = "\n\n".join(chunks)
+    ai_requested = bool(force_ai or (missing_fields and api_key))
+    if ai_requested:
+        if not api_key:
+            ai_error = "OpenAI API key was not provided, so AI JSON fallback could not run."
         else:
-            candidate_text = _full_text_from_pages(pages)[:30000]
+            if candidate_pages:
+                chunks: List[str] = []
+                for hit in candidate_pages[:5]:
+                    chunks.append(_evidence_window(pages, hit.get("document"), int(hit.get("page", 1)), radius=1, max_chars=6500))
+                candidate_text = "\n\n".join([c for c in chunks if c.strip()])
+                if not candidate_text.strip():
+                    candidate_text = full_text[:30000]
+            else:
+                # Important fallback: no page candidates does NOT mean no data.
+                candidate_text = full_text[:30000]
 
-        ai_result = ai_extract_fields_from_text(
-            section_id=section_id,
-            fields=missing_fields if not force_ai else fields,
-            candidate_text=candidate_text,
-            api_key=api_key or "",
-            model=model,
-            issuer_name=issuer_name,
-            state=state,
-            county_name=county_name,
-        )
-        if ai_result.get("ok"):
-            for f in (missing_fields if not force_ai else fields):
-                item = (ai_result.get("data") or {}).get(f.key) or {}
-                value = _coerce_value(item.get("value"), f.value_type)
-                if value is None or value == "":
-                    continue
-                ai_candidates.append({
-                    "field_key": f.key,
-                    "label": f.label,
-                    "scorecard_key": f.scorecard_key,
-                    "value": value,
-                    "value_type": f.value_type,
-                    "confidence": float(item.get("confidence") or 0.55),
-                    "method": "OpenAI Responses API Structured Extraction",
-                    "tier": "Tier 2",
-                    "source_document": item.get("source_label") or "Uploaded OS / source window",
-                    "page": item.get("page"),
-                    "evidence": item.get("evidence") or "",
-                    "preferred_source": f.preferred_source,
-                    "guidance": f.guidance,
-                    "notes": item.get("notes") or "",
-                    "response_id": ai_result.get("raw_response_id"),
-                })
-        else:
-            ai_error = ai_result.get("error")
+            ai_result = ai_extract_fields_from_text(
+                section_id=section_id,
+                fields=missing_fields if not force_ai else fields,
+                candidate_text=candidate_text,
+                api_key=api_key or "",
+                model=model,
+                issuer_name=issuer_name,
+                state=state,
+                county_name=county_name,
+            )
+            if ai_result.get("ok"):
+                for f in (missing_fields if not force_ai else fields):
+                    item = (ai_result.get("data") or {}).get(f.key) or {}
+                    value = _coerce_value(item.get("value"), f.value_type)
+                    if value is None or value == "":
+                        continue
+                    ai_candidates.append({
+                        "field_key": f.key,
+                        "label": f.label,
+                        "scorecard_key": f.scorecard_key,
+                        "value": value,
+                        "value_type": f.value_type,
+                        "confidence": float(item.get("confidence") or 0.55),
+                        "method": "OpenAI Responses API Structured Extraction",
+                        "tier": "Tier 2",
+                        "source_document": item.get("source_label") or "Uploaded OS / source window",
+                        "page": item.get("page"),
+                        "evidence": item.get("evidence") or "",
+                        "preferred_source": f.preferred_source,
+                        "guidance": f.guidance,
+                        "notes": item.get("notes") or "",
+                        "response_id": ai_result.get("raw_response_id"),
+                    })
+            else:
+                ai_error = ai_result.get("error")
 
-    # Merge regex first, then AI for missing only.
+    # Merge regex first, then AI for missing only unless forced.
     candidates_by_key: Dict[str, Dict[str, Any]] = {c["field_key"]: c for c in regex_candidates}
     for c in ai_candidates:
         if force_ai or c["field_key"] not in candidates_by_key:
@@ -729,6 +944,15 @@ def run_hybrid_section_extraction(
         {"field_key": f.key, "label": f.label, "preferred_source": f.preferred_source, "guidance": f.guidance}
         for f in fields if f.key not in final_found
     ]
+
+    scan_debug = _document_scan_debug(
+        parsed_docs,
+        regex_candidates=regex_candidates,
+        candidate_pages=candidate_pages,
+        ai_requested=ai_requested,
+        api_key_available=bool(api_key),
+        ai_candidates=ai_candidates,
+    )
 
     return {
         "ok": True,
@@ -744,4 +968,5 @@ def run_hybrid_section_extraction(
             for h in candidate_pages
         ],
         "ai_error": ai_error,
+        "scan_debug": scan_debug,
     }
