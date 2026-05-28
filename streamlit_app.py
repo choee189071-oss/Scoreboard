@@ -1037,33 +1037,6 @@ c3.metric("Candidate Queue", candidate_count)
 c4.metric("Approved Inputs", approved_count)
 
 
-st.markdown(
-    """
-    <div style="
-        display:flex;
-        gap:10px;
-        align-items:center;
-        margin:18px 0 26px 0;
-        padding:14px 16px;
-        border:1px solid #e5e7eb;
-        border-radius:16px;
-        background:#fafafa;
-        font-size:15px;
-        font-weight:600;
-    ">
-        <span>① Deal Workspace</span>
-        <span style="color:#9ca3af;">→</span>
-        <span>② Calculators</span>
-        <span style="color:#9ca3af;">→</span>
-        <span>③ Reliability Review</span>
-        <span style="color:#9ca3af;">→</span>
-        <span>④ Scorecard</span>
-        <span style="color:#9ca3af;">→</span>
-        <span>⑤ Sources & Evidence</span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
 
 tab_deal, tab_calcs, tab_review, tab_scorecard, tab_sources = st.tabs(
     [
