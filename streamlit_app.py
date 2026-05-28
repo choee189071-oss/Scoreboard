@@ -3561,6 +3561,14 @@ def render_hybrid_section_workflow(
         summary_cols[2].metric("Candidate Pages", len(candidate_pages))
         summary_cols[3].metric("AI Used", "Yes" if result.get("ai_candidates") else "No")
 
+        scan_debug = result.get("scan_debug") or {}
+        with st.expander("Debug: document scan coverage", expanded=False):
+            if scan_debug:
+                st.dataframe(pd.DataFrame([scan_debug]), use_container_width=True, hide_index=True)
+                st.caption("If full_text_characters is 0, the PDF parser did not extract text; use OCR/Vision or re-upload a text-readable OS. If candidate_pages is 0 but full_text_characters is large, regex/AI still scan the full text.")
+            else:
+                st.caption("No scan debug information was returned.")
+
         if ai_error:
             st.warning(f"AI fallback did not complete: {ai_error}")
 
