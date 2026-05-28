@@ -999,9 +999,13 @@ def fill_missing_scorecard_defaults_for_calculation(inputs):
     """
     Reliability-aware scoring fallback.
 
-    The UI stays blank for missing values.
-    Only at calculation time do we apply conservative/benchmark defaults
-    so the scoring function does not crash.
+    The UI stays blank for missing values. Only at calculation time do we apply
+    conservative/benchmark defaults for fields that are reasonable to benchmark.
+
+    Important fix:
+    - MLTM is NOT filled with a fake default. If missing, the scorecard engine
+      applies a neutral provisional financial score and marks the rating with *.
+    - rating_cap is never treated as a missing scoring input; default is None.
     """
     fallback_values = {
         "median_household_ebi_percent_of_us": 100.0,
@@ -1014,22 +1018,25 @@ def fill_missing_scorecard_defaults_for_calculation(inputs):
         "district_size_parcels": 400,
         "conveyance_to_homeowners": "Fairly Developed with Significant Conveyance (Some Developer Concentration)",
         "est_value_to_lien": 10.0,
-        "maximum_loss_to_maturity_percent": 20.0,
         "negative_override_notches": 0,
         "holistic_adjustment_notches": 0,
         "rating_cap": "None",
     }
 
-    filled = {}
+    filled = dict(inputs or {})
     missing_used = []
 
     for key, fallback in fallback_values.items():
-        value = inputs.get(key)
+        value = filled.get(key)
         if is_missing_master_value(value):
             filled[key] = fallback
-            missing_used.append(key)
-        else:
-            filled[key] = value
+            # Do not show rating_cap as a scary data fallback; None is the normal baseline.
+            if key != "rating_cap":
+                missing_used.append(key)
+
+    if is_missing_master_value(filled.get("maximum_loss_to_maturity_percent")):
+        filled["maximum_loss_to_maturity_percent"] = None
+        missing_used.append("maximum_loss_to_maturity_percent")
 
     return filled, missing_used
 
@@ -5349,6 +5356,90 @@ with tab_scorecard:
         "This page reads from the approved master scorecard data. Missing values stay blank. "
         "Manual edits here become Manual Input and will not be overwritten by later AI/API pulls."
     )
+
+    with st.expander("Manual Override / Scoreboard Data Editor", expanded=False):
+        st.caption(
+            "Use this when an AI/API value is wrong or when you want to test rating sensitivity. "
+            "Applied overrides are stored as Manual Input and will not be overwritten by later source pulls."
+        )
+        editable_fields = [
+            ("Median Household EBI (% of U.S.)", "median_household_ebi_percent_of_us", "number"),
+            ("Unemployment Rate Difference vs U.S. (%)", "unemployment_rate_difference_vs_us", "number"),
+            ("MSA Participation", "msa_participation", "select"),
+            ("Real Estate Market Volatility", "real_estate_market_volatility", "select"),
+            ("Population Growth Difference vs U.S. (%)", "population_growth_difference_vs_us", "number"),
+            ("Top 10 Taxpayers as % of Total Levy", "top10_taxpayers_percent_of_total_levy", "number"),
+            ("Largest Taxpayer as % of Total Levy", "largest_taxpayer_percent_of_total_levy", "number"),
+            ("District Size (Parcels)", "district_size_parcels", "integer"),
+            ("Conveyance to Homeowners", "conveyance_to_homeowners", "select"),
+            ("Est. Value-to-Lien", "est_value_to_lien", "number"),
+            ("Maximum Loss-to-Maturity (MLTM) %", "maximum_loss_to_maturity_percent", "number"),
+        ]
+        field_labels = [x[0] for x in editable_fields]
+        selected_label = st.selectbox("Field to override", field_labels, key="scoreboard_override_field")
+        selected_meta = next(x for x in editable_fields if x[0] == selected_label)
+        selected_key = selected_meta[1]
+        selected_type = selected_meta[2]
+        current_master_value = get_master_value(selected_key, fallback=None)
+        st.caption(f"Current approved/master value: `{display_value(current_master_value) or 'Missing'}` · Status: `{get_master_status(selected_key)}`")
+
+        if selected_type == "select" and selected_key == "msa_participation":
+            override_value = st.selectbox(
+                "New value",
+                ["Yes; Broad & Diverse", "Yes; Not Broad & Diverse", "No"],
+                key="scoreboard_override_select_value",
+            )
+        elif selected_type == "select" and selected_key == "real_estate_market_volatility":
+            override_value = st.selectbox(
+                "New value",
+                [
+                    "Low Volatility; Stable Prices; Low Distress",
+                    "Elevated Volatility; Stable Prices; Affordability Worse Than National Figures",
+                    "Falling Local Home Prices; High Price Volatility; Low Affordability; Rising Distress",
+                    "Falling Local Home Prices; High Price Volatility; Significantly Worse Affordability; Rising Distress",
+                ],
+                key="scoreboard_override_select_value_re",
+            )
+        elif selected_type == "select" and selected_key == "conveyance_to_homeowners":
+            override_value = st.selectbox(
+                "New value",
+                [
+                    "All or Nearly All Conveyed",
+                    "Most Conveyed",
+                    "Fairly Developed with Significant Conveyance (Some Developer Concentration)",
+                    "Developed; Significant Undeveloped Parcels Comprise Minority (Large Developer Concentration)",
+                    "Undeveloped with Limited Vertical Construction; High Concentration",
+                ],
+                key="scoreboard_override_select_value_conv",
+            )
+        else:
+            override_raw = st.text_input(
+                "New value",
+                value=_format_scorecard_widget_text(current_master_value, integer=(selected_type == "integer")),
+                key="scoreboard_override_text_value",
+            )
+            override_value = int(parse_numeric_input(override_raw, 0)) if selected_type == "integer" else parse_numeric_input(override_raw, 0.0)
+
+        c_apply, c_clear = st.columns(2)
+        with c_apply:
+            if st.button("Apply Manual Override", key="apply_scoreboard_override"):
+                set_manual_override(selected_key, override_value, source_method="Scoreboard Manual Override Panel")
+                widget_text = _format_scorecard_widget_text(override_value, integer=(selected_type == "integer"))
+                st.session_state[f"scorecard_input_{selected_key}"] = widget_text
+                st.session_state[f"scorecard_input_{selected_key}_dirty"] = True
+                st.session_state[f"scorecard_select_{selected_key}"] = override_value
+                st.session_state[f"scorecard_select_{selected_key}_dirty"] = True
+                st.success(f"Manual override applied: {selected_label} = {override_value}")
+                st.rerun()
+        with c_clear:
+            if st.button("Clear Manual Override for This Field", key="clear_scoreboard_override"):
+                st.session_state.get("approved_inputs", {}).pop(selected_key, None)
+                st.session_state.get("approved_input_metadata", {}).pop(selected_key, None)
+                for prefix in ["scorecard_input_", "scorecard_select_"]:
+                    st.session_state.pop(f"{prefix}{selected_key}", None)
+                    st.session_state.pop(f"{prefix}{selected_key}_dirty", None)
+                st.success(f"Cleared manual override for {selected_label}.")
+                st.rerun()
 
     with st.expander("A. Economic Fundamentals Assessment", expanded=True):
         col1, col2 = st.columns(2)
