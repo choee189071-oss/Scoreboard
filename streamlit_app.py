@@ -2890,6 +2890,138 @@ def _safe_json_from_text(text):
         return {}
 
 
+def _normalize_for_source_gate(value):
+    """Normalize issuer/source text for conservative source matching."""
+    if value is None:
+        return ""
+    text = str(value).lower()
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    text = re.sub(r"\b(cfd|no|number|series|district|community|facilities|school|high|union|ca|california|the|of|and)\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _important_source_tokens(value):
+    text = _normalize_for_source_gate(value)
+    return [tok for tok in text.split() if len(tok) >= 3]
+
+
+def _extract_deal_numbers(value):
+    if not value:
+        return []
+    text = str(value).lower()
+    # Captures common CFD / district identifiers such as 92-1, 2026A, 2025-26.
+    return re.findall(r"\b\d{2,4}(?:[- ]\d{1,4})?[a-z]?\b", text)
+
+
+def evaluate_source_confidence_gate(candidate, issuer_name, state="", county_name=""):
+    """
+    Conservative gate for AI-discovered public sources.
+
+    Goal: reduce wrong-issuer risk before any value can be approved into calculators.
+    - exact_match: enough issuer/deal tokens or deal numbers appear in source title/evidence/link.
+    - partial_match: some overlap exists; analyst can approve only with manual caution.
+    - mismatch: source clearly appears to be for a different issuer/deal; approval is blocked.
+    - unknown: insufficient identifying text; approval is blocked unless the user provides/uploads a source directly.
+    """
+    candidate = candidate or {}
+    source_blob = " ".join([
+        str(candidate.get("source_title", "")),
+        str(candidate.get("source_url", "")),
+        str(candidate.get("evidence_snippet", "")),
+        str(candidate.get("notes", "")),
+    ])
+    source_norm = _normalize_for_source_gate(source_blob)
+    issuer_tokens = _important_source_tokens(issuer_name)
+    county_tokens = _important_source_tokens(county_name)
+    issuer_hits = [tok for tok in issuer_tokens if tok in source_norm]
+    county_hits = [tok for tok in county_tokens if tok in source_norm]
+
+    issuer_nums = _extract_deal_numbers(issuer_name)
+    source_nums = _extract_deal_numbers(source_blob)
+    number_hits = [num for num in issuer_nums if num in source_nums]
+
+    # Strong negative signals: source has a different named issuer while missing the requested issuer.
+    requested_core = set(issuer_tokens[:6])
+    obvious_other_names = [
+        "perris", "temecula", "menifee", "murrieta", "riverside", "irvine", "tustin", "anaheim",
+        "lennar", "rancho", "santa", "newport", "laguna", "capistrano"
+    ]
+    requested_missing = len(issuer_hits) == 0 and len(number_hits) == 0
+    other_signal = any(name in source_norm for name in obvious_other_names if name not in requested_core)
+
+    if requested_missing and other_signal:
+        return {
+            "status": "mismatch",
+            "allowed": False,
+            "score": 0.0,
+            "message": "Source appears to reference a different issuer/deal. Approval is blocked; use a better matched source or upload the source table.",
+            "matched_terms": issuer_hits + number_hits,
+        }
+
+    if len(issuer_hits) >= 2 or number_hits:
+        return {
+            "status": "exact_match",
+            "allowed": True,
+            "score": 0.95,
+            "message": "Source appears to match the requested issuer/deal. Still verify dates, units, and table headers before approving.",
+            "matched_terms": issuer_hits + number_hits,
+        }
+
+    if issuer_hits or county_hits:
+        return {
+            "status": "partial_match",
+            "allowed": True,
+            "score": 0.60,
+            "message": "Source partially matches the deal geography/name. Use caution and verify the source manually before approving.",
+            "matched_terms": issuer_hits + county_hits,
+        }
+
+    return {
+        "status": "unknown",
+        "allowed": False,
+        "score": 0.25,
+        "message": "The source does not contain enough issuer/deal identifiers to approve safely. Upload/map the table or provide a more specific official source URL.",
+        "matched_terms": [],
+    }
+
+
+def source_gate_allows_approval(candidate):
+    gate = (candidate or {}).get("source_confidence_gate", {}) or {}
+    return bool(gate.get("allowed", False))
+
+
+def render_source_confidence_gate(candidate):
+    gate = (candidate or {}).get("source_confidence_gate", {}) or {}
+    status = gate.get("status", "unknown")
+    msg = gate.get("message", "Source match has not been evaluated.")
+    terms = gate.get("matched_terms", []) or []
+
+    if status == "exact_match":
+        st.success(f"Source Confidence Gate: Exact/strong match. {msg}")
+    elif status == "partial_match":
+        st.warning(f"Source Confidence Gate: Partial match. {msg}")
+    elif status == "mismatch":
+        st.error(f"Source Confidence Gate: MISMATCH. {msg}")
+    else:
+        st.warning(f"Source Confidence Gate: Unknown match. {msg}")
+
+    if terms:
+        st.caption("Matched terms: " + ", ".join(map(str, terms)))
+
+
+def public_candidate_has_any_value(candidate, table_keys=("taxpayer_table", "mltm_cashflow")):
+    """True only when source scout returned a usable value or non-empty table."""
+    vals = _candidate_values_dict(candidate)
+    if any(v not in [None, "", [], {}] for v in vals.values()):
+        return True
+    for key in table_keys:
+        if not _candidate_table_df(candidate, key).empty:
+            return True
+    return False
+
+
 def ai_public_source_scout_for_calculator(calculator_name, issuer_name, state, county_name, targets, api_key, model):
     """Use OpenAI web search to find public/source-backed calculator inputs.
 
@@ -2915,7 +3047,8 @@ Rules:
 2. Prefer official statement PDFs, EMMA/MSRB pages, county assessor/open data, official issuer disclosures, continuing disclosure, or clearly reputable public data.
 3. Return only values that have a source URL and short evidence snippet.
 4. If a value is not reliably found, return null for that field and explain why.
-5. Output valid JSON only.
+5. Verify that the source is for the requested issuer/district/deal, not merely a similar issuer. If the source appears mismatched, set confidence to 0, values to null, and explain the mismatch.
+6. Output valid JSON only.
 
 Use this schema:
 {{
@@ -2925,6 +3058,7 @@ Use this schema:
   "source_title": "",
   "source_url": "",
   "source_type": "official_statement | county_open_data | issuer_disclosure | EMMA | other_public_source | not_found",
+  "source_match_notes": "briefly explain whether source title/evidence matches the requested issuer/deal",
   "evidence_snippet": "",
   "warning": "Analyst must independently verify source, units, dates, and whether values match the target issue.",
   "values": {{
@@ -2965,6 +3099,12 @@ Use this schema:
         return {"ok": False, "error": "AI source scout did not return parseable JSON.", "raw_output": output_text[:2000]}
     parsed.setdefault("ok", True)
     parsed.setdefault("warning", "Analyst must independently verify source, units, dates, and whether values match the target issue.")
+    parsed["source_confidence_gate"] = evaluate_source_confidence_gate(
+        parsed,
+        issuer_name=issuer_name,
+        state=state,
+        county_name=county_name,
+    )
     return parsed
 
 
@@ -2972,9 +3112,12 @@ def render_public_source_scout_common(calculator_name, targets, key_prefix):
     """Render a reusable AI Source Scout panel and store candidate in session_state."""
     deal_setup = st.session_state.get("deal_setup", {}) or {}
     st.markdown("---")
-    st.subheader("AI Public Source Scout")
+    st.subheader("AI Public Source Scout + Source Confidence Gate")
     st.caption(
-        "Optional fallback when uploaded documents and table mapping do not work. It searches public sources and returns sourced candidates only; analyst approval is required before pre-fill."
+        "Workflow: AI searches public sources → verifies issuer/deal match → parses candidates → analyst approves only matched sources → upload/map table only if source search fails."
+    )
+    st.info(
+        "Source gate logic: exact match = can approve after review; partial match = caution; mismatch/unknown = approval blocked and fallback upload/manual mapping is recommended."
     )
     st.warning(
         "Double-check required: AI-discovered sources may be stale, mismatched to the wrong issuer/series, or use different units. Verify the source link and evidence before approving."
@@ -3041,6 +3184,19 @@ def render_public_source_scout_common(calculator_name, targets, key_prefix):
             else:
                 c3.caption("No source URL returned")
             st.write(f"**Source Title:** {cand.get('source_title', '')}")
+            if cand.get("source_match_notes"):
+                st.caption("Source match notes: " + str(cand.get("source_match_notes")))
+            if "source_confidence_gate" not in cand:
+                cand["source_confidence_gate"] = evaluate_source_confidence_gate(
+                    cand,
+                    issuer_name=deal_setup.get("issuer_name", ""),
+                    state=deal_setup.get("state", ""),
+                    county_name=deal_setup.get("county_name", ""),
+                )
+                st.session_state[f"{key_prefix}_public_source_candidate"] = cand
+            render_source_confidence_gate(cand)
+            if not public_candidate_has_any_value(cand):
+                st.info("No usable numeric/table inputs were found from this source. Use upload/map fallback or search again with a more specific official source URL.")
             if cand.get("evidence_snippet"):
                 with st.expander("Evidence snippet", expanded=False):
                     st.write(cand.get("evidence_snippet"))
@@ -3680,7 +3836,10 @@ with tab_calcs:
                     taxpayer_public_df = taxpayer_public_df.dropna(subset=["taxpayer_name", "levy_percent"])
                     st.caption("Preview of AI-sourced public taxpayer table")
                     st.dataframe(taxpayer_public_df, use_container_width=True, hide_index=True)
-                    if st.button("Approve AI-Sourced Taxpayer Table", key="approve_taxpayer_public_source"):
+                    if st.button("Approve AI-Sourced Taxpayer Table", key="approve_taxpayer_public_source", disabled=not source_gate_allows_approval(taxpayer_public_cand)):
+                        if not source_gate_allows_approval(taxpayer_public_cand):
+                            st.error("Approval blocked by Source Confidence Gate. Use a matched official source or upload/map the table.")
+                            st.stop()
                         sync_taxpayer_table_to_editor(
                             taxpayer_public_df.copy(),
                             source=taxpayer_public_cand.get("source_url") or taxpayer_public_cand.get("source_title") or "AI Public Source Scout",
@@ -3698,7 +3857,10 @@ with tab_calcs:
                     ctop, clargest = st.columns(2)
                     ctop.metric("Top 10 Taxpayers %", "" if top10 is None else top10)
                     clargest.metric("Largest Taxpayer %", "" if largest is None else largest)
-                    if st.button("Approve Aggregate Taxpayer Values", key="approve_taxpayer_public_aggregates"):
+                    if st.button("Approve Aggregate Taxpayer Values", key="approve_taxpayer_public_aggregates", disabled=not source_gate_allows_approval(taxpayer_public_cand)):
+                        if not source_gate_allows_approval(taxpayer_public_cand):
+                            st.error("Approval blocked by Source Confidence Gate. Use a matched official source or upload/map the table.")
+                            st.stop()
                         if top10 is not None:
                             safe_add_approved_input("top10_taxpayers_percent_of_total_levy", parse_numeric_input(top10), status="AI Extracted", source_method="AI Public Source Scout", source_document=taxpayer_public_cand.get("source_url"), confidence=taxpayer_public_cand.get("confidence", 0.55), notes="AI-sourced aggregate value; double-check source before use.")
                         if largest is not None:
@@ -3830,7 +3992,10 @@ with tab_calcs:
                 pv1.metric("Assessed Value", "" if vals.get("assessed_value") is None else f"${parse_numeric_input(vals.get('assessed_value')):,.0f}")
                 pv2.metric("Direct Debt", "" if vals.get("direct_debt") is None else f"${parse_numeric_input(vals.get('direct_debt')):,.0f}")
                 pv3.metric("Overlapping Debt", "" if vals.get("overlapping_debt") is None else f"${parse_numeric_input(vals.get('overlapping_debt')):,.0f}")
-                if st.button("Approve AI-Sourced VTL Inputs", key="approve_vtl_public_source"):
+                if st.button("Approve AI-Sourced VTL Inputs", key="approve_vtl_public_source", disabled=not source_gate_allows_approval(vtl_public_cand)):
+                    if not source_gate_allows_approval(vtl_public_cand):
+                        st.error("Approval blocked by Source Confidence Gate. Use a matched official source or upload/map the table.")
+                        st.stop()
                     existing = st.session_state.get("vtl_prefill", {}) or {}
                     for src_key, dest_key in [("assessed_value", "assessed_value"), ("direct_debt", "direct_debt"), ("overlapping_debt", "overlapping_debt")]:
                         if vals.get(src_key) is not None:
@@ -3995,7 +4160,10 @@ with tab_calcs:
                     mltm_public_df = mltm_public_df.dropna(subset=needed)
                     st.caption("Preview of AI-sourced public MLTM cashflow schedule")
                     st.dataframe(mltm_public_df, use_container_width=True, hide_index=True)
-                    if st.button("Approve AI-Sourced MLTM Schedule", key="approve_mltm_public_source"):
+                    if st.button("Approve AI-Sourced MLTM Schedule", key="approve_mltm_public_source", disabled=not source_gate_allows_approval(mltm_public_cand)):
+                        if not source_gate_allows_approval(mltm_public_cand):
+                            st.error("Approval blocked by Source Confidence Gate. Use a matched official source or upload/map the schedule.")
+                            st.stop()
                         vals = _candidate_values_dict(mltm_public_cand)
                         reserve_val = None
                         if vals.get("initial_reserve_fund") is not None:
@@ -4014,7 +4182,10 @@ with tab_calcs:
                 if vals.get("initial_reserve_fund") is not None:
                     st.info("AI found an initial reserve fund but not a full cashflow schedule. You can approve the reserve fund, then upload/map the cashflow schedule separately.")
                     st.metric("Initial Reserve Fund Candidate", f"${parse_numeric_input(vals.get('initial_reserve_fund')):,.0f}")
-                    if st.button("Approve AI-Sourced Reserve Fund", key="approve_mltm_public_reserve"):
+                    if st.button("Approve AI-Sourced Reserve Fund", key="approve_mltm_public_reserve", disabled=not source_gate_allows_approval(mltm_public_cand)):
+                        if not source_gate_allows_approval(mltm_public_cand):
+                            st.error("Approval blocked by Source Confidence Gate. Use a matched official source or upload/map the schedule.")
+                            st.stop()
                         sync_mltm_schedule_to_editor(
                             reserve_fund=float(parse_numeric_input(vals.get("initial_reserve_fund"))),
                             source=mltm_public_cand.get("source_url") or mltm_public_cand.get("source_title") or "AI Public Source Scout",
