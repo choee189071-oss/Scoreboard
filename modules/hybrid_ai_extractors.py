@@ -658,231 +658,324 @@ def _document_scan_debug(parsed_docs: List[Dict[str, Any]], regex_candidates: Op
         "ai_requested": bool(ai_requested),
         "api_key_available": bool(api_key_available),
         "ai_used": bool(ai_candidates),
-        "ai_extracted_candidates": len(ai_candidates or []),
     }
 
 
+def _looks_like_taxbase_concentration_fields(fields: Iterable[HybridField]) -> bool:
+    """Detect the Tax Base & Concentration resolver from its field keys.
+
+    This keeps candidate-page search section-aware without changing the public
+    function signature used by streamlit_app.py.
+    """
+    keys = {getattr(f, "key", "") for f in fields}
+    return bool({
+        "top10_taxpayers_percent_of_total_levy",
+        "largest_taxpayer_percent_of_total_levy",
+        "district_size_parcels",
+        "conveyance_to_homeowners",
+    } & keys)
+
+
+def _looks_like_leverage_fields(fields: Iterable[HybridField]) -> bool:
+    keys = {getattr(f, "key", "") for f in fields}
+    return bool({"assessed_value", "direct_debt", "overlapping_debt", "est_value_to_lien"} & keys)
+
+
+def _looks_like_cashflow_fields(fields: Iterable[HybridField]) -> bool:
+    keys = {getattr(f, "key", "") for f in fields}
+    return bool({"initial_reserve_fund", "maximum_loss_to_maturity_percent", "mltm_cashflow_table"} & keys)
+
+
 def find_candidate_pages_for_fields(parsed_docs: List[Dict[str, Any]], fields: Iterable[HybridField], max_pages: int = 12) -> List[Dict[str, Any]]:
+    """Find evidence pages for the selected section only.
+
+    2026-05-28 fix:
+    The old version used a global TOC target list containing "reserve fund" for
+    every section. In the Tax Base & Concentration workflow, this caused the page
+    finder to rank reserve-fund / front-matter pages above the actual land
+    ownership and special-tax levy table. AI fallback then received the wrong
+    page window and returned zero values.
+
+    This version makes TOC/page keywords section-aware and gives high weight to
+    table headers such as "Land Ownership and Current Special Tax Levy" and
+    "Percentage of Total Special Tax Levy".
+    """
+    fields = list(fields or [])
     pages = _pages_from_docs(parsed_docs)
     hits: List[Dict[str, Any]] = []
+
+    is_taxbase = _looks_like_taxbase_concentration_fields(fields)
+    is_leverage = _looks_like_leverage_fields(fields)
+    is_cashflow = _looks_like_cashflow_fields(fields)
+
     all_keywords: List[str] = []
     for field in fields:
         all_keywords.extend([k.lower() for k in field.keywords])
-    all_keywords = list(dict.fromkeys([k for k in all_keywords if k]))
+        all_keywords.append(str(field.label or "").lower())
+
+    # Section-specific evidence phrases. These are deliberately broad because
+    # OSs rarely use the same exact taxpayer-table title.
+    if is_taxbase:
+        all_keywords.extend([
+            "land ownership and current special tax levy",
+            "land ownership in the district",
+            "special tax levy",
+            "percentage of total special tax levy",
+            "fee title owner",
+            "lessee or other user",
+            "current annual special tax levy",
+            "concentration of property ownership",
+            "responsible for more than ten percent",
+            "owners of property subject to the levy",
+            "shares of the most recent annual special tax levy",
+        ])
+    elif is_leverage:
+        all_keywords.extend([
+            "value-to-burden ratio",
+            "value to burden ratio",
+            "assessed value to burden ratios",
+            "value to lien",
+            "direct and overlapping bonded debt",
+            "outstanding direct and overlapping bonded debt",
+        ])
+    elif is_cashflow:
+        all_keywords.extend([
+            "scheduled debt service",
+            "projected debt service coverage",
+            "debt service schedule",
+            "reserve fund",
+            "reserve requirement",
+            "sources and uses of funds",
+        ])
+
+    all_keywords = list(dict.fromkeys([k.strip() for k in all_keywords if k and k.strip()]))
+
+    def term_weight(term: str) -> int:
+        t = term.lower()
+        if is_taxbase and any(core in t for core in [
+            "land ownership and current special tax levy",
+            "percentage of total special tax levy",
+            "special tax levy",
+            "fee title owner",
+        ]):
+            return 12
+        if any(core in t for core in ["largest", "top ten", "top taxpayers", "taxpayer", "value-to-lien", "value to lien", "debt service"]):
+            return 6
+        if any(core in t for core in ["assessed", "taxable property", "reserve fund"]):
+            return 4
+        return 1
 
     for p in pages:
         lower = _safe_text(p.get("text", "")).lower()
         matched = [k for k in all_keywords if k in lower]
         if matched:
-            score = sum(3 if any(core in k for core in ["largest", "assessed", "debt service", "value-to-lien", "taxable property"]) else 1 for k in matched)
-            hits.append({**p, "matched_terms": matched, "page_score": score})
+            score = sum(term_weight(k) for k in matched)
 
-    # TOC helper: if a contents page lists a section and page number, add that page window.
-    toc_targets = ["largest taxpayers", "estimated assessed value-to-lien ratios", "estimated direct and overlapping", "debt service schedule", "reserve fund", "assessed value"]
+            # Extra table-structure boost for Tax Base & Concentration.
+            if is_taxbase:
+                if "percentage" in lower and "total special tax levy" in lower:
+                    score += 25
+                if "fee title owner" in lower and "special tax levy" in lower:
+                    score += 20
+                if "land ownership" in lower and "special tax levy" in lower:
+                    score += 20
+                # De-prioritize front matter / TOC pages that merely mention the phrase.
+                if "table of contents" in lower and "percentage of total special tax levy" not in lower:
+                    score -= 8
+
+            hits.append({**p, "matched_terms": matched[:12], "page_score": score})
+
+    # TOC helper: only search TOC headings relevant to the current section.
+    if is_taxbase:
+        toc_targets = [
+            "land ownership and current special tax levy",
+            "special tax levies and delinquencies",
+            "concentration of property ownership",
+            "development in the district",
+            "the district",
+        ]
+    elif is_leverage:
+        toc_targets = [
+            "value-to-burden ratio",
+            "direct and overlapping governmental obligations",
+            "estimated assessed value-to-lien ratios",
+            "assessed value",
+        ]
+    elif is_cashflow:
+        toc_targets = [
+            "scheduled debt service",
+            "projected debt service coverage",
+            "reserve fund",
+            "sources and uses of funds",
+        ]
+    else:
+        toc_targets = [k for k in all_keywords if len(k) >= 8][:12]
+
     for p in pages[:20]:
         text = _safe_text(p.get("text", ""))
+        lower = text.lower()
+        # Only treat likely front matter as TOC. This prevents normal body pages
+        # from generating accidental page-number jumps.
+        if "table of contents" not in lower and int(p.get("page", 9999)) > 15:
+            continue
         for target in toc_targets:
-            m = re.search(re.escape(target) + r"[^0-9]{0,90}(\d{1,3})", text, flags=re.I)
+            m = re.search(re.escape(target) + r"[^0-9]{0,110}(\d{1,3})", text, flags=re.I)
             if m:
                 try:
                     reported_page = int(m.group(1))
                 except Exception:
                     continue
-                # Official Statement body page numbers often start after front matter; search nearby actual pages.
-                for offset in range(0, 12):
+                for offset in range(0, 14):
                     actual = reported_page + offset
                     for match_page in [q for q in pages if int(q.get("page", 0)) == actual]:
-                        hits.append({**match_page, "matched_terms": [f"TOC: {target} → {reported_page}"], "page_score": 10})
+                        base_score = 18 if is_taxbase else 10
+                        hits.append({**match_page, "matched_terms": [f"TOC: {target} → {reported_page}"], "page_score": base_score})
 
-    # Deduplicate document/page, keep high score.
+    # Deduplicate document/page, keep highest score and matched terms.
     dedup: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for h in hits:
         key = (_safe_text(h.get("document")), int(h.get("page", 0)))
         if key not in dedup or h.get("page_score", 0) > dedup[key].get("page_score", 0):
             dedup[key] = h
+
     return sorted(dedup.values(), key=lambda x: x.get("page_score", 0), reverse=True)[:max_pages]
-
-
-
-def _extract_tax_levy_table_candidates(parsed_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Deterministic parser for OS tables like:
-    Land Ownership ... Current Special Tax Levy ... Percentage of Total Special Tax Levy.
-
-    This fixes the common case where candidate pages are found but generic regex returns
-    zero candidates because taxpayer concentration lives in a multi-line PDF table.
-    """
-    pages = _pages_from_docs(parsed_docs)
-    results: List[Dict[str, Any]] = []
-
-    for page in pages:
-        raw_text = _safe_text(page.get("text", ""))
-        lower = raw_text.lower()
-
-        # Keep this parser conservative: only run where the right table heading exists.
-        if not (
-            ("special tax levy" in lower and "percentage" in lower and "assessor parcel" in lower)
-            or ("land ownership" in lower and "special tax levy" in lower)
-        ):
-            continue
-
-        lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
-        rows: List[Dict[str, Any]] = []
-
-        for idx, line in enumerate(lines):
-            if not re.fullmatch(r"\d{3}-\d{3}-\d{2}", line):
-                continue
-
-            apn = line
-            window = lines[idx: idx + 30]
-
-            levy = None
-            levy_pos = None
-            for j, candidate in enumerate(window[1:], start=1):
-                candidate_clean = candidate.strip()
-                # A levy amount should be a money-like value, not acreage such as 2.18.
-                money_like = bool(re.fullmatch(r"\$?\s*\d[\d,]*\.\d{2}", candidate_clean))
-                if not money_like:
-                    continue
-                parsed_money = _clean_money(candidate_clean)
-                if parsed_money is not None and parsed_money >= 1000:
-                    levy = parsed_money
-                    levy_pos = j
-                    break
-
-            if levy is None or levy_pos is None:
-                continue
-
-            pct = None
-            for candidate in window[levy_pos + 1: levy_pos + 6]:
-                pct_match = re.fullmatch(r"(\d{1,3}(?:\.\d+)?)%?", candidate.strip())
-                if pct_match:
-                    pct_val = float(pct_match.group(1))
-                    if 0 < pct_val <= 100:
-                        pct = pct_val
-                        break
-
-            if pct is None:
-                continue
-
-            # Owner is usually the text between APN and user/tenant/size columns.
-            # This is evidence only; the actual scorecard fields use the percentages.
-            owner_parts = []
-            for candidate in window[1: levy_pos]:
-                if re.fullmatch(r"\d[\d,]*", candidate) or re.fullmatch(r"\d+(?:\.\d+)?", candidate):
-                    break
-                if re.search(r"(none|Toys|Best Buy|Sports Authority|Meineke|Arizona Tile|Dairy Queen|Jack in the Box|Krispy|Goodyear|Bed, Bath|Petco)", candidate, flags=re.I):
-                    break
-                owner_parts.append(candidate)
-            owner = _normalize_space(" ".join(owner_parts))
-
-            rows.append({
-                "apn": apn,
-                "owner": owner,
-                "special_tax_levy": levy,
-                "percent_of_total_special_tax_levy": pct,
-            })
-
-        # Require enough rows to look like a real taxpayer/parcel table.
-        if len(rows) < 3:
-            continue
-
-        pct_values = [r["percent_of_total_special_tax_levy"] for r in rows if isinstance(r.get("percent_of_total_special_tax_levy"), (int, float))]
-        if not pct_values:
-            continue
-
-        top10 = round(sum(sorted(pct_values, reverse=True)[:10]), 2)
-        largest = round(max(pct_values), 2)
-        parcel_count = len(rows)
-        text = _normalize_space(raw_text)
-
-        evidence = (
-            f"Parsed {parcel_count} parcel rows from Special Tax Levy table on page {page.get('page')}. "
-            f"Top 10 sum = {top10}%; largest parcel/taxpayer = {largest}%. "
-            f"Table excerpt: {text[:2200]}"
-        )
-
-        results.extend([
-            {
-                "field_key": "top10_taxpayers_percent_of_total_levy",
-                "label": "Top 10 Taxpayers as % of Total Levy",
-                "scorecard_key": "top10_taxpayers_percent_of_total_levy",
-                "value": top10,
-                "value_type": "percent",
-                "confidence": 0.88,
-                "method": "Regex Table Parser / Special Tax Levy Table",
-                "tier": "Tier 1",
-                "source_document": page.get("document"),
-                "page": page.get("page"),
-                "evidence": evidence,
-                "preferred_source": "Largest Taxpayers / Special Tax Levy table in OS",
-                "guidance": "Calculated by summing the ten largest percentages in the Special Tax Levy table. Verify whether parcels map one-to-one to taxpayers before approval.",
-                "table_rows": rows,
-            },
-            {
-                "field_key": "largest_taxpayer_percent_of_total_levy",
-                "label": "Largest Taxpayer as % of Total Levy",
-                "scorecard_key": "largest_taxpayer_percent_of_total_levy",
-                "value": largest,
-                "value_type": "percent",
-                "confidence": 0.90,
-                "method": "Regex Table Parser / Special Tax Levy Table",
-                "tier": "Tier 1",
-                "source_document": page.get("document"),
-                "page": page.get("page"),
-                "evidence": evidence,
-                "preferred_source": "Largest Taxpayers / Special Tax Levy table in OS",
-                "guidance": "Calculated as the largest percentage in the Special Tax Levy table. Verify table header says Percentage of Total Special Tax Levy.",
-                "table_rows": rows,
-            },
-            {
-                "field_key": "district_size_parcels",
-                "label": "District Size (Parcels)",
-                "scorecard_key": "district_size_parcels",
-                "value": parcel_count,
-                "value_type": "number",
-                "confidence": 0.86,
-                "method": "Regex Table Parser / Special Tax Levy Table",
-                "tier": "Tier 1",
-                "source_document": page.get("document"),
-                "page": page.get("page"),
-                "evidence": evidence,
-                "preferred_source": "OS development status / taxable parcels disclosure",
-                "guidance": "Counted rows in the Special Tax Levy table. Verify whether combined building rows such as 6/7 should count as one parcel or two buildings.",
-                "table_rows": rows,
-            },
-        ])
-        break
-
-    # Narrative backup for parcel count if the table parser did not catch it.
-    if not any(r.get("field_key") == "district_size_parcels" for r in results):
-        full_text = flatten_parsed_docs_to_full_text(parsed_docs)
-        m = re.search(r"(?:all\s+of\s+the\s+)?([0-9][0-9,]*)\s+parcels\s+of\s+Taxable\s+Property", full_text, flags=re.I)
-        if m:
-            val = _clean_number(m.group(1))
-            if val is not None:
-                results.append({
-                    "field_key": "district_size_parcels",
-                    "label": "District Size (Parcels)",
-                    "scorecard_key": "district_size_parcels",
-                    "value": val,
-                    "value_type": "number",
-                    "confidence": 0.82,
-                    "method": "Regex Narrative Scan",
-                    "tier": "Tier 1",
-                    "source_document": "Full parsed OS text",
-                    "page": None,
-                    "evidence": _normalize_space(full_text[max(0, m.start()-450):m.end()+450]),
-                    "preferred_source": "OS development status / taxable parcels disclosure",
-                    "guidance": "Narrative parcel count extracted from OS. Verify taxable vs developed parcel definition.",
-                })
-
-    return results
-
 
 # -----------------------------------------------------------------------------
 # Regex extraction
 # -----------------------------------------------------------------------------
+
+
+def _extract_taxbase_levy_table_candidates(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract taxpayer concentration from Special Tax Levy table pages.
+
+    Designed for OS tables whose rows include annual Special Tax Levy and
+    "Percentage of Total Special Tax Levy". It calculates:
+    - Largest taxpayer % = max row percentage
+    - Top 10 taxpayers % = sum of the 10 largest row percentages
+
+    The function returns reviewable candidates only; analyst approval remains
+    required in the Streamlit reliability layer.
+    """
+    results: List[Dict[str, Any]] = []
+    best_page = None
+    best_percentages: List[float] = []
+    best_score = -1
+
+    for page in pages:
+        raw_text = _safe_text(page.get("text", ""))
+        lower = raw_text.lower()
+        if not (
+            "special tax levy" in lower
+            and (
+                "percentage of total" in lower
+                or "percentage" in lower and "total special" in lower
+                or "fee title owner" in lower
+            )
+        ):
+            continue
+
+        # Focus on the taxpayer table area when possible.
+        table_text = raw_text
+        start_markers = [
+            "Land Ownership and Current Special Tax Levy",
+            "Land Ownership in the District",
+            "Percentage of Total",
+        ]
+        for marker in start_markers:
+            pos = table_text.lower().find(marker.lower())
+            if pos >= 0:
+                table_text = table_text[pos:]
+                break
+        end_pos = table_text.lower().find("sources:")
+        if end_pos > 0:
+            table_text = table_text[:end_pos]
+        totals_pos = table_text.lower().find("totals:")
+        if totals_pos > 0:
+            table_body = table_text[:totals_pos]
+        else:
+            table_body = table_text
+
+        # Capture the percentage immediately following a dollar/levy amount.
+        # Examples:
+        #   $40,517.72  9.17%
+        #   35,331.08  7.99
+        pct_matches = re.findall(
+            # Require a true levy amount, either dollar-prefixed or containing
+            # a thousands comma. This avoids accidentally treating acreage
+            # decimals like "1.95" as monetary values.
+            r"(?:\$\s*\d{1,3}(?:,\d{3})*|\d{1,3},\d{3})\.\d{2}\s+([0-9]{1,2}(?:\.\d{1,2})?)\s*%?",
+            table_body,
+            flags=re.I,
+        )
+        percentages: List[float] = []
+        for raw in pct_matches:
+            try:
+                val = float(raw)
+            except Exception:
+                continue
+            if 0 < val < 100:
+                percentages.append(val)
+
+        # Remove accidental duplicates while preserving order.
+        deduped: List[float] = []
+        for val in percentages:
+            if not any(abs(val - existing) < 0.0001 for existing in deduped):
+                deduped.append(val)
+        percentages = deduped
+
+        score = len(percentages)
+        if "fee title owner" in lower:
+            score += 5
+        if "percentage of total special tax levy" in _normalize_space(raw_text).lower():
+            score += 10
+
+        if len(percentages) >= 3 and score > best_score:
+            best_score = score
+            best_page = page
+            best_percentages = percentages
+
+    if not best_page or not best_percentages:
+        return results
+
+    sorted_pcts = sorted(best_percentages, reverse=True)
+    largest = round(sorted_pcts[0], 2)
+    top10 = round(sum(sorted_pcts[:10]), 2)
+    evidence = _normalize_space(_safe_text(best_page.get("text", "")))[:3500]
+
+    results.append({
+        "field_key": "largest_taxpayer_percent_of_total_levy",
+        "label": "Largest Taxpayer as % of Total Levy",
+        "scorecard_key": "largest_taxpayer_percent_of_total_levy",
+        "value": largest,
+        "value_type": "percent",
+        "confidence": 0.93,
+        "method": "Regex Special Tax Levy Table Parser",
+        "tier": "Tier 1",
+        "source_document": best_page.get("document"),
+        "page": best_page.get("page"),
+        "evidence": evidence,
+        "preferred_source": "Land Ownership / Special Tax Levy table in OS",
+        "guidance": "Largest row percentage from the Special Tax Levy table. Verify this is levy share, not assessed-value share.",
+        "notes": f"Parsed {len(best_percentages)} levy-share percentages from the table.",
+    })
+    results.append({
+        "field_key": "top10_taxpayers_percent_of_total_levy",
+        "label": "Top 10 Taxpayers as % of Total Levy",
+        "scorecard_key": "top10_taxpayers_percent_of_total_levy",
+        "value": top10,
+        "value_type": "percent",
+        "confidence": 0.91,
+        "method": "Regex Special Tax Levy Table Parser",
+        "tier": "Tier 1",
+        "source_document": best_page.get("document"),
+        "page": best_page.get("page"),
+        "evidence": evidence,
+        "preferred_source": "Land Ownership / Special Tax Levy table in OS",
+        "guidance": "Sum of the 10 largest levy-share percentages from the Special Tax Levy table. Verify treatment when there are fewer than 10 taxpayers or affiliated owners.",
+        "notes": f"Top 10 sum from {len(best_percentages)} parsed levy-share percentages.",
+    })
+    return results
+
 
 def regex_extract_fields(parsed_docs: List[Dict[str, Any]], section_id: str) -> List[Dict[str, Any]]:
     """
@@ -900,6 +993,12 @@ def regex_extract_fields(parsed_docs: List[Dict[str, Any]], section_id: str) -> 
     # A) Full-OS scan. This catches values even when page finder returns zero pages.
     for field in fields:
         results.extend(_scan_field_in_full_text(field, full_text))
+
+    # A2) Specialized Special Tax Levy table parser for Tax Base & Concentration.
+    # This handles multi-line taxpayer/land-ownership tables that normal one-line
+    # regex patterns cannot parse reliably.
+    if section_id == "taxbase_concentration":
+        results.extend(_extract_taxbase_levy_table_candidates(pages))
 
     # B) Page-by-page scan for better page/source evidence when possible.
     for field in fields:
@@ -939,12 +1038,38 @@ def regex_extract_fields(parsed_docs: List[Dict[str, Any]], section_id: str) -> 
                         "guidance": field.guidance,
                     })
 
-    # C) Special table-derived fields for taxpayer concentration.
+    # C) Special narrative-derived fields for Tax Base & Concentration.
     if section_id == "taxbase_concentration":
-        results.extend(_extract_tax_levy_table_candidates(parsed_docs))
+        # District size often appears as "includes 14 separate Assessor's parcels"
+        # rather than "14 taxable parcels". Capture that language too.
+        for page in pages:
+            text = _normalize_space(_safe_text(page.get("text", "")))
+            lower = text.lower()
+            parcel_match = re.search(
+                r"(?:district|taxable property)[^.]{0,180}?(?:includes|comprises|contains)[^.]{0,80}?([0-9][0-9,]*)\s+(?:separate\s+)?(?:orange\s+county\s+assessor(?:’s|'s)?\s+)?parcels",
+                text,
+                flags=re.I,
+            )
+            if parcel_match:
+                value = _clean_number(parcel_match.group(1))
+                if value is not None:
+                    results.append({
+                        "field_key": "district_size_parcels",
+                        "label": "District Size (Parcels)",
+                        "scorecard_key": "district_size_parcels",
+                        "value": int(value),
+                        "value_type": "number",
+                        "confidence": 0.84,
+                        "method": "Regex Narrative Scan",
+                        "tier": "Tier 1",
+                        "source_document": page.get("document"),
+                        "page": page.get("page"),
+                        "evidence": text[:1600],
+                        "preferred_source": "OS district description / taxable parcels disclosure",
+                        "guidance": "Narrative parcel count extracted from OS. Verify taxable vs developed parcel definition.",
+                    })
+                    break
 
-    # D) Special narrative-derived field for conveyance classification.
-    if section_id == "taxbase_concentration":
         for page in pages:
             text = _normalize_space(_safe_text(page.get("text", "")))
             lower = text.lower()
@@ -1123,75 +1248,6 @@ Text window:
         return {"ok": False, "error": f"OpenAI extraction exception: {exc}"}
 
 
-
-
-def _keyword_windows_from_full_text(full_text: str, fields: Iterable[HybridField], max_windows: int = 12, radius: int = 3500) -> str:
-    """
-    Build targeted evidence windows directly from full text.
-
-    Why: candidate-page ranking can over-focus on TOC/intro pages. If the top
-    candidate pages do not contain the actual table, AI fallback may be called
-    but see the wrong context and return no values. This helper grabs windows
-    around the actual field keywords across the full OS text.
-    """
-    text = _safe_text(full_text)
-    if not text.strip():
-        return ""
-
-    keywords: List[str] = []
-    for field in fields:
-        for kw in field.keywords:
-            if kw and kw.lower() not in keywords:
-                keywords.append(kw.lower())
-
-    # Extra muni-table phrases that often identify taxpayer/concentration/VTL pages.
-    for kw in [
-        "percentage of total special tax levy",
-        "current special tax levy",
-        "land ownership",
-        "top ten taxpayers",
-        "top 10 taxpayers",
-        "largest property owners",
-        "largest taxpayers",
-        "value-to-lien",
-        "assessed value-to-lien",
-    ]:
-        if kw not in keywords:
-            keywords.append(kw)
-
-    lower = text.lower()
-    spans: List[Tuple[int, int, str]] = []
-    for kw in keywords:
-        start = 0
-        while True:
-            idx = lower.find(kw, start)
-            if idx < 0:
-                break
-            spans.append((max(0, idx - radius), min(len(text), idx + len(kw) + radius), kw))
-            start = idx + max(len(kw), 1)
-            if len(spans) >= max_windows * 3:
-                break
-        if len(spans) >= max_windows * 3:
-            break
-
-    if not spans:
-        return ""
-
-    # Merge overlaps and keep earliest useful windows.
-    spans = sorted(spans, key=lambda x: (x[0], x[1]))
-    merged: List[List[Any]] = []
-    for s, e, kw in spans:
-        if not merged or s > merged[-1][1] + 800:
-            merged.append([s, e, {kw}])
-        else:
-            merged[-1][1] = max(merged[-1][1], e)
-            merged[-1][2].add(kw)
-
-    pieces = []
-    for i, (s, e, kws) in enumerate(merged[:max_windows], start=1):
-        pieces.append(f"--- KEYWORD WINDOW {i}; matched={', '.join(sorted(kws))} ---\n{text[s:e]}")
-    return "\n\n".join(pieces)
-
 def run_hybrid_section_extraction(
     *,
     section_id: str,
@@ -1227,29 +1283,16 @@ def run_hybrid_section_extraction(
         if not api_key:
             ai_error = "OpenAI API key was not provided, so AI JSON fallback could not run."
         else:
-            # Build AI context from BOTH page windows and direct keyword windows.
-            # Candidate pages can be TOC-heavy or intro-heavy; keyword windows make the
-            # actual taxpayer/VTL/debt-service table much more likely to be included.
-            chunks: List[str] = []
             if candidate_pages:
-                for hit in candidate_pages[:10]:
+                chunks: List[str] = []
+                for hit in candidate_pages[:5]:
                     chunks.append(_evidence_window(pages, hit.get("document"), int(hit.get("page", 1)), radius=1, max_chars=6500))
-
-            keyword_context = _keyword_windows_from_full_text(
-                full_text,
-                fields=missing_fields if not force_ai else fields,
-                max_windows=10,
-                radius=3500,
-            )
-            if keyword_context.strip():
-                chunks.append(keyword_context)
-
-            candidate_text = "\n\n".join([c for c in chunks if c and c.strip()])
-            if not candidate_text.strip():
+                candidate_text = "\n\n".join([c for c in chunks if c.strip()])
+                if not candidate_text.strip():
+                    candidate_text = full_text[:30000]
+            else:
                 # Important fallback: no page candidates does NOT mean no data.
                 candidate_text = full_text[:30000]
-            else:
-                candidate_text = candidate_text[:30000]
 
             ai_result = ai_extract_fields_from_text(
                 section_id=section_id,
