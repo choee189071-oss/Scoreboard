@@ -5019,7 +5019,11 @@ with tab_calcs:
 
                 if taxpayer_candidates:
                     best = taxpayer_candidates[0]
-                    df_candidate = reconstruct_taxpayer_table_from_text(best.get("preview", ""))
+                    # Reconstruct from the single best page first. The wider ±page preview is kept for evidence review,
+                    # but using it for parsing can accidentally pull in neighboring non-taxpayer tables.
+                    df_candidate = reconstruct_taxpayer_table_from_text(best.get("page_preview", "") or best.get("preview", ""))
+                    if df_candidate is None or df_candidate.empty:
+                        df_candidate = reconstruct_taxpayer_table_from_text(best.get("preview", ""))
                     # If evidence is located but rows are not reconstructed, keep a Tier-2 candidate rather than saying data is absent.
                     row_count = 0 if df_candidate is None else len(df_candidate)
                     confidence = confidence_score(row_count, 10)
