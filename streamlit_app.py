@@ -227,15 +227,17 @@ defaults = {
     "review_candidates": pd.DataFrame(),
     "candidate_extractions": [],
     "source_evidence": [],
+    # Blank by default: no demo issuer/geography should appear on fresh load.
+    # Analysts must enter/select a deal or use the test-case loader.
     "deal_setup": {
-        "issuer_name": "Mission Viejo CFD No. 92-1",
-        "state": "CA",
-        "state_fips": "06",
+        "issuer_name": "",
+        "state": "",
+        "state_fips": "",
         "geography_type": "county",
-        "county_or_place_fips": "059",
-        "county_name": "Orange County",
-        "location_name": "Los Angeles-Long Beach-Anaheim",
-        "bond_type": "Special Assessment Debt",
+        "county_or_place_fips": "",
+        "county_name": "",
+        "location_name": "",
+        "bond_type": "",
         "census_year": 2023,
     },
 }
@@ -4179,26 +4181,46 @@ with tab_deal:
 
     st.subheader("A. Deal Setup")
 
-    setup = st.session_state.get("deal_setup", defaults["deal_setup"]).copy()
+    setup = st.session_state.get("deal_setup", {}) or {}
+
+    reset_col, _ = st.columns([1, 5])
+    with reset_col:
+        if st.button("Clear Workspace", key="clear_full_workspace"):
+            keys_to_clear = [
+                "deal_setup", "approved_inputs", "approved_input_metadata",
+                "auto_data_results", "parsed_documents", "last_document_ai_result",
+                "last_scorecard_results", "review_candidates", "candidate_extractions",
+                "source_evidence", "last_scorecard_calculation_inputs",
+                "last_scorecard_missing_fallbacks", "taxpayer_df_override",
+                "vtl_assessed_value", "vtl_direct_debt", "vtl_overlapping_debt",
+                "mltm_cashflow_override", "mltm_initial_reserve_fund",
+            ]
+            for k in keys_to_clear:
+                st.session_state.pop(k, None)
+            st.rerun()
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
         issuer_name = st.text_input("Issuer / District Name", value=setup.get("issuer_name", ""))
-        state = st.text_input("State", value=setup.get("state", "CA")).strip().upper()
+        state = st.text_input("State", value=setup.get("state", "")).strip().upper()
+        bond_type_options = ["", "Special Assessment Debt", "CFD / Mello-Roos", "Special Tax Bonds"]
+        current_bond_type = setup.get("bond_type", "")
+        bond_type_index = bond_type_options.index(current_bond_type) if current_bond_type in bond_type_options else 0
         bond_type = st.selectbox(
             "Bond Type",
-            ["Special Assessment Debt", "CFD / Mello-Roos", "Special Tax Bonds"],
-            index=0,
+            bond_type_options,
+            index=bond_type_index,
+            format_func=lambda x: "Select bond type" if x == "" else x,
         )
 
     with col3:
-        county_name_raw = st.text_input("County Name", value=setup.get("county_name", "Orange County"))
+        county_name_raw = st.text_input("County Name", value=setup.get("county_name", ""))
         census_year = st.number_input(
             "ACS Year",
             min_value=2018,
             max_value=2024,
-            value=int(setup.get("census_year", 2023)),
+            value=int(setup.get("census_year", 2023) or 2023),
             step=1,
         )
 
@@ -4235,7 +4257,9 @@ with tab_deal:
             help="Auto-mapped from State + County when available. Used for housing and regional market context.",
         )
 
-    if geo_map["is_fully_mapped"]:
+    if not state or not normalize_county_name(county_name_raw):
+        st.info("Enter State + County Name to auto-map State FIPS, County FIPS, and MSA.")
+    elif geo_map["is_fully_mapped"]:
         st.success(
             f"Geography auto-mapped: {county_name} County, {state} → County FIPS {county_or_place_fips}; MSA: {location_name}."
         )
