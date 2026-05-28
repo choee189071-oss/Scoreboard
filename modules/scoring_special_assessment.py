@@ -35,10 +35,13 @@ ECONOMIC_FUNDAMENTALS_SUBFACTOR_WEIGHTS = {
 
 DISTRICT_CHARACTERISTICS_SUBFACTOR_WEIGHTS = {
     "Top 10 Taxpayers as % of Total Levy": 0.25,
-    "Conveyance to Homeowners": 0.25,
+    "Conveyance to Homeowners": 0.30,
     "Largest Taxpayer as % of Total Levy": 0.20,
-    "District Size (Parcels)": 0.15,
-    "Est. Value-to-Lien": 0.15,
+    # Parcel count can be misleading for CFD deals because assessor/APN parcels,
+    # building sites, taxable parcels, and residential units are often different.
+    # Keep it as a signal, but do not let it dominate the scorecard.
+    "District Size (Parcels)": 0.05,
+    "Est. Value-to-Lien": 0.20,
 }
 
 INITIAL_INDICATIVE_RATING_SCALE = [
@@ -71,6 +74,18 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def is_missing_scorecard_input(value: Any) -> bool:
+    """Treat blanks/placeholders as missing instead of silently converting them."""
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "nan", "null", "n/a", "missing", "missing data"}:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
 
 
 def safe_divide(numerator: Any, denominator: Any, default: float = 0.0) -> float:
@@ -433,7 +448,12 @@ def assess_district_size_parcels(district_size_parcels: Any) -> int:
         return 3
     if parcels >= 200:
         return 4
-    return 5
+    # Small numeric parcel counts in CFD OSs are often APNs/building sites,
+    # not true homeowner/taxable-unit scale. Treat <50 as neutral/adequate
+    # unless the analyst separately verifies it is actually a tiny district.
+    if parcels < 50:
+        return 3
+    return 4
 
 
 def assess_est_value_to_lien(est_value_to_lien: Any) -> int:
@@ -496,6 +516,21 @@ def calculate_financial_profile_assessment(
     maximum_loss_to_maturity_percent: Any,
 ) -> Dict[str, Any]:
     top10 = safe_float(top10_taxpayers_percent_of_total_levy, default=25)
+
+    # Do not silently turn missing MLTM into a weak 15% stress value.
+    # Missing MLTM should be visible as a provisional/neutral scorecard input.
+    if is_missing_scorecard_input(maximum_loss_to_maturity_percent):
+        top10_bucket = ">=40%" if top10 > 40 else ("25%-40%" if top10 > 25 else ("15%-25%" if top10 > 15 else ("5%-15%" if top10 > 5 else "<=5%")))
+        return {
+            "maximum_loss_to_maturity_percent": None,
+            "financial_profile_top10_taxpayers_bucket": top10_bucket,
+            "maximum_loss_to_maturity_bucket": "Missing / pending MLTM calculator",
+            "financial_profile_assessment": 3.0,
+            "financial_profile_assessment_category": "Pending MLTM",
+            "financial_profile_matrix_note": "MLTM is missing. A neutral provisional financial assessment of 3.0 was used; calculate/approve MLTM before treating the rating as final.",
+            "missing_financial_inputs": ["maximum_loss_to_maturity_percent"],
+        }
+
     mltm = safe_float(maximum_loss_to_maturity_percent, default=15)
 
     if mltm >= 40:
@@ -554,6 +589,7 @@ def calculate_financial_profile_assessment(
         "financial_profile_assessment": numeric_assessment,
         "financial_profile_assessment_category": assessment_to_category(numeric_assessment),
         "financial_profile_matrix_note": "Balanced prototype matrix: Top-10 concentration is already counted in District Characteristics; MLTM remains the main financial loss-capacity driver.",
+        "missing_financial_inputs": [],
     }
 
 
@@ -616,6 +652,9 @@ The scorecard produces a **Factor Score Weighted Average of {weighted}**, which 
 - Holistic analysis adjustment notches: {results['holistic_adjustment_notches']}
 - Rating cap: {results['rating_cap']}
 - Final indicative rating: **{rating}**
+
+#### Data Completeness Note
+{("- This rating is provisional because these scorecard inputs are missing: " + ", ".join(results.get("missing_scorecard_inputs", []))) if results.get("missing_scorecard_inputs") else "- All core scoring inputs were supplied for this calculation."}
 """
 
 
@@ -630,7 +669,7 @@ def calculate_special_assessment_scorecard(inputs: Dict[str, Any]) -> Dict[str, 
 
     financial_results = calculate_financial_profile_assessment(
         top10_value,
-        inputs.get("maximum_loss_to_maturity_percent", 15),
+        inputs.get("maximum_loss_to_maturity_percent"),
     )
 
     factor_score_weighted_average = calculate_factor_score_weighted_average(
@@ -647,9 +686,14 @@ def calculate_special_assessment_scorecard(inputs: Dict[str, Any]) -> Dict[str, 
     holistic_adjustment_notches = int(safe_float(inputs.get("holistic_adjustment_notches", 0), 0))
     rating_cap = inputs.get("rating_cap", "None")
 
+    missing_inputs = []
+    if is_missing_scorecard_input(inputs.get("maximum_loss_to_maturity_percent")):
+        missing_inputs.append("maximum_loss_to_maturity_percent")
+
     rating_after_overriding_factors = notch_rating(initial_indicative_rating, -negative_override_notches)
     rating_after_holistic_analysis = notch_rating(rating_after_overriding_factors, holistic_adjustment_notches)
-    indicative_rating = apply_rating_cap(rating_after_holistic_analysis, rating_cap)
+    indicative_rating_base = apply_rating_cap(rating_after_holistic_analysis, rating_cap)
+    indicative_rating = indicative_rating_base + "*" if missing_inputs else indicative_rating_base
 
     results = {
         **economic_results,
@@ -663,6 +707,9 @@ def calculate_special_assessment_scorecard(inputs: Dict[str, Any]) -> Dict[str, 
         "rating_after_overriding_factors": rating_after_overriding_factors,
         "rating_after_holistic_analysis": rating_after_holistic_analysis,
         "indicative_rating": indicative_rating,
+        "indicative_rating_base": indicative_rating_base,
+        "is_provisional_rating": bool(missing_inputs),
+        "missing_scorecard_inputs": missing_inputs,
         "weighted_score": factor_score_weighted_average,
         "final_indicative_rating": indicative_rating,
         "economic_fundamentals_score": economic_results["economic_fundamentals_assessment"],
