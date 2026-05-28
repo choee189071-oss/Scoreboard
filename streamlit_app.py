@@ -4763,7 +4763,7 @@ with tab_calcs:
             )
             if st.button("Run Table Extraction for Taxpayer Table", key="run_taxpayer_table_engine"):
                 parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
-                pages = detect_candidate_pages(parsed_docs_for_engine, window_radius=2)
+                pages = detect_candidate_pages(parsed_docs_for_engine)
                 taxpayer_candidates = [p for p in pages if p.get("candidate_type") == "top_taxpayers"]
                 if taxpayer_candidates:
                     best = taxpayer_candidates[0]
@@ -5036,7 +5036,7 @@ Open Evidence Preview or use the upload / mapping fallback before approving.
             )
             if st.button("Run Table Extraction for VTL Inputs", key="run_vtl_table_engine"):
                 parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
-                pages = detect_candidate_pages(parsed_docs_for_engine, window_radius=2)
+                pages = detect_candidate_pages(parsed_docs_for_engine)
                 vtl_pages = [p for p in pages if p.get("candidate_type") in ["value_to_lien", "overlapping_debt"]]
                 combined_text = "\n\n".join([p.get("preview", "") for p in (vtl_pages or pages)])
                 extracted = extract_vtl_inputs_from_text(combined_text)
@@ -5224,7 +5224,7 @@ Open Evidence Preview or use the upload / mapping fallback before approving.
             )
             if st.button("Run Table Extraction for MLTM Cashflow", key="run_mltm_table_engine"):
                 parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
-                pages = detect_candidate_pages(parsed_docs_for_engine, window_radius=2)
+                pages = detect_candidate_pages(parsed_docs_for_engine)
                 mltm_pages = [p for p in pages if p.get("candidate_type") in ["debt_service", "reserve_fund"]]
                 combined_text = "\n\n".join([p.get("preview", "") for p in mltm_pages])
                 df_candidate = extract_mltm_cashflow_from_text(combined_text)
