@@ -2557,38 +2557,10 @@ c3.metric("Candidate Queue", candidate_count)
 c4.metric("Approved Inputs", approved_count)
 
 
-st.markdown(
-    """
-    <div style="
-        display:flex;
-        gap:10px;
-        align-items:center;
-        margin:18px 0 26px 0;
-        padding:14px 16px;
-        border:1px solid #e5e7eb;
-        border-radius:16px;
-        background:#fafafa;
-        font-size:15px;
-        font-weight:600;
-    ">
-        <span>① Deal Workspace</span>
-        <span style="color:#9ca3af;">→</span>
-        <span>② Calculators</span>
-        <span style="color:#9ca3af;">→</span>
-        <span>③ Reliability Review</span>
-        <span style="color:#9ca3af;">→</span>
-        <span>④ Scorecard</span>
-        <span style="color:#9ca3af;">→</span>
-        <span>⑤ Sources & Evidence</span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
 tab_deal, tab_calcs, tab_review, tab_scorecard, tab_sources = st.tabs(
     [
         "1 Deal Workspace",
-        "2 Calculators",
+        "2 Data & Calculators",
         "3 Reliability Review",
         "4 Scorecard",
         "5 Sources & Evidence",
@@ -2691,115 +2663,8 @@ with tab_deal:
         st.info("No parsed documents yet.")
 
     st.markdown("---")
-    st.subheader("C. Run Deal Intelligence Pipeline")
+    st.info("Next step: go to **2 Data & Calculators** to run data pulls, resolve missing fields, and build ratios/stress tests.")
 
-    p1, p2 = st.columns(2)
-
-    with p1:
-        try:
-            default_census_key = st.secrets.get("CENSUS_API_KEY", "")
-        except Exception:
-            default_census_key = ""
-        try:
-            default_fred_key = st.secrets.get("FRED_API_KEY", "")
-        except Exception:
-            default_fred_key = ""
-
-        census_api_key = st.text_input("Census API Key Override", type="password", value="")
-        fred_api_key = st.text_input("FRED API Key Override", type="password", value="")
-
-    with p2:
-        try:
-            default_openai_key = st.secrets.get("OPENAI_API_KEY", "")
-        except Exception:
-            default_openai_key = ""
-
-        openai_api_key = st.text_input("OpenAI API Key Override", type="password", value="")
-        model = st.selectbox("OpenAI Model", ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"], index=0)
-
-    selected_targets = st.multiselect(
-        "Fields to Extract from Uploaded Documents",
-        DEFAULT_TARGETS,
-        default=DEFAULT_TARGETS,
-    )
-
-    run_col1, run_col2, run_col3 = st.columns([1.1, 1.1, 2])
-
-    with run_col1:
-        run_auto_only = st.button("Run Auto Context Only")
-
-    with run_col2:
-        run_full = st.button("Run Deal Intelligence Pipeline", type="primary")
-
-    with run_col3:
-        st.caption("Pipeline = public data context + uploaded document extraction + candidate reliability review.")
-
-    if run_auto_only:
-        with st.spinner("Pulling structured public data..."):
-            run_auto_context_pull(
-                deal_setup,
-                census_api_key=census_api_key or default_census_key or None,
-                fred_api_key=fred_api_key or default_fred_key or None,
-            )
-        st.success("Auto context pull completed.")
-
-    if run_full:
-        with st.spinner("Step 1/2: Pulling structured public data..."):
-            run_auto_context_pull(
-                deal_setup,
-                census_api_key=census_api_key or default_census_key or None,
-                fred_api_key=fred_api_key or default_fred_key or None,
-            )
-
-        if st.session_state.get("parsed_documents"):
-            with st.spinner("Step 2/2: Running document AI extraction..."):
-                result = run_document_extraction_pipeline(
-                    deal_setup=deal_setup,
-                    selected_targets=selected_targets,
-                    api_key=openai_api_key or default_openai_key,
-                    model=model,
-                )
-
-            if result.get("ok", False):
-                st.success("Deal intelligence pipeline completed.")
-            else:
-                st.warning(result.get("error", "Document extraction did not complete. Auto context was still pulled."))
-        else:
-            st.warning("Auto context completed. No documents uploaded, so document extraction was skipped.")
-
-    st.markdown("---")
-    st.subheader("D. Missing Data Resolver")
-    st.caption("Use safe semi-auto tools to resolve fields that should not be guessed. Results replace the manual_required rows after approval.")
-    resolver_tab1, resolver_tab2, resolver_tab3 = st.tabs(["Local Unemployment", "Assessed Value", "Housing Proxy"])
-    with resolver_tab1:
-        render_local_unemployment_resolver(deal_setup, key_prefix="deal_workspace")
-    with resolver_tab2:
-        render_assessed_value_upload_parser(key_prefix="deal_workspace")
-    with resolver_tab3:
-        render_housing_market_proxy_resolver(key_prefix="deal_workspace")
-
-    if st.session_state.get("auto_data_results"):
-        st.subheader("Auto Context Results")
-        auto_context_df = auto_data_results_to_dataframe(st.session_state["auto_data_results"])
-        auto_context_df = auto_context_df.fillna("").replace({None: "", "None": "", "nan": "", "NaN": ""})
-        st.dataframe(auto_context_df, use_container_width=True)
-
-    if st.session_state.get("parsed_documents"):
-        st.subheader("Parsed Document Preview")
-        for doc in st.session_state.get("parsed_documents", []):
-            title = f"{doc.get('file_name')} — {doc.get('detected_document_type', 'Unclassified')}"
-            with st.expander(title, expanded=False):
-                if doc.get("warnings"):
-                    for warning in doc.get("warnings"):
-                        st.warning(warning)
-                st.text_area("Parsed Text Preview", doc.get("text", "")[:5000], height=220)
-                for table in doc.get("tables", []):
-                    st.write(table.get("table_name"))
-                    st.dataframe(pd.DataFrame(table.get("preview", [])), use_container_width=True)
-
-
-    st.markdown("---")
-    st.info("Next step: go to **2 Calculators** if any ratios/stress tests need to be built, then move to **3 Reliability Review**.")
 
 # =============================================================================
 # Tab 3: Reliability Review
@@ -3060,30 +2925,132 @@ with tab_scorecard:
 # =============================================================================
 
 with tab_calcs:
-    st.header("2. Analytical Calculators")
+    st.header("2. Data & Calculators Workspace")
     st.caption(
-        "Use these workspaces to calculate values that are not reliably available from public APIs or document extraction."
+        "Run market/public-data pulls, resolve missing fields safely, then calculate deal-specific ratios and stress tests."
     )
 
-    calc_tab1, calc_tab2, calc_tab3, calc_tab4, calc_tab5, calc_tab6 = st.tabs(
+    st.markdown("---")
+    st.subheader("A. Deal Intelligence Pipeline")
+
+    p1, p2 = st.columns(2)
+
+    with p1:
+        try:
+            default_census_key = st.secrets.get("CENSUS_API_KEY", "")
+        except Exception:
+            default_census_key = ""
+        try:
+            default_fred_key = st.secrets.get("FRED_API_KEY", "")
+        except Exception:
+            default_fred_key = ""
+
+        census_api_key = st.text_input("Census API Key Override", type="password", value="")
+        fred_api_key = st.text_input("FRED API Key Override", type="password", value="")
+
+    with p2:
+        try:
+            default_openai_key = st.secrets.get("OPENAI_API_KEY", "")
+        except Exception:
+            default_openai_key = ""
+
+        openai_api_key = st.text_input("OpenAI API Key Override", type="password", value="")
+        model = st.selectbox("OpenAI Model", ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"], index=0)
+
+    selected_targets = st.multiselect(
+        "Fields to Extract from Uploaded Documents",
+        DEFAULT_TARGETS,
+        default=DEFAULT_TARGETS,
+    )
+
+    run_col1, run_col2, run_col3 = st.columns([1.1, 1.1, 2])
+
+    with run_col1:
+        run_auto_only = st.button("Run Auto Context Only")
+
+    with run_col2:
+        run_full = st.button("Run Deal Intelligence Pipeline", type="primary")
+
+    with run_col3:
+        st.caption("Pipeline = public data context + uploaded document extraction + candidate reliability review.")
+
+    if run_auto_only:
+        with st.spinner("Pulling structured public data..."):
+            run_auto_context_pull(
+                deal_setup,
+                census_api_key=census_api_key or default_census_key or None,
+                fred_api_key=fred_api_key or default_fred_key or None,
+            )
+        st.success("Auto context pull completed.")
+
+    if run_full:
+        with st.spinner("Step 1/2: Pulling structured public data..."):
+            run_auto_context_pull(
+                deal_setup,
+                census_api_key=census_api_key or default_census_key or None,
+                fred_api_key=fred_api_key or default_fred_key or None,
+            )
+
+        if st.session_state.get("parsed_documents"):
+            with st.spinner("Step 2/2: Running document AI extraction..."):
+                result = run_document_extraction_pipeline(
+                    deal_setup=deal_setup,
+                    selected_targets=selected_targets,
+                    api_key=openai_api_key or default_openai_key,
+                    model=model,
+                )
+
+            if result.get("ok", False):
+                st.success("Deal intelligence pipeline completed.")
+            else:
+                st.warning(result.get("error", "Document extraction did not complete. Auto context was still pulled."))
+        else:
+            st.warning("Auto context completed. No documents uploaded, so document extraction was skipped.")
+
+    st.markdown("---")
+    st.subheader("B. Missing Data Resolver")
+    st.caption("Use safe semi-auto tools to resolve fields that should not be guessed. Results replace the manual_required rows after approval.")
+    resolver_tab1, resolver_tab2, resolver_tab3 = st.tabs(["Local Unemployment", "Assessed Value", "Housing Proxy"])
+    with resolver_tab1:
+        render_local_unemployment_resolver(deal_setup, key_prefix="data_workspace")
+    with resolver_tab2:
+        render_assessed_value_upload_parser(key_prefix="data_workspace")
+    with resolver_tab3:
+        render_housing_market_proxy_resolver(key_prefix="data_workspace")
+
+    if st.session_state.get("auto_data_results"):
+        st.subheader("Auto Context Results")
+        auto_context_df = auto_data_results_to_dataframe(st.session_state["auto_data_results"])
+        auto_context_df = auto_context_df.fillna("").replace({None: "", "None": "", "nan": "", "NaN": ""})
+        st.dataframe(auto_context_df, use_container_width=True)
+
+    if st.session_state.get("parsed_documents"):
+        st.subheader("Parsed Document Preview")
+        for doc in st.session_state.get("parsed_documents", []):
+            title = f"{doc.get('file_name')} — {doc.get('detected_document_type', 'Unclassified')}"
+            with st.expander(title, expanded=False):
+                if doc.get("warnings"):
+                    for warning in doc.get("warnings"):
+                        st.warning(warning)
+                st.text_area("Parsed Text Preview", doc.get("text", "")[:5000], height=220)
+                for table in doc.get("tables", []):
+                    st.write(table.get("table_name"))
+                    st.dataframe(pd.DataFrame(table.get("preview", [])), use_container_width=True)
+
+
+
+
+    st.markdown("---")
+    st.subheader("C. Analytical Calculators")
+    st.caption("Use these workspaces for ratios/stress tests that require analyst inputs or uploaded schedules.")
+
+    calc_tab1, calc_tab2, calc_tab3 = st.tabs(
         [
             "Taxpayer Concentration",
             "Value-to-Lien",
             "MLTM Stress Test",
-            "BLS / LAUS",
-            "Assessed Value Upload",
-            "Housing Proxy",
         ]
     )
-
-    with calc_tab4:
-        render_local_unemployment_resolver(st.session_state.get("deal_setup", {}), key_prefix="sources_resolver")
-
-    with calc_tab5:
-        render_assessed_value_upload_parser(key_prefix="calc_tab")
-
-    with calc_tab6:
-        render_housing_market_proxy_resolver(key_prefix="calc_tab")
 
     with calc_tab1:
         st.subheader("Taxpayer Concentration Builder")
