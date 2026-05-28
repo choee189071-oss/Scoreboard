@@ -1037,12 +1037,40 @@ c3.metric("Candidate Queue", candidate_count)
 c4.metric("Approved Inputs", approved_count)
 
 
-tab_deal, tab_review, tab_scorecard, tab_calcs, tab_sources = st.tabs(
+st.markdown(
+    """
+    <div style="
+        display:flex;
+        gap:10px;
+        align-items:center;
+        margin:18px 0 26px 0;
+        padding:14px 16px;
+        border:1px solid #e5e7eb;
+        border-radius:16px;
+        background:#fafafa;
+        font-size:15px;
+        font-weight:600;
+    ">
+        <span>① Deal Workspace</span>
+        <span style="color:#9ca3af;">→</span>
+        <span>② Calculators</span>
+        <span style="color:#9ca3af;">→</span>
+        <span>③ Reliability Review</span>
+        <span style="color:#9ca3af;">→</span>
+        <span>④ Scorecard</span>
+        <span style="color:#9ca3af;">→</span>
+        <span>⑤ Sources & Evidence</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+tab_deal, tab_calcs, tab_review, tab_scorecard, tab_sources = st.tabs(
     [
         "1 Deal Workspace",
-        "2 Reliability Review",
-        "3 Scorecard",
-        "4 Calculators",
+        "2 Calculators",
+        "3 Reliability Review",
+        "4 Scorecard",
         "5 Sources & Evidence",
     ]
 )
@@ -1053,9 +1081,9 @@ tab_deal, tab_review, tab_scorecard, tab_calcs, tab_sources = st.tabs(
 # =============================================================================
 
 with tab_deal:
-    st.header("Deal Workspace")
+    st.header("1. Deal Workspace")
     st.write(
-        "Set up the deal once, then run the full pipeline: structured public data + uploaded evidence + AI candidate extraction."
+        "Start here: set up the deal, upload evidence, and run the public-data + document-intelligence pipeline."
     )
 
     st.subheader("A. Deal Setup")
@@ -1237,14 +1265,17 @@ with tab_deal:
                     st.dataframe(pd.DataFrame(table.get("preview", [])), use_container_width=True)
 
 
+    st.markdown("---")
+    st.info("Next step: go to **2 Calculators** if any ratios/stress tests need to be built, then move to **3 Reliability Review**.")
+
 # =============================================================================
-# Tab 2: Reliability Review
+# Tab 3: Reliability Review
 # =============================================================================
 
 with tab_review:
-    st.header("Reliability Review")
+    st.header("3. Reliability Review")
     st.caption(
-        "Missing fields are intentionally left blank. Values only appear after they are auto-pulled, calculated, manually entered, or approved from AI candidates."
+        "Review candidate values before they enter the scorecard. Missing fields stay blank; Needs Review items require analyst approval."
     )
 
     matrix_df = build_data_reliability_matrix()
@@ -1315,12 +1346,15 @@ with tab_review:
     st.dataframe(build_data_reliability_matrix(), use_container_width=True)
 
 
+    st.markdown("---")
+    st.info("Next step: go to **4 Scorecard** after approving or overriding key values.")
+
 # =============================================================================
-# Tab 3: Scorecard
+# Tab 4: Scorecard
 # =============================================================================
 
 with tab_scorecard:
-    st.header("Special Assessment Debt Scorecard")
+    st.header("4. Special Assessment Debt Scorecard")
 
     defaults_for_scorecard = get_default_scorecard_inputs()
     st.info(
@@ -1493,7 +1527,10 @@ with tab_scorecard:
 # =============================================================================
 
 with tab_calcs:
-    st.header("Analytical Calculators")
+    st.header("2. Analytical Calculators")
+    st.caption(
+        "Use these workspaces to calculate values that are not reliably available from public APIs or document extraction."
+    )
 
     calc_tab1, calc_tab2, calc_tab3 = st.tabs(["Taxpayer Concentration", "Value-to-Lien", "MLTM Stress Test"])
 
@@ -1623,7 +1660,7 @@ with tab_calcs:
 # =============================================================================
 
 with tab_sources:
-    st.header("Sources & Evidence")
+    st.header("5. Sources & Evidence")
 
     st.subheader("Source Priority Engine")
     st.dataframe(source_priority_table(), use_container_width=True)
