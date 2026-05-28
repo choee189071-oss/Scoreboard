@@ -33,6 +33,15 @@ from modules.reliability_layer import (
     build_reliability_summary,
 )
 
+from modules.table_extraction_engine import (
+    detect_candidate_pages,
+    reconstruct_taxpayer_table_from_text,
+    extract_vtl_inputs_from_text,
+    extract_mltm_cashflow_from_text,
+    confidence_score,
+    confidence_status,
+)
+
 st.set_page_config(page_title="Municipal Credit Deal Workspace", layout="wide")
 
 st.title("Municipal Credit Deal Workspace")
@@ -3755,6 +3764,48 @@ with tab_calcs:
         st.subheader("Taxpayer Concentration Builder")
         render_ai_fill_warning()
 
+        with st.expander("AI Table Extraction Engine", expanded=False):
+            st.warning(
+                "AI/table extraction is only a data-entry accelerator. Always double-check source documents, table headers, units, and dates before approving."
+            )
+            if st.button("Run Table Extraction for Taxpayer Table", key="run_taxpayer_table_engine"):
+                parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
+                pages = detect_candidate_pages(parsed_docs_for_engine)
+                taxpayer_candidates = [p for p in pages if p.get("candidate_type") == "top_taxpayers"]
+                if taxpayer_candidates:
+                    best = taxpayer_candidates[0]
+                    df_candidate = reconstruct_taxpayer_table_from_text(best.get("preview", ""))
+                    st.session_state["taxpayer_table_candidate_engine"] = {
+                        "source_document": best.get("document"),
+                        "matched_terms": best.get("matched_terms", []),
+                        "table": df_candidate,
+                        "confidence": confidence_score(len(df_candidate), 10),
+                        "status": confidence_status(confidence_score(len(df_candidate), 10)),
+                        "preview": best.get("preview", ""),
+                    }
+                else:
+                    st.session_state["taxpayer_table_candidate_engine"] = None
+                    st.info("No strong taxpayer table candidate found.")
+
+            taxpayer_engine_candidate = st.session_state.get("taxpayer_table_candidate_engine")
+            if taxpayer_engine_candidate:
+                st.write(f"**Source document:** {taxpayer_engine_candidate.get('source_document', '')}")
+                st.write(f"**Confidence:** {taxpayer_engine_candidate.get('confidence', 0)}% — `{taxpayer_engine_candidate.get('status', '')}`")
+                table_candidate = taxpayer_engine_candidate.get("table", pd.DataFrame())
+                if table_candidate is None or table_candidate.empty:
+                    st.warning("A possible taxpayer section was found, but no clean taxpayer rows were reconstructed. Use the upload/mapping fallback or verify the evidence manually.")
+                else:
+                    st.dataframe(table_candidate, use_container_width=True, hide_index=True)
+                with st.expander("Evidence Preview"):
+                    st.text(str(taxpayer_engine_candidate.get("preview", ""))[:3000])
+                if st.button("Approve and Load Taxpayer Table", key="approve_taxpayer_table_engine"):
+                    if table_candidate is not None and not table_candidate.empty:
+                        sync_taxpayer_table_to_editor(table_candidate.copy(), source=taxpayer_engine_candidate.get("source_document"))
+                        st.success("Taxpayer table loaded into calculator. Review before calculating.")
+                        rerun_after_approve()
+                    else:
+                        st.error("No usable taxpayer table rows to load.")
+
         parsed_docs = st.session_state.get("parsed_documents", []) or []
         with st.expander("AI Fill from Uploaded Documents", expanded=False):
             st.caption("Looks for a Top Taxpayers / Special Tax Levy table in uploaded OS or Appendix documents, then lets you approve it into the calculator.")
@@ -3916,6 +3967,49 @@ with tab_calcs:
         st.subheader("Value-to-Lien Calculator")
         render_ai_fill_warning()
 
+        with st.expander("AI Table Extraction Engine", expanded=False):
+            st.warning(
+                "AI/table extraction may misread PDF tables. Verify source, units, and whether debt figures are direct, overlapping, or total."
+            )
+            if st.button("Run Table Extraction for VTL Inputs", key="run_vtl_table_engine"):
+                parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
+                pages = detect_candidate_pages(parsed_docs_for_engine)
+                vtl_pages = [p for p in pages if p.get("candidate_type") in ["value_to_lien", "overlapping_debt"]]
+                combined_text = "\n\n".join([p.get("preview", "") for p in (vtl_pages or pages)])
+                extracted = extract_vtl_inputs_from_text(combined_text)
+                found_count = sum(v is not None for v in extracted.values())
+                st.session_state["vtl_table_candidate_engine"] = {
+                    **extracted,
+                    "confidence": confidence_score(found_count, 3),
+                    "status": confidence_status(confidence_score(found_count, 3)),
+                    "preview": combined_text[:4000],
+                }
+
+            vtl_engine_candidate = st.session_state.get("vtl_table_candidate_engine")
+            if vtl_engine_candidate:
+                c1, c2, c3, c4 = st.columns(4)
+                av = vtl_engine_candidate.get("assessed_value")
+                dd = vtl_engine_candidate.get("direct_debt")
+                od = vtl_engine_candidate.get("overlapping_debt")
+                c1.metric("Assessed Value", "" if av is None else f"${float(av):,.0f}")
+                c2.metric("Direct Debt", "" if dd is None else f"${float(dd):,.0f}")
+                c3.metric("Overlapping Debt", "" if od is None else f"${float(od):,.0f}")
+                c4.metric("Confidence", f"{vtl_engine_candidate.get('confidence', 0)}%")
+                st.caption(f"Extraction status: `{vtl_engine_candidate.get('status', '')}`")
+                with st.expander("Evidence Preview"):
+                    st.text(vtl_engine_candidate.get("preview", ""))
+                if st.button("Approve and Pre-Fill VTL Inputs", key="approve_vtl_table_engine"):
+                    existing = st.session_state.get("vtl_prefill", {}) or {}
+                    for k in ["assessed_value", "direct_debt", "overlapping_debt"]:
+                        if vtl_engine_candidate.get(k) is not None:
+                            existing[k] = float(vtl_engine_candidate[k])
+                    if existing:
+                        sync_vtl_prefill_to_widgets(existing, source_note="AI Table Extraction Engine")
+                        st.success("VTL inputs pre-filled. Review before calculating.")
+                        rerun_after_approve()
+                    else:
+                        st.error("No usable VTL values were extracted.")
+
         parsed_docs = st.session_state.get("parsed_documents", []) or []
         with st.expander("AI Fill from Uploaded Documents", expanded=False):
             st.caption("Searches uploaded documents for assessed value, direct debt, and overlapping debt. Approving only pre-fills the calculator; you can still edit everything.")
@@ -4056,6 +4150,41 @@ with tab_calcs:
     with calc_tab3:
         st.subheader("Maximum Loss-to-Maturity Stress Test")
         render_ai_fill_warning()
+
+        with st.expander("AI Table Extraction Engine", expanded=False):
+            st.warning(
+                "AI/table extraction may misread debt-service schedules. Verify years, levy/revenue columns, debt-service columns, and units."
+            )
+            if st.button("Run Table Extraction for MLTM Cashflow", key="run_mltm_table_engine"):
+                parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
+                pages = detect_candidate_pages(parsed_docs_for_engine)
+                mltm_pages = [p for p in pages if p.get("candidate_type") in ["debt_service", "reserve_fund"]]
+                combined_text = "\n\n".join([p.get("preview", "") for p in mltm_pages])
+                df_candidate = extract_mltm_cashflow_from_text(combined_text)
+                st.session_state["mltm_cashflow_candidate_engine"] = {
+                    "table": df_candidate,
+                    "confidence": confidence_score(len(df_candidate), 10),
+                    "status": confidence_status(confidence_score(len(df_candidate), 10)),
+                    "preview": combined_text[:5000],
+                }
+
+            mltm_engine_candidate = st.session_state.get("mltm_cashflow_candidate_engine")
+            if mltm_engine_candidate:
+                st.write(f"**Confidence:** {mltm_engine_candidate.get('confidence', 0)}% — `{mltm_engine_candidate.get('status', '')}`")
+                mltm_table = mltm_engine_candidate.get("table", pd.DataFrame())
+                if mltm_table is None or mltm_table.empty:
+                    st.warning("A possible debt-service section was found, but no clean year / levy / debt-service rows were reconstructed. Use upload/mapping fallback or verify the evidence manually.")
+                else:
+                    st.dataframe(mltm_table, use_container_width=True, hide_index=True)
+                with st.expander("Evidence Preview"):
+                    st.text(mltm_engine_candidate.get("preview", ""))
+                if st.button("Approve and Load MLTM Cashflow", key="approve_mltm_table_engine"):
+                    if mltm_table is not None and not mltm_table.empty:
+                        sync_mltm_schedule_to_editor(mltm_table.copy(), source="AI Table Extraction Engine")
+                        st.success("MLTM cashflow loaded into calculator. Review before calculating.")
+                        rerun_after_approve()
+                    else:
+                        st.error("No usable MLTM cashflow rows to load.")
 
         parsed_docs = st.session_state.get("parsed_documents", []) or []
         with st.expander("AI Fill from Uploaded Documents", expanded=False):
