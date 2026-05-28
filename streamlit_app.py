@@ -1,6 +1,9 @@
 import streamlit as st
 import pandas as pd
 import re
+import os
+import json
+import requests
 from datetime import datetime
 
 from modules.scoring_special_assessment import (
@@ -1394,6 +1397,157 @@ def pull_realtor_inventory_yoy(market_name, realtor_csv_url=None):
     }
 
 
+
+def get_secret_or_env(name):
+    """Read an API key from Streamlit secrets or environment without crashing locally."""
+    try:
+        value = st.secrets.get(name, "")
+        if value:
+            return value
+    except Exception:
+        pass
+    return os.getenv(name, "") or ""
+
+
+def extract_json_object(text):
+    """Best-effort JSON extractor for AI responses."""
+    if not text:
+        raise ValueError("AI response was empty.")
+    text = text.strip()
+    # Remove common markdown fences if the model included them.
+    text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"```$", "", text).strip()
+    if text.startswith("{") and text.endswith("}"):
+        return json.loads(text)
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        raise ValueError("Could not find a JSON object in AI response.")
+    return json.loads(match.group())
+
+
+def normalize_optional_percent(value):
+    """Convert an AI-returned percentage into float or None."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in ["", "none", "null", "n/a", "not available", "unknown"]:
+        return None
+    try:
+        return float(str(value).replace("%", "").replace(",", "").strip())
+    except Exception:
+        return None
+
+
+def run_ai_market_source_pull(market_name, state, api_key, model="gpt-4.1-mini"):
+    """
+    AI web-search source scout for housing inventory and distress.
+
+    Safe design:
+    - AI may search the web and propose values + source URLs.
+    - It returns raw inputs as candidates only.
+    - Analyst must approve before values are used by the classifier.
+    """
+    if not api_key:
+        raise ValueError("OpenAI API key is required for AI web source pull.")
+
+    prompt = f"""
+You are assisting a municipal credit analyst. Search the web for the most reliable recent public data sources for:
+1) housing inventory year-over-year change, and
+2) a housing distress proxy such as foreclosure rate/change, delinquency rate/change, or another clearly labeled distress metric.
+
+Geography: {market_name}, {state}
+
+Rules:
+- Prefer official/public or reputable data sources: Realtor.com Research Data, Redfin Data Center, ATTOM public reports, CoreLogic reports, Federal Reserve/FRED if available, county/public dashboards.
+- Do NOT invent values. If you cannot verify a number from a source, return null for that value.
+- Source URLs must be direct source pages or downloadable data links when available.
+- Distress proxy can be a foreclosure/delinquency percent, foreclosure YoY change, or a clearly named distress indicator. Explain what it is in distress_metric_label.
+- Return JSON only. No markdown.
+
+JSON schema:
+{{
+  "inventory_yoy": number|null,
+  "inventory_metric_label": string|null,
+  "inventory_date": string|null,
+  "inventory_source_title": string|null,
+  "inventory_source_url": string|null,
+  "distress_proxy": number|null,
+  "distress_metric_label": string|null,
+  "distress_date": string|null,
+  "distress_source_title": string|null,
+  "distress_source_url": string|null,
+  "affordability_worse_than_us": boolean|null,
+  "confidence": number,
+  "notes": string
+}}
+"""
+
+    payload = {
+        "model": model,
+        "input": prompt,
+        "tools": [{"type": "web_search_preview"}],
+        "tool_choice": "auto",
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    response = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=90)
+    if response.status_code >= 400:
+        raise ValueError(f"OpenAI web source pull failed: {response.status_code} {response.text[:500]}")
+    data = response.json()
+
+    output_text = data.get("output_text")
+    if not output_text:
+        chunks = []
+        for item in data.get("output", []) or []:
+            for content in item.get("content", []) or []:
+                if content.get("type") in ["output_text", "text"]:
+                    chunks.append(content.get("text", ""))
+        output_text = "\n".join(chunks).strip()
+
+    parsed = extract_json_object(output_text)
+    parsed["inventory_yoy"] = normalize_optional_percent(parsed.get("inventory_yoy"))
+    parsed["distress_proxy"] = normalize_optional_percent(parsed.get("distress_proxy"))
+    try:
+        parsed["confidence"] = float(parsed.get("confidence", 0.55))
+    except Exception:
+        parsed["confidence"] = 0.55
+    parsed["ok"] = bool(parsed.get("inventory_yoy") is not None or parsed.get("distress_proxy") is not None)
+    return parsed
+
+
+def approve_ai_market_source_inputs(ai_sources, key_prefix="main"):
+    """Store AI-sourced market inputs after analyst approval and write raw-data rows."""
+    context = st.session_state.get(f"{key_prefix}_housing_market_context", {}) or {"errors": []}
+
+    if ai_sources.get("inventory_yoy") is not None:
+        st.session_state[f"{key_prefix}_auto_inventory_yoy"] = float(ai_sources["inventory_yoy"])
+        context["ai_inventory"] = {
+            "ok": True,
+            "inventory_yoy": float(ai_sources["inventory_yoy"]),
+            "matched_place": ai_sources.get("inventory_source_title") or "AI-sourced public housing inventory source",
+            "date_or_year": ai_sources.get("inventory_date") or datetime.now().date().isoformat(),
+            "source_url": ai_sources.get("inventory_source_url") or "",
+            "inventory_column": ai_sources.get("inventory_metric_label") or "AI-sourced inventory YoY",
+            "confidence": ai_sources.get("confidence", 0.55),
+        }
+
+    if ai_sources.get("distress_proxy") is not None:
+        st.session_state[f"{key_prefix}_auto_distress_proxy"] = float(ai_sources["distress_proxy"])
+        context["ai_distress"] = {
+            "ok": True,
+            "distress_proxy": float(ai_sources["distress_proxy"]),
+            "matched_place": ai_sources.get("distress_source_title") or "AI-sourced public distress source",
+            "date_or_year": ai_sources.get("distress_date") or datetime.now().date().isoformat(),
+            "source_url": ai_sources.get("distress_source_url") or "",
+            "distress_metric_label": ai_sources.get("distress_metric_label") or "AI-sourced distress proxy",
+            "confidence": ai_sources.get("confidence", 0.55),
+        }
+
+    if ai_sources.get("affordability_worse_than_us") is not None:
+        st.session_state[f"{key_prefix}_auto_affordability_worse"] = bool(ai_sources.get("affordability_worse_than_us"))
+
+    st.session_state[f"{key_prefix}_housing_market_context"] = context
+    upsert_housing_market_context_rows(context)
+    return context
+
 def upsert_housing_market_context_rows(context):
     """Write pulled housing market raw inputs into Auto Context Results, preserving source links."""
     if context.get("fhfa"):
@@ -1430,6 +1584,40 @@ def upsert_housing_market_context_rows(context):
             unique_key="housing_inventory_yoy_realtor",
         )
 
+    if context.get("ai_inventory"):
+        inv = context["ai_inventory"]
+        upsert_auto_data_result_by_target(
+            {
+                "data_source": "AI Source Scout",
+                "series_label": inv.get("matched_place", "AI-sourced inventory source"),
+                "target_data": "Inventory YoY",
+                "status": "needs_review_approved_source",
+                "date_or_year": inv.get("date_or_year", ""),
+                "value": f"{inv.get('inventory_yoy', 0):.2f}%",
+                "source_url": inv.get("source_url", ""),
+                "notes": f"AI found source; analyst approved raw input. Metric: {inv.get('inventory_column', '')}. Confidence {float(inv.get('confidence', 0.55)):.0%}.",
+            },
+            target_contains="Inventory YoY",
+            unique_key="housing_inventory_yoy_ai_source",
+        )
+
+    if context.get("ai_distress"):
+        dis = context["ai_distress"]
+        upsert_auto_data_result_by_target(
+            {
+                "data_source": "AI Source Scout",
+                "series_label": dis.get("matched_place", "AI-sourced distress source"),
+                "target_data": "Distress Proxy",
+                "status": "needs_review_approved_source",
+                "date_or_year": dis.get("date_or_year", ""),
+                "value": f"{dis.get('distress_proxy', 0):.2f}%",
+                "source_url": dis.get("source_url", ""),
+                "notes": f"AI found source; analyst approved raw input. Metric: {dis.get('distress_metric_label', '')}. Confidence {float(dis.get('confidence', 0.55)):.0%}.",
+            },
+            target_contains="Distress Proxy",
+            unique_key="housing_distress_proxy_ai_source",
+        )
+
 
 def render_housing_market_proxy_resolver(key_prefix="main"):
     st.subheader("Housing Market Trend / Distress Proxy")
@@ -1446,7 +1634,10 @@ def render_housing_market_proxy_resolver(key_prefix="main"):
 
     with auto_tab:
         st.markdown("#### Pull Housing Market Context")
-        st.caption("FHFA is used for home-price YoY. Realtor.com can be used for inventory YoY when a direct data download link is supplied.")
+        st.caption(
+            "FHFA is used for home-price YoY. Realtor.com direct downloads are preferred for inventory. "
+            "When inventory or distress are missing, AI Source Scout can search the web, show the source link, and wait for analyst approval before using the inputs."
+        )
 
         c1, c2 = st.columns(2)
         with c1:
@@ -1461,16 +1652,30 @@ def render_housing_market_proxy_resolver(key_prefix="main"):
                 value="https://www.fhfa.gov/hpi/download/monthly/hpi_master.csv",
                 key=f"{key_prefix}_fhfa_hpi_url",
             )
-        with c2:
             state_for_match = st.text_input("State fallback", value=default_state, key=f"{key_prefix}_housing_state_fallback")
+        with c2:
             realtor_csv_url = st.text_input(
                 "Optional Realtor.com direct CSV/XLSX URL for inventory",
                 value=st.session_state.get("last_realtor_csv_url", ""),
                 key=f"{key_prefix}_realtor_inventory_url",
                 help="Use Realtor.com Research Data Library → Monthly Housing Inventory → Metro/County historical data download.",
             )
+            default_openai_key_for_market = get_secret_or_env("OPENAI_API_KEY")
+            ai_market_api_key = st.text_input(
+                "Optional OpenAI API Key for AI Source Scout",
+                value="",
+                type="password",
+                key=f"{key_prefix}_ai_market_api_key",
+                help="Leave blank to use st.secrets['OPENAI_API_KEY'] if configured.",
+            )
+            ai_market_model = st.selectbox(
+                "AI Source Scout Model",
+                ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"],
+                index=0,
+                key=f"{key_prefix}_ai_market_model",
+            )
 
-        pull_col, classify_col = st.columns(2)
+        pull_col, ai_col, classify_col = st.columns(3)
         with pull_col:
             if st.button("Run Housing Market Context Pull", key=f"{key_prefix}_run_housing_context_pull", type="primary"):
                 context = {"errors": []}
@@ -1499,6 +1704,48 @@ def render_housing_market_proxy_resolver(key_prefix="main"):
                     st.success("Housing market context pulled. Review below, then generate a candidate.")
                 for err in context.get("errors", []):
                     st.warning(err)
+
+        with ai_col:
+            if st.button("AI Search Missing Inventory / Distress Sources", key=f"{key_prefix}_ai_search_market_sources"):
+                try:
+                    source_result = run_ai_market_source_pull(
+                        market_name=market_name,
+                        state=state_for_match,
+                        api_key=ai_market_api_key or default_openai_key_for_market,
+                        model=ai_market_model,
+                    )
+                    st.session_state[f"{key_prefix}_ai_market_source_result"] = source_result
+                    if source_result.get("ok"):
+                        st.success("AI found one or more source-backed market inputs. Review and approve below.")
+                    else:
+                        st.warning("AI searched but did not find enough source-backed numeric inputs. Check the notes below.")
+                    st.json(source_result)
+                except Exception as e:
+                    st.error(f"AI Source Scout failed: {e}")
+
+        ai_source_result = st.session_state.get(f"{key_prefix}_ai_market_source_result")
+        if ai_source_result:
+            st.markdown("#### AI Source Scout Candidate Inputs")
+            c_ai1, c_ai2, c_ai3 = st.columns(3)
+            inv_val = ai_source_result.get("inventory_yoy")
+            dis_val = ai_source_result.get("distress_proxy")
+            c_ai1.metric("Inventory YoY Candidate", "" if inv_val is None else f"{float(inv_val):.2f}%")
+            c_ai2.metric("Distress Proxy Candidate", "" if dis_val is None else f"{float(dis_val):.2f}%")
+            c_ai3.metric("AI Confidence", f"{float(ai_source_result.get('confidence', 0.55)):.0%}")
+            if ai_source_result.get("inventory_source_url"):
+                st.markdown(f"**Inventory source:** [{ai_source_result.get('inventory_source_title') or 'source'}]({ai_source_result.get('inventory_source_url')})")
+            if ai_source_result.get("distress_source_url"):
+                st.markdown(f"**Distress source:** [{ai_source_result.get('distress_source_title') or 'source'}]({ai_source_result.get('distress_source_url')})")
+            if ai_source_result.get("notes"):
+                st.caption(ai_source_result.get("notes"))
+
+            approve_ai_col, reject_ai_col = st.columns([1, 2])
+            with approve_ai_col:
+                if st.button("Approve AI-Sourced Inputs", key=f"{key_prefix}_approve_ai_market_sources"):
+                    approve_ai_market_source_inputs(ai_source_result, key_prefix=key_prefix)
+                    st.success("Approved AI-sourced raw inputs. Inventory/distress rows were updated with source links.")
+            with reject_ai_col:
+                st.caption("Approval only stores raw inputs. Scorecard classification still requires Generate Candidate → Reliability Review approval.")
 
         with classify_col:
             if st.button("Generate Candidate from Pulled Data", key=f"{key_prefix}_generate_candidate_from_pulled"):
@@ -1554,6 +1801,14 @@ def render_housing_market_proxy_resolver(key_prefix="main"):
                 realtor = context["realtor"]
                 cols[1].metric("Inventory YoY", f"{realtor['inventory_yoy']:.2f}%")
                 st.caption(f"Realtor matched geography: {realtor.get('matched_place')} | Source: {realtor.get('source_url')}")
+            if context.get("ai_inventory"):
+                inv = context["ai_inventory"]
+                cols[1].metric("Inventory YoY", f"{inv['inventory_yoy']:.2f}%")
+                st.caption(f"AI-approved inventory source: {inv.get('matched_place')} | Source: {inv.get('source_url')}")
+            if context.get("ai_distress"):
+                dis = context["ai_distress"]
+                cols[2].metric("Distress Proxy", f"{dis['distress_proxy']:.2f}%")
+                st.caption(f"AI-approved distress source: {dis.get('matched_place')} | Source: {dis.get('source_url')}")
             if context.get("errors"):
                 with st.expander("Pull warnings / missing sources", expanded=False):
                     for err in context["errors"]:
@@ -1616,8 +1871,8 @@ def render_housing_market_proxy_resolver(key_prefix="main"):
             pd.DataFrame(
                 [
                     {"Input": "Home Price YoY", "Preferred Source": "FHFA HPI", "Mode": "Auto pull", "Link": "https://www.fhfa.gov/hpi/download/monthly/hpi_master.csv"},
-                    {"Input": "Inventory YoY", "Preferred Source": "Realtor.com Research Data", "Mode": "Paste direct CSV/XLSX link or upload", "Link": "https://www.realtor.com/research/data/"},
-                    {"Input": "Distress Proxy", "Preferred Source": "Foreclosure/delinquency vendor or internal proxy", "Mode": "Manual/optional", "Link": ""},
+                    {"Input": "Inventory YoY", "Preferred Source": "Realtor.com / Redfin / AI Source Scout", "Mode": "Direct CSV preferred; AI source scout fallback; analyst approve", "Link": "https://www.realtor.com/research/data/"},
+                    {"Input": "Distress Proxy", "Preferred Source": "ATTOM/CoreLogic/FRED/county source via AI Source Scout", "Mode": "AI source scout fallback; analyst approve", "Link": ""},
                     {"Input": "Affordability", "Preferred Source": "Census income + home price context", "Mode": "Analyst checkbox / future auto", "Link": ""},
                 ]
             ),
