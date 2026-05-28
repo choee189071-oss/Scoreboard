@@ -926,6 +926,104 @@ def classify_housing_market_proxy(price_yoy, inventory_yoy, distress_proxy, affo
     }
 
 
+def infer_distress_proxy_from_indicators(price_yoy=None, inventory_yoy=None, local_unemployment_diff=None, affordability_worse=False):
+    """
+    Safe fallback when no observed foreclosure/delinquency source is available.
+    This does NOT claim to be an observed foreclosure/default rate. It is an inferred
+    stress signal derived from pulled housing/macroeconomic indicators and must be
+    analyst-verified before use.
+    """
+    def _num(x, default=0.0):
+        try:
+            if x is None or (isinstance(x, str) and x.strip() == ""):
+                return default
+            return float(str(x).replace("%", "").replace(",", ""))
+        except Exception:
+            return default
+
+    price = _num(price_yoy)
+    inventory = _num(inventory_yoy)
+    unemp_diff = _num(local_unemployment_diff)
+    points = 0
+    reasons = []
+
+    if price <= -8:
+        points += 3
+        reasons.append("home prices are materially declining")
+    elif price < 0:
+        points += 2
+        reasons.append("home prices are declining")
+    elif price < 3:
+        points += 1
+        reasons.append("home price growth is soft")
+
+    if inventory >= 40:
+        points += 2
+        reasons.append("inventory is rising sharply")
+    elif inventory >= 15:
+        points += 1
+        reasons.append("inventory is rising")
+
+    if unemp_diff >= 2:
+        points += 2
+        reasons.append("local unemployment is materially above the U.S. rate")
+    elif unemp_diff >= 0.75:
+        points += 1
+        reasons.append("local unemployment is above the U.S. rate")
+
+    if affordability_worse:
+        points += 1
+        reasons.append("affordability appears worse than national figures")
+
+    # This is an inferred stress proxy, not an observed foreclosure/default rate.
+    if points <= 1:
+        proxy = 0.25
+        label = "Low inferred distress"
+        confidence = 0.55
+    elif points <= 3:
+        proxy = 1.00
+        label = "Moderate inferred distress"
+        confidence = 0.50
+    elif points <= 5:
+        proxy = 2.00
+        label = "Elevated inferred distress"
+        confidence = 0.45
+    else:
+        proxy = 3.00
+        label = "High inferred distress"
+        confidence = 0.40
+
+    return {
+        "distress_proxy": proxy,
+        "distress_metric_label": label,
+        "source_type": "AI-inferred from pulled market indicators; not an observed foreclosure/delinquency statistic",
+        "confidence": confidence,
+        "reasons": reasons or ["no major negative indicator detected"],
+        "needs_double_check": True,
+    }
+
+
+def get_local_unemployment_diff_from_session():
+    """Best-effort reader for unemployment difference already approved/pulled elsewhere."""
+    val = (st.session_state.get("approved_inputs", {}) or {}).get("unemployment_rate_difference_vs_us")
+    try:
+        if val is not None:
+            return float(str(val).replace("%", ""))
+    except Exception:
+        pass
+    for r in st.session_state.get("auto_data_results", []) or []:
+        target = str(r.get("target_data") or r.get("Target Data") or "").lower()
+        if "local unemployment" in target:
+            text = str(r.get("value") or r.get("Extracted / Calculated Value") or "")
+            m = re.search(r"diff\s*([+-]?\d+(?:\.\d+)?)", text)
+            if m:
+                try:
+                    return float(m.group(1))
+                except Exception:
+                    pass
+    return None
+
+
 def add_candidate_value(scorecard_key, scorecard_field, value, source_method, confidence=0.70, notes="", source_document="", source_url=""):
     """Add a reviewable candidate instead of directly overwriting the scorecard."""
     candidate = {
@@ -1514,7 +1612,12 @@ JSON schema:
 
 
 def approve_ai_market_source_inputs(ai_sources, key_prefix="main"):
-    """Store AI-sourced market inputs after analyst approval and write raw-data rows."""
+    """Store AI-sourced market inputs after analyst approval and write raw-data rows.
+
+    If no observed distress source is found, create a clearly labeled inferred stress proxy
+    from already pulled indicators. This is intentionally conservative: it is never presented
+    as an observed foreclosure/delinquency statistic and carries a double-check warning.
+    """
     context = st.session_state.get(f"{key_prefix}_housing_market_context", {}) or {"errors": []}
 
     if ai_sources.get("inventory_yoy") is not None:
@@ -1527,6 +1630,7 @@ def approve_ai_market_source_inputs(ai_sources, key_prefix="main"):
             "source_url": ai_sources.get("inventory_source_url") or "",
             "inventory_column": ai_sources.get("inventory_metric_label") or "AI-sourced inventory YoY",
             "confidence": ai_sources.get("confidence", 0.55),
+            "needs_double_check": True,
         }
 
     if ai_sources.get("distress_proxy") is not None:
@@ -1537,9 +1641,41 @@ def approve_ai_market_source_inputs(ai_sources, key_prefix="main"):
             "matched_place": ai_sources.get("distress_source_title") or "AI-sourced public distress source",
             "date_or_year": ai_sources.get("distress_date") or datetime.now().date().isoformat(),
             "source_url": ai_sources.get("distress_source_url") or "",
-            "distress_metric_label": ai_sources.get("distress_metric_label") or "AI-sourced distress proxy",
+            "distress_metric_label": ai_sources.get("distress_metric_label") or "AI-sourced observed distress proxy",
             "confidence": ai_sources.get("confidence", 0.55),
+            "needs_double_check": True,
         }
+    else:
+        # Safe fallback: infer stress from pulled indicators if no public foreclosure/delinquency metric was found.
+        price = st.session_state.get(f"{key_prefix}_auto_home_price_yoy", 0.0)
+        inv = st.session_state.get(f"{key_prefix}_auto_inventory_yoy")
+        if inv is None and ai_sources.get("inventory_yoy") is not None:
+            inv = ai_sources.get("inventory_yoy")
+        aff = ai_sources.get("affordability_worse_than_us")
+        if aff is None:
+            aff = st.session_state.get(f"{key_prefix}_auto_affordability_worse", True)
+        inferred = infer_distress_proxy_from_indicators(
+            price_yoy=price,
+            inventory_yoy=inv or 0.0,
+            local_unemployment_diff=get_local_unemployment_diff_from_session(),
+            affordability_worse=bool(aff),
+        )
+        st.session_state[f"{key_prefix}_auto_distress_proxy"] = float(inferred["distress_proxy"])
+        context["inferred_distress"] = {
+            "ok": True,
+            "distress_proxy": float(inferred["distress_proxy"]),
+            "matched_place": "Inferred from FHFA/Realtor/FRED/Census-style indicators",
+            "date_or_year": datetime.now().date().isoformat(),
+            "source_url": (context.get("fhfa", {}) or {}).get("source_url", ""),
+            "distress_metric_label": inferred["distress_metric_label"],
+            "source_type": inferred["source_type"],
+            "confidence": inferred["confidence"],
+            "reasons": inferred["reasons"],
+            "needs_double_check": True,
+        }
+        context.setdefault("errors", []).append(
+            "No observed foreclosure/delinquency source was found. The app created an inferred distress proxy from pulled indicators; analysts must double-check sources before approval."
+        )
 
     if ai_sources.get("affordability_worse_than_us") is not None:
         st.session_state[f"{key_prefix}_auto_affordability_worse"] = bool(ai_sources.get("affordability_worse_than_us"))
@@ -1616,6 +1752,23 @@ def upsert_housing_market_context_rows(context):
             },
             target_contains="Distress Proxy",
             unique_key="housing_distress_proxy_ai_source",
+        )
+
+    if context.get("inferred_distress"):
+        dis = context["inferred_distress"]
+        upsert_auto_data_result_by_target(
+            {
+                "data_source": "AI Inferred / Analyst Review Required",
+                "series_label": dis.get("matched_place", "Inferred from pulled indicators"),
+                "target_data": "Observed / Inferred Distress Proxy",
+                "status": "needs_double_check",
+                "date_or_year": dis.get("date_or_year", ""),
+                "value": f"{dis.get('distress_proxy', 0):.2f}% ({dis.get('distress_metric_label', 'inferred stress proxy')})",
+                "source_url": dis.get("source_url", ""),
+                "notes": "AI-inferred fallback only; not an observed foreclosure/delinquency statistic. Analysts must independently verify all underlying public sources before approval. " + "; ".join(dis.get("reasons", [])),
+            },
+            target_contains="Distress Proxy",
+            unique_key="housing_distress_proxy_inferred",
         )
 
 
@@ -1706,7 +1859,7 @@ def render_housing_market_proxy_resolver(key_prefix="main"):
                     st.warning(err)
 
         with ai_col:
-            if st.button("AI Search Missing Inventory / Distress Sources", key=f"{key_prefix}_ai_search_market_sources"):
+            if st.button("Find Missing Public Market Sources", key=f"{key_prefix}_ai_search_market_sources"):
                 try:
                     source_result = run_ai_market_source_pull(
                         market_name=market_name,
@@ -1725,17 +1878,38 @@ def render_housing_market_proxy_resolver(key_prefix="main"):
 
         ai_source_result = st.session_state.get(f"{key_prefix}_ai_market_source_result")
         if ai_source_result:
-            st.markdown("#### AI Source Scout Candidate Inputs")
+            st.markdown("#### Suggested Public Market Inputs")
+            st.warning(
+                "AI-sourced or inferred market signals may be incomplete, stale, or mismatched by geography. "
+                "Analysts should independently double-check every source link before approval."
+            )
             c_ai1, c_ai2, c_ai3 = st.columns(3)
             inv_val = ai_source_result.get("inventory_yoy")
             dis_val = ai_source_result.get("distress_proxy")
+            inferred_preview = None
+            if dis_val is None:
+                inferred_preview = infer_distress_proxy_from_indicators(
+                    price_yoy=st.session_state.get(f"{key_prefix}_auto_home_price_yoy", 0.0),
+                    inventory_yoy=inv_val if inv_val is not None else st.session_state.get(f"{key_prefix}_auto_inventory_yoy", 0.0),
+                    local_unemployment_diff=get_local_unemployment_diff_from_session(),
+                    affordability_worse=bool(ai_source_result.get("affordability_worse_than_us") if ai_source_result.get("affordability_worse_than_us") is not None else True),
+                )
+                dis_display = f"{float(inferred_preview['distress_proxy']):.2f}% inferred"
+            else:
+                dis_display = f"{float(dis_val):.2f}% observed"
             c_ai1.metric("Inventory YoY Candidate", "" if inv_val is None else f"{float(inv_val):.2f}%")
-            c_ai2.metric("Distress Proxy Candidate", "" if dis_val is None else f"{float(dis_val):.2f}%")
-            c_ai3.metric("AI Confidence", f"{float(ai_source_result.get('confidence', 0.55)):.0%}")
+            c_ai2.metric("Observed / Inferred Distress Proxy", dis_display)
+            c_ai3.metric("Source Scout Confidence", f"{float(ai_source_result.get('confidence', 0.55)):.0%}")
             if ai_source_result.get("inventory_source_url"):
                 st.markdown(f"**Inventory source:** [{ai_source_result.get('inventory_source_title') or 'source'}]({ai_source_result.get('inventory_source_url')})")
             if ai_source_result.get("distress_source_url"):
                 st.markdown(f"**Distress source:** [{ai_source_result.get('distress_source_title') or 'source'}]({ai_source_result.get('distress_source_url')})")
+            elif inferred_preview:
+                st.warning(
+                    "No observed foreclosure/delinquency source was found. The distress value shown above is inferred from pulled indicators, "
+                    "not directly observed. Double-check sources before approving."
+                )
+                st.caption("Inferred reasons: " + "; ".join(inferred_preview.get("reasons", [])))
             if ai_source_result.get("notes"):
                 st.caption(ai_source_result.get("notes"))
 
@@ -1745,10 +1919,10 @@ def render_housing_market_proxy_resolver(key_prefix="main"):
                     approve_ai_market_source_inputs(ai_source_result, key_prefix=key_prefix)
                     st.success("Approved AI-sourced raw inputs. Inventory/distress rows were updated with source links.")
             with reject_ai_col:
-                st.caption("Approval only stores raw inputs. Scorecard classification still requires Generate Candidate → Reliability Review approval.")
+                st.caption("Approval stores raw inputs or clearly labeled inferred inputs. Scorecard classification still requires Generate Housing Risk Interpretation → Reliability Review approval.")
 
         with classify_col:
-            if st.button("Generate Candidate from Pulled Data", key=f"{key_prefix}_generate_candidate_from_pulled"):
+            if st.button("Generate Housing Risk Interpretation", key=f"{key_prefix}_generate_candidate_from_pulled"):
                 price_yoy_auto = st.session_state.get(f"{key_prefix}_auto_home_price_yoy", 0.0)
                 inventory_yoy_auto = st.session_state.get(f"{key_prefix}_auto_inventory_yoy", 0.0)
                 distress_proxy_auto = st.session_state.get(f"{key_prefix}_auto_distress_proxy", 0.0)
@@ -1761,6 +1935,12 @@ def render_housing_market_proxy_resolver(key_prefix="main"):
                     source_links.append(f"FHFA: {context['fhfa'].get('source_url', '')}")
                 if context.get("realtor"):
                     source_links.append(f"Realtor: {context['realtor'].get('source_url', '')}")
+                if context.get("ai_inventory"):
+                    source_links.append(f"AI-approved inventory source: {context['ai_inventory'].get('source_url', '')}")
+                if context.get("ai_distress"):
+                    source_links.append(f"AI-approved observed distress source: {context['ai_distress'].get('source_url', '')}")
+                if context.get("inferred_distress"):
+                    source_links.append("Inferred distress proxy: derived from pulled indicators; verify sources")
                 notes = "Reasons: " + "; ".join(housing["reasons"]) + (" | Sources: " + " | ".join(source_links) if source_links else "")
 
                 add_candidate_value(
@@ -1807,8 +1987,17 @@ def render_housing_market_proxy_resolver(key_prefix="main"):
                 st.caption(f"AI-approved inventory source: {inv.get('matched_place')} | Source: {inv.get('source_url')}")
             if context.get("ai_distress"):
                 dis = context["ai_distress"]
-                cols[2].metric("Distress Proxy", f"{dis['distress_proxy']:.2f}%")
+                cols[2].metric("Observed Distress Proxy", f"{dis['distress_proxy']:.2f}%")
                 st.caption(f"AI-approved distress source: {dis.get('matched_place')} | Source: {dis.get('source_url')}")
+                st.warning("AI-sourced distress data must be independently verified before scorecard approval.")
+            if context.get("inferred_distress"):
+                dis = context["inferred_distress"]
+                cols[2].metric("Inferred Distress Proxy", f"{dis['distress_proxy']:.2f}%")
+                st.warning(
+                    "This distress proxy is inferred from market indicators, not an observed foreclosure/delinquency statistic. "
+                    "Double-check FHFA/Realtor/FRED/Census-style sources before approval."
+                )
+                st.caption("Inferred reasons: " + "; ".join(dis.get("reasons", [])))
             if context.get("errors"):
                 with st.expander("Pull warnings / missing sources", expanded=False):
                     for err in context["errors"]:
@@ -1871,8 +2060,8 @@ def render_housing_market_proxy_resolver(key_prefix="main"):
             pd.DataFrame(
                 [
                     {"Input": "Home Price YoY", "Preferred Source": "FHFA HPI", "Mode": "Auto pull", "Link": "https://www.fhfa.gov/hpi/download/monthly/hpi_master.csv"},
-                    {"Input": "Inventory YoY", "Preferred Source": "Realtor.com / Redfin / AI Source Scout", "Mode": "Direct CSV preferred; AI source scout fallback; analyst approve", "Link": "https://www.realtor.com/research/data/"},
-                    {"Input": "Distress Proxy", "Preferred Source": "ATTOM/CoreLogic/FRED/county source via AI Source Scout", "Mode": "AI source scout fallback; analyst approve", "Link": ""},
+                    {"Input": "Inventory YoY", "Preferred Source": "Realtor.com / Redfin / AI Source Scout", "Mode": "Direct CSV preferred; AI source scout fallback or inferred proxy; analyst approve + double-check warning", "Link": "https://www.realtor.com/research/data/"},
+                    {"Input": "Distress Proxy", "Preferred Source": "ATTOM/CoreLogic/FRED/county source via AI Source Scout", "Mode": "AI source scout fallback or inferred proxy; analyst approve + double-check warning", "Link": ""},
                     {"Input": "Affordability", "Preferred Source": "Census income + home price context", "Mode": "Analyst checkbox / future auto", "Link": ""},
                 ]
             ),
