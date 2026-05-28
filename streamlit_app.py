@@ -2518,6 +2518,179 @@ def run_document_extraction_pipeline(deal_setup, selected_targets, api_key, mode
     return result
 
 
+
+
+# =============================================================================
+# AI-Assisted Calculator Fill Helpers
+# =============================================================================
+
+def _compact_text(value, max_len=12000):
+    text = str(value or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_len]
+
+
+def _tables_from_parsed_docs(parsed_docs):
+    """Flatten parsed document tables into DataFrames with document metadata."""
+    out = []
+    for doc in parsed_docs or []:
+        file_name = doc.get("file_name", "Uploaded document")
+        for t in doc.get("tables", []) or []:
+            preview = t.get("preview", [])
+            if not preview:
+                continue
+            try:
+                df = pd.DataFrame(preview)
+                if not df.empty:
+                    out.append({"source_document": file_name, "table_name": t.get("table_name", "table"), "df": df})
+            except Exception:
+                continue
+    return out
+
+
+def _column_score(col_name, positive_terms, negative_terms=None):
+    name = str(col_name).lower()
+    score = sum(1 for term in positive_terms if term in name)
+    if negative_terms:
+        score -= sum(1 for term in negative_terms if term in name)
+    return score
+
+
+def _best_column(df, positive_terms, negative_terms=None):
+    if df is None or df.empty:
+        return None
+    ranked = []
+    for c in df.columns:
+        ranked.append((_column_score(c, positive_terms, negative_terms), c))
+    ranked = sorted(ranked, reverse=True, key=lambda x: x[0])
+    return ranked[0][1] if ranked and ranked[0][0] > 0 else None
+
+
+def _parse_percent_series(series):
+    vals = []
+    for v in series:
+        if v is None:
+            vals.append(None)
+            continue
+        s = str(v).replace(',', '').strip()
+        m = re.search(r"-?\d+(?:\.\d+)?", s)
+        vals.append(float(m.group()) if m else None)
+    return pd.Series(vals)
+
+
+def _parse_money_value(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        return float(value)
+    s = str(value)
+    # Handles $3,454,244,692, 3.4 billion, 183.2 million, etc.
+    m = re.search(r"\$?\s*(-?\d+(?:,\d{3})*(?:\.\d+)?|-?\d+(?:\.\d+)?)\s*(billion|million|thousand|bn|mm|m|k)?", s, re.I)
+    if not m:
+        return None
+    num = float(m.group(1).replace(',', ''))
+    unit = (m.group(2) or '').lower()
+    if unit in ['billion', 'bn']:
+        num *= 1_000_000_000
+    elif unit in ['million', 'mm', 'm']:
+        num *= 1_000_000
+    elif unit in ['thousand', 'k']:
+        num *= 1_000
+    return num
+
+
+def _parse_money_series(series):
+    return pd.Series([_parse_money_value(v) for v in series])
+
+
+def scan_taxpayer_table_candidates(parsed_docs):
+    """AI-assisted but deterministic table scout for Top Taxpayer / levy concentration tables."""
+    candidates = []
+    for item in _tables_from_parsed_docs(parsed_docs):
+        df = item['df'].copy()
+        taxpayer_col = _best_column(df, ['taxpayer', 'owner', 'property owner', 'name'])
+        levy_col = _best_column(df, ['levy', 'special tax', 'percent', '%', 'share'], negative_terms=['amount', '$'])
+        if taxpayer_col and levy_col:
+            temp = pd.DataFrame({
+                'taxpayer_name': df[taxpayer_col].astype(str),
+                'levy_percent': _parse_percent_series(df[levy_col]),
+            }).dropna(subset=['taxpayer_name', 'levy_percent'])
+            temp = temp[temp['taxpayer_name'].str.strip().ne('')]
+            temp = temp.head(20)
+            if len(temp) >= 3:
+                candidates.append({
+                    'source_document': item['source_document'],
+                    'table_name': item['table_name'],
+                    'data': temp,
+                    'confidence': 0.82 if len(temp) >= 8 else 0.68,
+                    'notes': f"Detected taxpayer column '{taxpayer_col}' and levy/percent column '{levy_col}'."
+                })
+    return candidates
+
+
+def scan_vtl_inputs_from_documents(parsed_docs):
+    """Find assessed value / direct debt / overlapping debt candidates from text and tables."""
+    text = ' '.join([_compact_text(doc.get('text', ''), 30000) for doc in parsed_docs or []])
+    patterns = {
+        'assessed_value': [r'assessed valuation[^$\d]{0,80}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)',
+                           r'assessed value[^$\d]{0,80}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)'],
+        'direct_debt': [r'direct debt[^$\d]{0,80}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)',
+                        r'bonds outstanding[^$\d]{0,80}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)'],
+        'overlapping_debt': [r'overlapping debt[^$\d]{0,80}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)'],
+    }
+    result = {'assessed_value': None, 'direct_debt': None, 'overlapping_debt': None, 'evidence': [], 'confidence': 0.55}
+    for key, pats in patterns.items():
+        for pat in pats:
+            m = re.search(pat, text, re.I)
+            if m:
+                value = _parse_money_value(m.group(1))
+                if value and value > 0:
+                    result[key] = value
+                    start, end = max(m.start()-120, 0), min(m.end()+120, len(text))
+                    result['evidence'].append({'field': key, 'excerpt': text[start:end]})
+                    break
+    found = sum(v is not None for k, v in result.items() if k in ['assessed_value', 'direct_debt', 'overlapping_debt'])
+    result['confidence'] = {0: 0.0, 1: 0.55, 2: 0.70, 3: 0.82}.get(found, 0.55)
+    return result
+
+
+def scan_mltm_cashflow_candidates(parsed_docs):
+    """Find candidate levy / debt service schedule tables for MLTM."""
+    candidates = []
+    reserve_candidate = None
+    text = ' '.join([_compact_text(doc.get('text', ''), 30000) for doc in parsed_docs or []])
+    reserve_match = re.search(r'(reserve fund|debt service reserve)[^$\d]{0,120}(\$?\s*[\d,]+(?:\.\d+)?\s*(?:billion|million|thousand|bn|mm|m|k)?)', text, re.I)
+    if reserve_match:
+        reserve_candidate = _parse_money_value(reserve_match.group(2))
+
+    for item in _tables_from_parsed_docs(parsed_docs):
+        df = item['df'].copy()
+        year_col = _best_column(df, ['year', 'fiscal', 'period'])
+        levy_col = _best_column(df, ['levy', 'special tax', 'revenue', 'tax revenues'], negative_terms=['percent', '%'])
+        debt_col = _best_column(df, ['debt service', 'annual debt service', 'principal and interest', 'p&i'])
+        if year_col and levy_col and debt_col:
+            temp = pd.DataFrame({
+                'year': _parse_percent_series(df[year_col]).astype('Int64'),
+                'special_tax_levy': _parse_money_series(df[levy_col]),
+                'annual_debt_service': _parse_money_series(df[debt_col]),
+            }).dropna(subset=['year', 'special_tax_levy', 'annual_debt_service'])
+            if len(temp) >= 3:
+                candidates.append({
+                    'source_document': item['source_document'],
+                    'table_name': item['table_name'],
+                    'data': temp,
+                    'reserve_fund': reserve_candidate,
+                    'confidence': 0.80 if len(temp) >= 8 else 0.65,
+                    'notes': f"Detected year '{year_col}', levy/revenue '{levy_col}', and debt service '{debt_col}'."
+                })
+    return candidates
+
+
+def render_ai_fill_warning():
+    st.warning(
+        "AI-assisted extraction is only a data-entry accelerator. Always double-check source documents, table headers, units, and dates before approving any value."
+    )
+
 # =============================================================================
 # Sidebar
 # =============================================================================
@@ -3054,27 +3227,57 @@ with tab_calcs:
 
     with calc_tab1:
         st.subheader("Taxpayer Concentration Builder")
-        default_taxpayers = pd.DataFrame(
-            {
-                "taxpayer_name": [
-                    "Lennar Landbank",
-                    "Lennar",
-                    "Risewell Landbank",
-                    "Risewell",
-                    "Beazer Landbank",
-                    "Beazer",
-                    "Dignity Community Care",
-                    "Ridge EG West LP",
-                    "PF Portfolio 2 LP",
-                    "EGBL 15 LLC",
-                ],
-                "levy_percent": [6.1, 0.0, 4.0, 0.0, 1.5, 0.0, 1.5, 1.4, 0.9, 0.7],
-            }
-        )
+        render_ai_fill_warning()
 
-        taxpayer_df = st.data_editor(default_taxpayers, num_rows="dynamic", use_container_width=True)
+        parsed_docs = st.session_state.get("parsed_documents", []) or []
+        with st.expander("AI Fill from Uploaded Documents", expanded=False):
+            st.caption("Looks for a Top Taxpayers / Special Tax Levy table in uploaded OS or Appendix documents, then lets you approve it into the calculator.")
+            if not parsed_docs:
+                st.info("Upload an OS / Appendix PDF in Deal Workspace first.")
+            else:
+                if st.button("Scan Documents for Taxpayer Table", key="ai_scan_taxpayer_table"):
+                    st.session_state["taxpayer_ai_candidates"] = scan_taxpayer_table_candidates(parsed_docs)
 
-        if st.button("Calculate Taxpayer Concentration"):
+                candidates = st.session_state.get("taxpayer_ai_candidates", []) or []
+                if not candidates:
+                    st.caption("No taxpayer-table candidate scanned yet, or no strong table was found.")
+                else:
+                    for i, cand in enumerate(candidates):
+                        with st.container(border=True):
+                            st.write(f"**Source:** {cand['source_document']} — {cand['table_name']}")
+                            st.write(f"**Confidence:** {cand['confidence']:.0%}")
+                            st.caption(cand.get("notes", ""))
+                            st.dataframe(cand["data"], use_container_width=True, hide_index=True)
+                            if st.button("Approve and Load This Taxpayer Table", key=f"approve_taxpayer_ai_table_{i}"):
+                                st.session_state["taxpayer_table_default"] = cand["data"].copy()
+                                st.session_state["taxpayer_table_source"] = cand["source_document"]
+                                st.success("Loaded into Taxpayer Concentration Builder. Please review, edit if needed, then calculate.")
+
+        default_taxpayers = st.session_state.get("taxpayer_table_default")
+        if default_taxpayers is None:
+            default_taxpayers = pd.DataFrame(
+                {
+                    "taxpayer_name": [
+                        "Lennar Landbank",
+                        "Lennar",
+                        "Risewell Landbank",
+                        "Risewell",
+                        "Beazer Landbank",
+                        "Beazer",
+                        "Dignity Community Care",
+                        "Ridge EG West LP",
+                        "PF Portfolio 2 LP",
+                        "EGBL 15 LLC",
+                    ],
+                    "levy_percent": [6.1, 0.0, 4.0, 0.0, 1.5, 0.0, 1.5, 1.4, 0.9, 0.7],
+                }
+            )
+        else:
+            st.info(f"AI-loaded table source: {st.session_state.get('taxpayer_table_source', 'uploaded document')}. Review before calculating.")
+
+        taxpayer_df = st.data_editor(default_taxpayers, num_rows="dynamic", use_container_width=True, key="taxpayer_concentration_editor")
+
+        if st.button("Calculate Taxpayer Concentration", key="calculate_taxpayer_concentration"):
             concentration = calculate_taxpayer_concentration(taxpayer_df)
             safe_add_approved_input(
                 "top10_taxpayers_percent_of_total_levy",
@@ -3097,17 +3300,70 @@ with tab_calcs:
 
     with calc_tab2:
         st.subheader("Value-to-Lien Calculator")
+        render_ai_fill_warning()
+
+        parsed_docs = st.session_state.get("parsed_documents", []) or []
+        with st.expander("AI Fill from Uploaded Documents", expanded=False):
+            st.caption("Searches uploaded documents for assessed value, direct debt, and overlapping debt. Approving only pre-fills the calculator; you can still edit everything.")
+            if not parsed_docs:
+                st.info("Upload an OS / Appendix PDF or assessor file first.")
+            else:
+                if st.button("Scan Documents for VTL Inputs", key="ai_scan_vtl_inputs"):
+                    st.session_state["vtl_ai_candidate"] = scan_vtl_inputs_from_documents(parsed_docs)
+
+                cand = st.session_state.get("vtl_ai_candidate")
+                if cand:
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Assessed Value", "" if cand.get("assessed_value") is None else f"${cand['assessed_value']:,.0f}")
+                    c2.metric("Direct Debt", "" if cand.get("direct_debt") is None else f"${cand['direct_debt']:,.0f}")
+                    c3.metric("Overlapping Debt", "" if cand.get("overlapping_debt") is None else f"${cand['overlapping_debt']:,.0f}")
+                    c4.metric("Confidence", f"{cand.get('confidence', 0):.0%}")
+                    if cand.get("evidence"):
+                        with st.expander("Evidence snippets"):
+                            for e in cand["evidence"]:
+                                st.write(f"**{e['field']}**")
+                                st.code(e["excerpt"])
+                    if st.button("Approve and Pre-Fill VTL Inputs", key="approve_vtl_ai_inputs"):
+                        existing = st.session_state.get("vtl_prefill", {}) or {}
+                        for k in ["assessed_value", "direct_debt", "overlapping_debt"]:
+                            if cand.get(k) is not None:
+                                existing[k] = float(cand[k])
+                        st.session_state["vtl_prefill"] = existing
+                        st.success("Loaded into Value-to-Lien calculator. Review/edit before calculating.")
+
+        vtl_prefill = st.session_state.get("vtl_prefill", {}) or {}
+        if st.session_state.get("suggested_assessed_value") is not None:
+            vtl_prefill.setdefault("assessed_value", float(st.session_state.get("suggested_assessed_value")))
+
         col1, col2 = st.columns(2)
 
         with col1:
-            assessed_value = st.number_input("Assessed Value", min_value=0.0, value=3454244692.0, step=1000000.0)
-            direct_debt = st.number_input("Direct Debt", min_value=0.0, value=183240000.0, step=1000000.0)
+            assessed_value = st.number_input(
+                "Assessed Value",
+                min_value=0.0,
+                value=float(vtl_prefill.get("assessed_value", 3454244692.0)),
+                step=1000000.0,
+                key="vtl_assessed_value_input",
+            )
+            direct_debt = st.number_input(
+                "Direct Debt",
+                min_value=0.0,
+                value=float(vtl_prefill.get("direct_debt", 183240000.0)),
+                step=1000000.0,
+                key="vtl_direct_debt_input",
+            )
 
         with col2:
-            overlapping_debt = st.number_input("Overlapping Debt", min_value=0.0, value=38445099.0, step=1000000.0)
-            include_overlapping_debt = st.checkbox("Include Overlapping Debt", value=True)
+            overlapping_debt = st.number_input(
+                "Overlapping Debt",
+                min_value=0.0,
+                value=float(vtl_prefill.get("overlapping_debt", 38445099.0)),
+                step=1000000.0,
+                key="vtl_overlapping_debt_input",
+            )
+            include_overlapping_debt = st.checkbox("Include Overlapping Debt", value=True, key="vtl_include_overlapping_debt")
 
-        if st.button("Calculate Value-to-Lien"):
+        if st.button("Calculate Value-to-Lien", key="calculate_vtl"):
             vtl_results = calculate_value_to_lien(assessed_value, direct_debt, overlapping_debt, include_overlapping_debt)
             safe_add_approved_input(
                 "est_value_to_lien",
@@ -3123,41 +3379,81 @@ with tab_calcs:
 
     with calc_tab3:
         st.subheader("Maximum Loss-to-Maturity Stress Test")
-        initial_reserve_fund = st.number_input("Initial Reserve Fund", min_value=0.0, value=15439154.0, step=100000.0)
+        render_ai_fill_warning()
 
-        default_cashflow = pd.DataFrame(
-            {
-                "year": list(range(2027, 2037)),
-                "special_tax_levy": [
-                    12191803,
-                    12460759,
-                    12710019,
-                    12959939,
-                    13219518,
-                    13492483,
-                    13758628,
-                    14025653,
-                    14138513,
-                    14239823,
-                ],
-                "annual_debt_service": [
-                    11108912,
-                    11327963,
-                    11554563,
-                    11781763,
-                    12017744,
-                    12265894,
-                    12507844,
-                    12750594,
-                    12853194,
-                    12945294,
-                ],
-            }
+        parsed_docs = st.session_state.get("parsed_documents", []) or []
+        with st.expander("AI Fill from Uploaded Documents", expanded=False):
+            st.caption("Looks for a cashflow / debt-service schedule with year, special tax levy or revenue, and annual debt service columns.")
+            if not parsed_docs:
+                st.info("Upload a debt service schedule, OS appendix table, Excel, or CSV first.")
+            else:
+                if st.button("Scan Documents for MLTM Cashflow", key="ai_scan_mltm_cashflow"):
+                    st.session_state["mltm_ai_candidates"] = scan_mltm_cashflow_candidates(parsed_docs)
+
+                candidates = st.session_state.get("mltm_ai_candidates", []) or []
+                if not candidates:
+                    st.caption("No MLTM cashflow candidate scanned yet, or no strong schedule table was found.")
+                else:
+                    for i, cand in enumerate(candidates):
+                        with st.container(border=True):
+                            st.write(f"**Source:** {cand['source_document']} — {cand['table_name']}")
+                            st.write(f"**Confidence:** {cand['confidence']:.0%}")
+                            st.caption(cand.get("notes", ""))
+                            if cand.get("reserve_fund"):
+                                st.metric("Reserve Fund Candidate", f"${cand['reserve_fund']:,.0f}")
+                            st.dataframe(cand["data"], use_container_width=True, hide_index=True)
+                            if st.button("Approve and Load This MLTM Schedule", key=f"approve_mltm_ai_schedule_{i}"):
+                                st.session_state["mltm_cashflow_default"] = cand["data"].copy()
+                                if cand.get("reserve_fund"):
+                                    st.session_state["mltm_reserve_default"] = float(cand["reserve_fund"])
+                                st.session_state["mltm_schedule_source"] = cand["source_document"]
+                                st.success("Loaded into MLTM Stress Test. Review/edit before calculating.")
+
+        initial_reserve_fund = st.number_input(
+            "Initial Reserve Fund",
+            min_value=0.0,
+            value=float(st.session_state.get("mltm_reserve_default", 15439154.0)),
+            step=100000.0,
+            key="mltm_initial_reserve_fund",
         )
 
-        cashflow_df = st.data_editor(default_cashflow, num_rows="dynamic", use_container_width=True)
+        default_cashflow = st.session_state.get("mltm_cashflow_default")
+        if default_cashflow is None:
+            default_cashflow = pd.DataFrame(
+                {
+                    "year": list(range(2027, 2037)),
+                    "special_tax_levy": [
+                        12191803,
+                        12460759,
+                        12710019,
+                        12959939,
+                        13219518,
+                        13492483,
+                        13758628,
+                        14025653,
+                        14138513,
+                        14239823,
+                    ],
+                    "annual_debt_service": [
+                        11108912,
+                        11327963,
+                        11554563,
+                        11781763,
+                        12017744,
+                        12265894,
+                        12507844,
+                        12750594,
+                        12853194,
+                        12945294,
+                    ],
+                }
+            )
+        else:
+            st.info(f"AI-loaded schedule source: {st.session_state.get('mltm_schedule_source', 'uploaded document')}. Review before calculating.")
 
-        if st.button("Calculate MLTM"):
+        cashflow_df = st.data_editor(default_cashflow, num_rows="dynamic", use_container_width=True, key="mltm_cashflow_editor")
+
+        if st.button("Calculate MLTM", key="calculate_mltm"):
             mltm_results = calculate_mltm_from_cashflow(cashflow_df, initial_reserve_fund=initial_reserve_fund)
             safe_add_approved_input(
                 "maximum_loss_to_maturity_percent",
