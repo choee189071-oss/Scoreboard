@@ -1029,89 +1029,193 @@ def build_current_source_status_table():
     return clean_display_dataframe(df)
 
 
-def render_assessed_value_upload_parser():
-    st.subheader("Assessed Value Upload Parser")
-    st.caption("Safe mode: upload assessor / parcel / tax roll CSV or Excel. The app suggests columns, but analyst approves before it becomes source data.")
 
-    av_file = st.file_uploader(
-        "Upload assessor, parcel, or assessed-value file",
-        type=["csv", "xlsx", "xls"],
-        key="assessed_value_file",
+def extract_assessed_value_candidates_from_documents(parsed_docs):
+    """
+    Conservative regex extractor for OS / Appendix text.
+    It creates candidates only; analyst must approve before the value becomes source data.
+    """
+    candidates = []
+    patterns = [
+        r"(?:total\s+)?assessed\s+valuation[^\n\r$]{0,80}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+        r"(?:total\s+)?assessed\s+value[^\n\r$]{0,80}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+        r"taxable\s+assessed\s+value[^\n\r$]{0,80}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+        r"full\s+cash\s+value[^\n\r$]{0,80}\$?\s*([0-9][0-9,]{5,}(?:\.\d+)?)",
+    ]
+    for doc in parsed_docs or []:
+        text = doc.get("text", "") or ""
+        compact = re.sub(r"\s+", " ", text)
+        for pat in patterns:
+            for m in re.finditer(pat, compact, flags=re.IGNORECASE):
+                raw = m.group(1)
+                val = parse_numeric_input(raw, default=0.0)
+                if val <= 0:
+                    continue
+                start = max(0, m.start() - 180)
+                end = min(len(compact), m.end() + 180)
+                candidates.append({
+                    "value": float(val),
+                    "source_document": doc.get("file_name", "Uploaded document"),
+                    "excerpt": compact[start:end],
+                    "confidence": 0.62,
+                    "raw_value": raw,
+                })
+    # Deduplicate by value/document and favor larger values that look like total AV.
+    seen = set()
+    deduped = []
+    for c in sorted(candidates, key=lambda x: x["value"], reverse=True):
+        key = (round(c["value"], 0), c["source_document"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(c)
+    return deduped[:8]
+
+
+def approve_total_assessed_value(value, source_method, source_document="", confidence=0.75, notes=""):
+    safe_add_approved_input(
+        "total_assessed_value",
+        float(value),
+        status="Manual Input",
+        source_method=source_method,
+        source_document=source_document,
+        confidence=confidence,
+        notes=notes,
+    )
+    upsert_auto_data_result_by_target(
+        {
+            "data_source": "County Open Data / Assessor" if "Upload" in source_method or "Manual" in source_method else "OS / Appendix PDF",
+            "series_label": source_document,
+            "target_data": "Assessed value",
+            "status": "success",
+            "date_or_year": datetime.now().date().isoformat(),
+            "value": f"${float(value):,.0f}",
+            "source_url": "",
+            "notes": notes,
+        },
+        target_contains="Assessed value",
+        unique_key="assessed_value_resolved",
     )
 
-    if not av_file:
-        st.info("Best source: county assessor export, tax roll, parcel file, or OS table containing assessed valuation.")
-        return
+def render_assessed_value_upload_parser():
+    st.subheader("Assessed Value Resolver")
+    st.caption(
+        "Safe mode: try OS/Appendix extraction first, then assessor/parcel upload parsing, then manual override. "
+        "Nothing becomes source data until analyst approval."
+    )
 
-    try:
-        if av_file.name.lower().endswith(".csv"):
-            av_df = pd.read_csv(av_file)
+    av_tab1, av_tab2, av_tab3 = st.tabs(["OS / Appendix AI Extraction", "Assessor Upload Parser", "Manual Override"])
+
+    with av_tab1:
+        parsed_docs = st.session_state.get("parsed_documents", []) or []
+        if not parsed_docs:
+            st.info("Upload an OS / Appendix PDF in Deal Workspace first, then this tab can search for assessed value evidence.")
         else:
-            av_df = pd.read_excel(av_file)
+            st.write(f"Parsed documents available: {len(parsed_docs)}")
+            if st.button("Scan Uploaded Documents for Assessed Value", key="scan_docs_for_assessed_value"):
+                st.session_state["assessed_value_doc_candidates"] = extract_assessed_value_candidates_from_documents(parsed_docs)
 
-        st.write(f"Rows loaded: {len(av_df):,}")
-        st.dataframe(av_df.head(25), use_container_width=True)
+            candidates = st.session_state.get("assessed_value_doc_candidates", []) or []
+            if not candidates:
+                st.caption("No document candidates scanned yet, or no strong assessed-value pattern was found.")
+            else:
+                for i, c in enumerate(candidates):
+                    with st.container(border=True):
+                        st.metric("Candidate Assessed Value", f"${c['value']:,.0f}")
+                        st.write(f"**Document:** {c['source_document']}")
+                        st.write(f"**Confidence:** {c['confidence']:.0%}")
+                        with st.expander("Evidence excerpt"):
+                            st.write(c["excerpt"])
+                        if st.button("Approve This Document Candidate", key=f"approve_doc_assessed_value_{i}"):
+                            approve_total_assessed_value(
+                                c["value"],
+                                source_method="OS / Appendix AI-Assisted Extraction",
+                                source_document=c["source_document"],
+                                confidence=c["confidence"],
+                                notes=f"Approved from document evidence. Excerpt: {c['excerpt'][:500]}",
+                            )
+                            st.success("Assessed value approved and Auto Context row updated.")
 
-        suggested_cols = infer_assessed_value_columns(av_df)
-        all_cols = list(av_df.columns)
-        default_index = all_cols.index(suggested_cols[0]) if suggested_cols and suggested_cols[0] in all_cols else 0
-
-        value_col = st.selectbox(
-            "Assessed value column",
-            all_cols,
-            index=default_index,
-            key="assessed_value_column_select",
+    with av_tab2:
+        av_file = st.file_uploader(
+            "Upload assessor, parcel, or assessed-value file",
+            type=["csv", "xlsx", "xls"],
+            key="assessed_value_file",
         )
 
-        parsed_values = clean_money_series(av_df[value_col])
-        total_av = parsed_values.sum(skipna=True)
-        valid_rows = int(parsed_values.notna().sum())
-        numeric_share = valid_rows / max(len(av_df), 1)
+        if not av_file:
+            st.info("Best source: county assessor export, tax roll, parcel file, or OS table containing assessed valuation.")
+        else:
+            try:
+                if av_file.name.lower().endswith(".csv"):
+                    av_df = pd.read_csv(av_file)
+                else:
+                    av_df = pd.read_excel(av_file)
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Detected Total AV", f"${total_av:,.0f}")
-        c2.metric("Valid Numeric Rows", f"{valid_rows:,}")
-        c3.metric("Numeric Coverage", f"{numeric_share:.0%}")
+                st.write(f"Rows loaded: {len(av_df):,}")
+                st.dataframe(av_df.head(25), use_container_width=True)
 
-        st.caption("Suggested columns: " + (", ".join(map(str, suggested_cols[:5])) if suggested_cols else "No strong suggestion."))
+                suggested_cols = infer_assessed_value_columns(av_df)
+                all_cols = list(av_df.columns)
+                default_index = all_cols.index(suggested_cols[0]) if suggested_cols and suggested_cols[0] in all_cols else 0
 
-        confidence = 0.90 if suggested_cols and value_col == suggested_cols[0] and numeric_share >= 0.60 else 0.75
-        if numeric_share < 0.50:
-            st.warning("Selected column has low numeric coverage. Please verify before approving.")
-
-        approve_col, candidate_col = st.columns(2)
-        with approve_col:
-            if st.button("Approve Assessed Value as Source Data", key="approve_total_av"):
-                safe_add_approved_input(
-                    "total_assessed_value",
-                    float(total_av),
-                    status="Manual Input",
-                    source_method="Assessed Value Upload Parser",
-                    source_document=av_file.name,
-                    confidence=confidence,
-                    notes=f"Total assessed value summed from column '{value_col}' across {valid_rows:,} numeric rows.",
+                value_col = st.selectbox(
+                    "Assessed value column",
+                    all_cols,
+                    index=default_index,
+                    key="assessed_value_column_select",
                 )
-                append_auto_data_result_once(
-                    {
-                        "data_source": "County Open Data / Assessor",
-                        "target_data": "Assessed value",
-                        "status": "success",
-                        "Date / Year": datetime.now().date().isoformat(),
-                        "Extracted / Calculated Value": f"${float(total_av):,.0f}",
-                        "source_url": "",
-                        "notes": f"Parsed from {av_file.name}; column {value_col}; confidence {confidence:.0%}.",
-                    },
-                    unique_key="assessed_value_upload_parser",
+
+                parsed_values = clean_money_series(av_df[value_col])
+                total_av = parsed_values.sum(skipna=True)
+                valid_rows = int(parsed_values.notna().sum())
+                numeric_share = valid_rows / max(len(av_df), 1)
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Detected Total AV", f"${total_av:,.0f}")
+                c2.metric("Valid Numeric Rows", f"{valid_rows:,}")
+                c3.metric("Numeric Coverage", f"{numeric_share:.0%}")
+
+                st.caption("Suggested columns: " + (", ".join(map(str, suggested_cols[:5])) if suggested_cols else "No strong suggestion."))
+
+                confidence = 0.90 if suggested_cols and value_col == suggested_cols[0] and numeric_share >= 0.60 else 0.75
+                if numeric_share < 0.50:
+                    st.warning("Selected column has low numeric coverage. Please verify before approving.")
+
+                approve_col, candidate_col = st.columns(2)
+                with approve_col:
+                    if st.button("Approve Assessed Value as Source Data", key="approve_total_av"):
+                        approve_total_assessed_value(
+                            float(total_av),
+                            source_method="Assessed Value Upload Parser",
+                            source_document=av_file.name,
+                            confidence=confidence,
+                            notes=f"Total assessed value summed from column '{value_col}' across {valid_rows:,} numeric rows. Confidence {confidence:.0%}.",
+                        )
+                        st.success("Total assessed value approved and Auto Context row updated.")
+                with candidate_col:
+                    if st.button("Use AV to Update Value-to-Lien Calculator Input", key="candidate_total_av"):
+                        st.session_state["suggested_assessed_value"] = float(total_av)
+                        st.success("Saved as suggested assessed value for the Value-to-Lien calculator.")
+
+            except Exception as e:
+                st.error(f"Could not parse assessed value file: {e}")
+
+    with av_tab3:
+        manual_av = st.text_input("Manual total assessed value", placeholder="Example: 3454244692", key="manual_total_assessed_value")
+        manual_source = st.text_input("Manual source note", placeholder="Example: OS p. A-12 / County assessor roll", key="manual_total_assessed_value_source")
+        if st.button("Approve Manual Assessed Value", key="approve_manual_total_av"):
+            if not manual_av.strip():
+                st.error("Enter a value first.")
+            else:
+                parsed = parse_numeric_input(manual_av, default=0.0)
+                approve_total_assessed_value(
+                    parsed,
+                    source_method="Manual Assessed Value Override",
+                    source_document=manual_source,
+                    confidence=1.0,
+                    notes=f"Manual override. Source note: {manual_source}",
                 )
-                st.success("Total assessed value approved into master inputs.")
-        with candidate_col:
-            if st.button("Use AV to Update Value-to-Lien Calculator Input", key="candidate_total_av"):
-                st.session_state["suggested_assessed_value"] = float(total_av)
-                st.success("Saved as suggested assessed value for the Value-to-Lien calculator.")
-
-    except Exception as e:
-        st.error(f"Could not parse assessed value file: {e}")
-
+                st.success("Manual assessed value approved and Auto Context row updated.")
 
 def render_housing_market_proxy_resolver():
     st.subheader("Housing Market Trend / Distress Proxy")
@@ -1140,16 +1244,18 @@ def render_housing_market_proxy_resolver():
             confidence=housing["confidence"],
             notes=f"Risk points: {housing['risk_points']}. {notes}",
         )
-        append_auto_data_result_once(
+        upsert_auto_data_result_by_target(
             {
                 "data_source": "Housing Data",
+                "series_label": "Analyst indicators",
                 "target_data": "Housing market trend / distress proxy",
                 "status": "needs_review",
-                "Date / Year": datetime.now().date().isoformat(),
-                "Extracted / Calculated Value": housing["classification"],
+                "date_or_year": datetime.now().date().isoformat(),
+                "value": housing["classification"],
                 "source_url": "",
                 "notes": f"Candidate only. Risk points {housing['risk_points']}; confidence {housing['confidence']:.0%}.",
             },
+            target_contains="Housing market trend",
             unique_key="housing_market_proxy_candidate",
         )
         st.success("Housing classification candidate added to Reliability Review.")
@@ -1853,7 +1959,15 @@ with tab_deal:
             st.warning("Auto context completed. No documents uploaded, so document extraction was skipped.")
 
     st.markdown("---")
-    render_local_unemployment_resolver(deal_setup, key_prefix="deal_workspace")
+    st.subheader("D. Missing Data Resolver")
+    st.caption("Use safe semi-auto tools to resolve fields that should not be guessed. Results replace the manual_required rows after approval.")
+    resolver_tab1, resolver_tab2, resolver_tab3 = st.tabs(["Local Unemployment", "Assessed Value", "Housing Proxy"])
+    with resolver_tab1:
+        render_local_unemployment_resolver(deal_setup, key_prefix="deal_workspace")
+    with resolver_tab2:
+        render_assessed_value_upload_parser()
+    with resolver_tab3:
+        render_housing_market_proxy_resolver()
 
     if st.session_state.get("auto_data_results"):
         st.subheader("Auto Context Results")
