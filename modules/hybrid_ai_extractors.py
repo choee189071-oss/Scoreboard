@@ -658,6 +658,7 @@ def _document_scan_debug(parsed_docs: List[Dict[str, Any]], regex_candidates: Op
         "ai_requested": bool(ai_requested),
         "api_key_available": bool(api_key_available),
         "ai_used": bool(ai_candidates),
+        "ai_extracted_candidates": len(ai_candidates or []),
     }
 
 
@@ -1122,6 +1123,75 @@ Text window:
         return {"ok": False, "error": f"OpenAI extraction exception: {exc}"}
 
 
+
+
+def _keyword_windows_from_full_text(full_text: str, fields: Iterable[HybridField], max_windows: int = 12, radius: int = 3500) -> str:
+    """
+    Build targeted evidence windows directly from full text.
+
+    Why: candidate-page ranking can over-focus on TOC/intro pages. If the top
+    candidate pages do not contain the actual table, AI fallback may be called
+    but see the wrong context and return no values. This helper grabs windows
+    around the actual field keywords across the full OS text.
+    """
+    text = _safe_text(full_text)
+    if not text.strip():
+        return ""
+
+    keywords: List[str] = []
+    for field in fields:
+        for kw in field.keywords:
+            if kw and kw.lower() not in keywords:
+                keywords.append(kw.lower())
+
+    # Extra muni-table phrases that often identify taxpayer/concentration/VTL pages.
+    for kw in [
+        "percentage of total special tax levy",
+        "current special tax levy",
+        "land ownership",
+        "top ten taxpayers",
+        "top 10 taxpayers",
+        "largest property owners",
+        "largest taxpayers",
+        "value-to-lien",
+        "assessed value-to-lien",
+    ]:
+        if kw not in keywords:
+            keywords.append(kw)
+
+    lower = text.lower()
+    spans: List[Tuple[int, int, str]] = []
+    for kw in keywords:
+        start = 0
+        while True:
+            idx = lower.find(kw, start)
+            if idx < 0:
+                break
+            spans.append((max(0, idx - radius), min(len(text), idx + len(kw) + radius), kw))
+            start = idx + max(len(kw), 1)
+            if len(spans) >= max_windows * 3:
+                break
+        if len(spans) >= max_windows * 3:
+            break
+
+    if not spans:
+        return ""
+
+    # Merge overlaps and keep earliest useful windows.
+    spans = sorted(spans, key=lambda x: (x[0], x[1]))
+    merged: List[List[Any]] = []
+    for s, e, kw in spans:
+        if not merged or s > merged[-1][1] + 800:
+            merged.append([s, e, {kw}])
+        else:
+            merged[-1][1] = max(merged[-1][1], e)
+            merged[-1][2].add(kw)
+
+    pieces = []
+    for i, (s, e, kws) in enumerate(merged[:max_windows], start=1):
+        pieces.append(f"--- KEYWORD WINDOW {i}; matched={', '.join(sorted(kws))} ---\n{text[s:e]}")
+    return "\n\n".join(pieces)
+
 def run_hybrid_section_extraction(
     *,
     section_id: str,
@@ -1157,16 +1227,29 @@ def run_hybrid_section_extraction(
         if not api_key:
             ai_error = "OpenAI API key was not provided, so AI JSON fallback could not run."
         else:
+            # Build AI context from BOTH page windows and direct keyword windows.
+            # Candidate pages can be TOC-heavy or intro-heavy; keyword windows make the
+            # actual taxpayer/VTL/debt-service table much more likely to be included.
+            chunks: List[str] = []
             if candidate_pages:
-                chunks: List[str] = []
-                for hit in candidate_pages[:5]:
+                for hit in candidate_pages[:10]:
                     chunks.append(_evidence_window(pages, hit.get("document"), int(hit.get("page", 1)), radius=1, max_chars=6500))
-                candidate_text = "\n\n".join([c for c in chunks if c.strip()])
-                if not candidate_text.strip():
-                    candidate_text = full_text[:30000]
-            else:
+
+            keyword_context = _keyword_windows_from_full_text(
+                full_text,
+                fields=missing_fields if not force_ai else fields,
+                max_windows=10,
+                radius=3500,
+            )
+            if keyword_context.strip():
+                chunks.append(keyword_context)
+
+            candidate_text = "\n\n".join([c for c in chunks if c and c.strip()])
+            if not candidate_text.strip():
                 # Important fallback: no page candidates does NOT mean no data.
                 candidate_text = full_text[:30000]
+            else:
+                candidate_text = candidate_text[:30000]
 
             ai_result = ai_extract_fields_from_text(
                 section_id=section_id,
