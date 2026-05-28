@@ -4763,7 +4763,7 @@ with tab_calcs:
             )
             if st.button("Run Table Extraction for Taxpayer Table", key="run_taxpayer_table_engine"):
                 parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
-                pages = detect_candidate_pages(parsed_docs_for_engine)
+                pages = detect_candidate_pages(parsed_docs_for_engine, window_radius=2)
                 taxpayer_candidates = [p for p in pages if p.get("candidate_type") == "top_taxpayers"]
                 if taxpayer_candidates:
                     best = taxpayer_candidates[0]
@@ -4790,10 +4790,10 @@ with tab_calcs:
                 # Reliability badge: align table extraction with the platform-wide Tier 1 / Tier 2 / Tier 3 logic.
                 if confidence >= 85:
                     st.success("🟢 Tier 1 — Source Verified / strong table reconstruction. Still verify source dates, units, and headers before approval.")
-                elif confidence >= 40:
-                    st.warning("🟡 Tier 2 — AI Reconstructed. Review the evidence and table carefully before approval.")
+                elif confidence >= 20:
+                    st.warning("🟡 Tier 2 — Taxpayer section detected. Manual review/reconstruction required before approval.")
                 else:
-                    st.info("⚪ Tier 3 — Evidence Located, Reconstruction Failed or Low Confidence. This does not mean the OS lacks taxpayer data.")
+                    st.info("⚪ Tier 3 — No reliable taxpayer table evidence located. This does not mean the OS lacks taxpayer data, but the current parser could not locate a usable section.")
 
                 table_candidate = taxpayer_engine_candidate.get("table", pd.DataFrame())
                 if table_candidate is None or table_candidate.empty:
@@ -5036,7 +5036,7 @@ Open Evidence Preview or use the upload / mapping fallback before approving.
             )
             if st.button("Run Table Extraction for VTL Inputs", key="run_vtl_table_engine"):
                 parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
-                pages = detect_candidate_pages(parsed_docs_for_engine)
+                pages = detect_candidate_pages(parsed_docs_for_engine, window_radius=2)
                 vtl_pages = [p for p in pages if p.get("candidate_type") in ["value_to_lien", "overlapping_debt"]]
                 combined_text = "\n\n".join([p.get("preview", "") for p in (vtl_pages or pages)])
                 extracted = extract_vtl_inputs_from_text(combined_text)
@@ -5224,7 +5224,7 @@ Open Evidence Preview or use the upload / mapping fallback before approving.
             )
             if st.button("Run Table Extraction for MLTM Cashflow", key="run_mltm_table_engine"):
                 parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
-                pages = detect_candidate_pages(parsed_docs_for_engine)
+                pages = detect_candidate_pages(parsed_docs_for_engine, window_radius=2)
                 mltm_pages = [p for p in pages if p.get("candidate_type") in ["debt_service", "reserve_fund"]]
                 combined_text = "\n\n".join([p.get("preview", "") for p in mltm_pages])
                 df_candidate = extract_mltm_cashflow_from_text(combined_text)
