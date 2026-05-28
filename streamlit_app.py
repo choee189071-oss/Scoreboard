@@ -5387,7 +5387,7 @@ with tab_scorecard:
             override_value = st.selectbox(
                 "New value",
                 ["Yes; Broad & Diverse", "Yes; Not Broad & Diverse", "No"],
-                key="scoreboard_override_select_value",
+                key=f"scoreboard_override_select_value_{selected_key}",
             )
         elif selected_type == "select" and selected_key == "real_estate_market_volatility":
             override_value = st.selectbox(
@@ -5398,7 +5398,7 @@ with tab_scorecard:
                     "Falling Local Home Prices; High Price Volatility; Low Affordability; Rising Distress",
                     "Falling Local Home Prices; High Price Volatility; Significantly Worse Affordability; Rising Distress",
                 ],
-                key="scoreboard_override_select_value_re",
+                key=f"scoreboard_override_select_value_{selected_key}",
             )
         elif selected_type == "select" and selected_key == "conveyance_to_homeowners":
             override_value = st.selectbox(
@@ -5410,13 +5410,13 @@ with tab_scorecard:
                     "Developed; Significant Undeveloped Parcels Comprise Minority (Large Developer Concentration)",
                     "Undeveloped with Limited Vertical Construction; High Concentration",
                 ],
-                key="scoreboard_override_select_value_conv",
+                key=f"scoreboard_override_select_value_{selected_key}",
             )
         else:
             override_raw = st.text_input(
                 "New value",
                 value=_format_scorecard_widget_text(current_master_value, integer=(selected_type == "integer")),
-                key="scoreboard_override_text_value",
+                key=f"scoreboard_override_text_value_{selected_key}",
             )
             override_value = int(parse_numeric_input(override_raw, 0)) if selected_type == "integer" else parse_numeric_input(override_raw, 0.0)
 
@@ -5585,7 +5585,30 @@ with tab_scorecard:
         "rating_cap": rating_cap,
     }
 
-    if st.button("Calculate Scorecard", type="primary"):
+    st.markdown("---")
+    save_col, calc_col = st.columns([1, 1])
+    with save_col:
+        if st.button("Save Current Scorecard Values as Manual Inputs", key="save_all_scorecard_visible_values"):
+            saved = []
+            for _key, _value in scorecard_inputs.items():
+                if _key in {"negative_override_notches", "holistic_adjustment_notches", "rating_cap"}:
+                    continue
+                if is_missing_master_value(_value):
+                    continue
+                set_manual_override(_key, _value, source_method="Scorecard Visible Value Save")
+                st.session_state[f"scorecard_input_{_key}_dirty"] = True
+                st.session_state[f"scorecard_select_{_key}_dirty"] = True
+                saved.append(_key)
+            st.success(f"Saved {len(saved)} visible scorecard values as Manual Input.")
+            st.rerun()
+
+    with calc_col:
+        calculate_now = st.button("Calculate Scorecard", type="primary")
+
+    if calculate_now:
+        # Use the current visible widget values for calculation immediately.
+        # Saved manual overrides persist across reruns; calculation itself should not
+        # snap back to old AI/API values.
         calculation_inputs, missing_used = fill_missing_scorecard_defaults_for_calculation(scorecard_inputs)
 
         if missing_used:
