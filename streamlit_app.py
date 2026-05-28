@@ -841,8 +841,15 @@ def get_master_status(scorecard_key):
 def set_manual_override(scorecard_key, value, source_method="Scorecard Manual Override"):
     """
     Manual override has highest priority.
-    It writes to approved_inputs and marks metadata as Manual Input.
+    It writes to approved_inputs, records a manual override map, and keeps the
+    visible Streamlit widget state aligned with the analyst value.
     """
+    if not scorecard_key or value is None:
+        return
+
+    st.session_state.setdefault("manual_scorecard_overrides", {})
+    st.session_state["manual_scorecard_overrides"][scorecard_key] = value
+
     add_approved_input(
         scorecard_key=scorecard_key,
         value=value,
@@ -851,6 +858,16 @@ def set_manual_override(scorecard_key, value, source_method="Scorecard Manual Ov
         confidence=1.0,
         notes="Manual override from scorecard input.",
     )
+
+    # Keep widget state from snapping back after reruns.
+    try:
+        text_value = _format_scorecard_widget_text(value, integer=str(scorecard_key).endswith("parcels"))
+    except Exception:
+        text_value = str(value)
+    st.session_state[f"scorecard_input_{scorecard_key}"] = text_value
+    st.session_state[f"scorecard_input_{scorecard_key}_dirty"] = True
+    st.session_state[f"scorecard_select_{scorecard_key}"] = value
+    st.session_state[f"scorecard_select_{scorecard_key}_dirty"] = True
 
 
 def can_auto_update_scorecard_key(scorecard_key):
@@ -994,6 +1011,85 @@ def nullable_selectbox(label, scorecard_key, options):
         set_manual_override(scorecard_key, selected)
 
     return selected
+
+
+
+# =============================================================================
+# Scorecard Manual Override Helpers
+# =============================================================================
+
+SCORECARD_WIDGET_SPECS = {
+    "median_household_ebi_percent_of_us": "number",
+    "unemployment_rate_difference_vs_us": "number",
+    "msa_participation": "select",
+    "real_estate_market_volatility": "select",
+    "population_growth_difference_vs_us": "number",
+    "top10_taxpayers_percent_of_total_levy": "number",
+    "largest_taxpayer_percent_of_total_levy": "number",
+    "district_size_parcels": "integer",
+    "conveyance_to_homeowners": "select",
+    "est_value_to_lien": "number",
+    "maximum_loss_to_maturity_percent": "number",
+    "negative_override_notches": "number",
+    "holistic_adjustment_notches": "number",
+    "rating_cap": "select",
+}
+
+
+def _read_current_scorecard_widget_value(scorecard_key, fallback=None):
+    """Read the current visible widget/manual value with analyst edits first."""
+    manual_map = st.session_state.get("manual_scorecard_overrides", {}) or {}
+    if scorecard_key in manual_map and not is_missing_master_value(manual_map.get(scorecard_key)):
+        return manual_map.get(scorecard_key)
+
+    value_type = SCORECARD_WIDGET_SPECS.get(scorecard_key, "number")
+
+    if value_type == "select":
+        select_key = f"scorecard_select_{scorecard_key}"
+        if select_key in st.session_state and not is_missing_master_value(st.session_state.get(select_key)):
+            return st.session_state.get(select_key)
+        # rating_cap is not rendered through nullable_selectbox.
+        if scorecard_key == "rating_cap" and "Rating Cap" in st.session_state:
+            return st.session_state.get("Rating Cap")
+        return fallback
+
+    input_key = f"scorecard_input_{scorecard_key}"
+    if input_key in st.session_state:
+        raw = str(st.session_state.get(input_key) or "").strip()
+        if raw != "":
+            parsed = parse_numeric_input(raw, 0.0)
+            return int(parsed) if value_type == "integer" else parsed
+
+    return fallback
+
+
+def collect_scorecard_inputs_from_widgets(base_inputs=None):
+    """Build calculation inputs from the visible Scorecard widgets first."""
+    collected = dict(base_inputs or {})
+    approved = st.session_state.get("approved_inputs", {}) or {}
+
+    for key in SCORECARD_WIDGET_SPECS:
+        fallback = collected.get(key, approved.get(key))
+        value = _read_current_scorecard_widget_value(key, fallback=fallback)
+        if not is_missing_master_value(value):
+            collected[key] = value
+        elif key in collected:
+            collected[key] = None
+
+    return collected
+
+
+def save_current_scorecard_widgets_as_manual_inputs():
+    """Persist all visible Scorecard widget values as Manual Input."""
+    saved = []
+    current = collect_scorecard_inputs_from_widgets({})
+    for key, value in current.items():
+        if key in {"rating_cap", "negative_override_notches", "holistic_adjustment_notches"}:
+            continue
+        if not is_missing_master_value(value):
+            set_manual_override(key, value, source_method="Scorecard Current-Values Save")
+            saved.append(key)
+    return saved
 
 def fill_missing_scorecard_defaults_for_calculation(inputs):
     """
@@ -3064,7 +3160,23 @@ def add_approved_input(
     confidence=None,
     notes=None,
 ):
-    if value is None:
+    """
+    Write an approved scorecard input.
+
+    Critical rule:
+    Manual Input has absolute priority. Once a field is marked Manual Input,
+    AI/API/calculator writes are ignored unless the incoming write is also
+    Manual Input. This prevents scorecard edits from snapping back to AI values
+    on Streamlit reruns.
+    """
+    if not scorecard_key or value is None:
+        return
+
+    st.session_state.setdefault("approved_inputs", {})
+    st.session_state.setdefault("approved_input_metadata", {})
+
+    existing_status = (st.session_state.get("approved_input_metadata", {}).get(scorecard_key, {}) or {}).get("status")
+    if existing_status == "Manual Input" and status != "Manual Input":
         return
 
     st.session_state["approved_inputs"][scorecard_key] = value
@@ -5585,30 +5697,25 @@ with tab_scorecard:
         "rating_cap": rating_cap,
     }
 
-    st.markdown("---")
-    save_col, calc_col = st.columns([1, 1])
-    with save_col:
-        if st.button("Save Current Scorecard Values as Manual Inputs", key="save_all_scorecard_visible_values"):
-            saved = []
-            for _key, _value in scorecard_inputs.items():
-                if _key in {"negative_override_notches", "holistic_adjustment_notches", "rating_cap"}:
-                    continue
-                if is_missing_master_value(_value):
-                    continue
-                set_manual_override(_key, _value, source_method="Scorecard Visible Value Save")
-                st.session_state[f"scorecard_input_{_key}_dirty"] = True
-                st.session_state[f"scorecard_select_{_key}_dirty"] = True
-                saved.append(_key)
-            st.success(f"Saved {len(saved)} visible scorecard values as Manual Input.")
+    scorecard_inputs = collect_scorecard_inputs_from_widgets(scorecard_inputs)
+
+    c_save_current, c_calc_current = st.columns([1.1, 1])
+    with c_save_current:
+        if st.button("Save Current Scorecard Values as Manual Inputs", key="save_current_scorecard_values"):
+            saved = save_current_scorecard_widgets_as_manual_inputs()
+            if saved:
+                st.success(f"Saved {len(saved)} visible scorecard values as Manual Input.")
+            else:
+                st.info("No visible scorecard values were available to save.")
             st.rerun()
 
-    with calc_col:
-        calculate_now = st.button("Calculate Scorecard", type="primary")
+    with c_calc_current:
+        calculate_clicked = st.button("Calculate Scorecard", type="primary")
 
-    if calculate_now:
-        # Use the current visible widget values for calculation immediately.
-        # Saved manual overrides persist across reruns; calculation itself should not
-        # snap back to old AI/API values.
+    if calculate_clicked:
+        # Re-read the widget state at click time, persist it as manual, and use it for calculation.
+        scorecard_inputs = collect_scorecard_inputs_from_widgets(scorecard_inputs)
+        save_current_scorecard_widgets_as_manual_inputs()
         calculation_inputs, missing_used = fill_missing_scorecard_defaults_for_calculation(scorecard_inputs)
 
         if missing_used:
