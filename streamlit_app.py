@@ -1413,6 +1413,82 @@ def generate_real_estate_volatility_candidate_from_available_data(key_prefix="da
     return {"ok": True, **housing, "notes": notes}
 
 
+
+def ensure_real_estate_volatility_candidate_synced():
+    """Make sure housing/market-context rows map into the scorecard field.
+
+    This fixes the common case where Auto Context Results contains housing
+    indicators or a housing proxy candidate, but the Economic Fundamentals card
+    still shows Real Estate Market Volatility as Missing.
+
+    The function is conservative:
+    - approved analyst/manual values win;
+    - existing reviewable candidates win;
+    - a direct housing-classification row is reused when present;
+    - otherwise, if pulled housing indicators exist, it generates a derived
+      Needs Review candidate using the deterministic housing classifier.
+    """
+    key = "real_estate_market_volatility"
+
+    approved = st.session_state.get("approved_inputs", {}) or {}
+    if key in approved and not is_missing_master_value(approved.get(key)):
+        return None
+
+    existing_candidates = st.session_state.get("candidate_extractions", []) or []
+    for c in existing_candidates:
+        if c.get("scorecard_key") == key and has_candidate_value(c.get("value")):
+            return c
+
+    # 1) Reuse an explicit classification row if Auto Context Results already has one.
+    for item in st.session_state.get("auto_data_results", []) or []:
+        target = str(item.get("target_data") or item.get("Target Data") or "").lower()
+        raw_status = str(item.get("status") or item.get("Status") or "").lower()
+        value = (
+            item.get("value")
+            or item.get("Extracted / Calculated Value")
+            or item.get("extracted_calculated_value")
+            or item.get("calculated_value")
+        )
+
+        is_housing_classification = (
+            "real estate market volatility" in target
+            or "housing market trend" in target
+            or "housing market volatility" in target
+        )
+
+        if is_housing_classification and has_candidate_value(value) and raw_status not in {"manual_required", "missing"}:
+            return upsert_candidate_value(
+                scorecard_key=key,
+                scorecard_field="Real Estate Market Volatility",
+                value=value,
+                source_method=item.get("data_source") or item.get("Data Source") or "Housing Market Context Engine",
+                confidence=item.get("confidence") or item.get("Confidence") or 0.70,
+                notes=item.get("notes", "Housing classification candidate from Auto Context Results. Double-check sources before approval."),
+                source_document=item.get("series_label") or item.get("Series / Label") or "Housing market context",
+                source_url=item.get("source_url") or item.get("Source URL") or "",
+            )
+
+    # 2) If only raw indicators exist, generate a derived candidate.
+    has_indicator = False
+    indicator_terms = ["home price yoy", "inventory yoy", "distress proxy"]
+    for item in st.session_state.get("auto_data_results", []) or []:
+        target = str(item.get("target_data") or item.get("Target Data") or "").lower()
+        value = item.get("value") or item.get("Extracted / Calculated Value") or item.get("calculated_value")
+        if any(term in target for term in indicator_terms) and has_candidate_value(value):
+            has_indicator = True
+            break
+
+    if has_indicator:
+        try:
+            return generate_real_estate_volatility_candidate_from_available_data(key_prefix="data_workspace")
+        except Exception as exc:
+            st.session_state.setdefault("economic_engine_warnings", []).append(
+                f"Real estate volatility sync could not generate candidate: {exc}"
+            )
+            return None
+
+    return None
+
 def run_economic_fundamentals_engines(deal_setup, census_api_key=None, key_prefix="data_workspace"):
     """Fill the three previously-empty Economic Fundamental fields using their proper method.
 
@@ -2721,6 +2797,13 @@ def sync_auto_context_results_to_scorecard():
             row["status"] = "Needs Review"
             candidate_rows.append(row)
 
+    # Ensure pulled housing indicators/proxy also create the Real Estate Market Volatility candidate.
+    try:
+        ensure_real_estate_volatility_candidate_synced()
+    except NameError:
+        # Function is defined later in older copies; build_data_reliability_matrix will call it.
+        pass
+
     existing = st.session_state.get("candidate_extractions", []) or []
     st.session_state["candidate_extractions"] = merge_candidate_rows(existing, candidate_rows)
     return st.session_state["candidate_extractions"]
@@ -2794,6 +2877,7 @@ def sync_candidates_from_sources():
 def build_data_reliability_matrix():
     # Keep Scorecard/Reliability cards synchronized with Auto Context Results.
     sync_auto_context_results_to_scorecard()
+    ensure_real_estate_volatility_candidate_synced()
 
     approved_inputs = st.session_state.get("approved_inputs", {}) or {}
     approved_meta = st.session_state.get("approved_input_metadata", {}) or {}
