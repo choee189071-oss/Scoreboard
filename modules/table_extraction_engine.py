@@ -209,6 +209,116 @@ def _window_pages(pages: List[Dict[str, Any]], page_index: int, radius: int = 2)
     return "\n\n".join(pieces)
 
 
+
+
+def _normalize_for_search(text: Any) -> str:
+    """Lowercase, whitespace-normalized text for robust OS section matching."""
+    return re.sub(r"\s+", " ", safe_text(text).lower()).strip()
+
+
+TOC_SECTION_PATTERNS: Dict[str, List[str]] = {
+    "top_taxpayers": [
+        "largest taxpayers",
+        "largest property owners",
+        "top taxpayers",
+        "top ten taxpayers",
+        "principal taxpayers",
+        "major taxpayers",
+        "taxpayer concentration",
+        "ownership concentration",
+    ],
+    "debt_service": ["debt service schedule", "annual debt service"],
+    "overlapping_debt": ["estimated direct and overlapping indebtedness", "direct and overlapping debt", "overlapping indebtedness"],
+    "value_to_lien": ["estimated assessed value-to-lien ratios", "value-to-lien ratios", "value to lien ratios"],
+    "reserve_fund": ["reserve fund", "reserve requirement"],
+}
+
+
+def _find_printed_page_offset(pages: List[Dict[str, Any]]) -> int:
+    """
+    Estimate the offset between OS printed page numbers and PDF page numbers.
+
+    Many official statements have cover/TOC pages before printed page 1. In the
+    Clinton Keith OS, printed page 1 is PDF page 9, so TOC page 37 maps to PDF page 45.
+    """
+    for p in pages[:25]:
+        txt = safe_text(p.get("text"))
+        low = txt.lower()
+        if "introduction" in low and "general" in low and "official statement" in low:
+            try:
+                return int(p.get("page", 1)) - 1
+            except Exception:
+                return 0
+    return 0
+
+
+def _parse_toc_candidate_pages(
+    pages: List[Dict[str, Any]],
+    label: str,
+    phrases: Sequence[str],
+    window_radius: int,
+    doc_name: str,
+) -> List[Dict[str, Any]]:
+    """Use the table of contents to jump directly to sections such as 'Largest Taxpayers .... 37'."""
+    candidates: List[Dict[str, Any]] = []
+    offset = _find_printed_page_offset(pages)
+
+    toc_pages = pages[:15]
+    for toc_page in toc_pages:
+        raw = safe_text(toc_page.get("text"))
+        if "table of contents" not in raw.lower() and "page" not in raw.lower():
+            continue
+        # Look line-by-line first; if text extraction collapses dots/spaces, the regex still tolerates it.
+        for line in raw.splitlines():
+            normalized_line = _normalize_for_search(line)
+            if not normalized_line:
+                continue
+            for phrase in phrases:
+                if phrase not in normalized_line:
+                    continue
+                # Page number is usually the last number on the TOC line.
+                nums = re.findall(r"\b(\d{1,3})\b", line)
+                if not nums:
+                    continue
+                printed_page = int(nums[-1])
+                pdf_page = printed_page + offset
+                if pdf_page < 1 or pdf_page > len(pages):
+                    continue
+                page_index = pdf_page - 1
+                context = _window_pages(pages, page_index, radius=window_radius)
+                candidates.append({
+                    "document": doc_name,
+                    "candidate_type": label,
+                    "chunk_type": "toc_jump_page_window",
+                    "page": pdf_page,
+                    "printed_page": printed_page,
+                    "page_index": page_index,
+                    "window_radius": window_radius,
+                    "score": 12,
+                    "matched_terms": [phrase, "table of contents"],
+                    "preview": context[:30000],
+                    "page_preview": safe_text(pages[page_index].get("text"))[:5000],
+                    "toc_source_page": toc_page.get("page"),
+                })
+    return candidates
+
+
+def _score_page_for_label(label: str, lower: str, hits: List[str]) -> int:
+    """Extra scoring so actual tables beat narrative mentions and TOC lines."""
+    score = 0
+    if label == "top_taxpayers":
+        if "largest property owners" in lower:
+            score += 8
+        if "owner" in lower and "applied special tax" in lower:
+            score += 7
+        if "projected special tax" in lower and "special tax" in lower:
+            score += 4
+        if "table" in lower and ("property owners" in lower or "taxpayers" in lower):
+            score += 3
+        if "table of contents" in lower:
+            score -= 5
+    return score
+
 def detect_candidate_pages(
     parsed_docs: Iterable[Dict[str, Any]],
     window_radius: int = 2,
@@ -217,7 +327,11 @@ def detect_candidate_pages(
     """
     Find likely pages/tables across the full OS.
 
-    Returns page windows so tables spanning multiple pages have enough context.
+    Upgrade notes:
+    - Scans every parsed page, not only front matter.
+    - Uses a TOC jump first, so entries like "Largest Taxpayers ........ 37"
+      map to the real PDF page even when the OS has cover/TOC pages.
+    - Scores actual table pages above narrative mentions.
     """
     candidates: List[Dict[str, Any]] = []
     allowed = set(target_types or TABLE_KEYWORDS.keys())
@@ -226,6 +340,22 @@ def detect_candidate_pages(
         doc_name = doc.get("file_name") or doc.get("name") or "Uploaded document"
         pages = _pages_from_doc(doc)
 
+        # P0: TOC jump. This catches Clinton Keith-style OS files where the TOC says
+        # "Largest Taxpayers ... 37" but the actual PDF page is later because of front matter.
+        for label in allowed:
+            toc_phrases = TOC_SECTION_PATTERNS.get(label, TABLE_KEYWORDS.get(label, []))
+            if toc_phrases and pages:
+                candidates.extend(
+                    _parse_toc_candidate_pages(
+                        pages=pages,
+                        label=label,
+                        phrases=toc_phrases,
+                        window_radius=window_radius,
+                        doc_name=doc_name,
+                    )
+                )
+
+        # P1: full page scan.
         for page_index, page in enumerate(pages):
             page_text = safe_text(page.get("text"))
             lower = page_text.lower()
@@ -240,8 +370,17 @@ def detect_candidate_pages(
                 for phrase in phrases:
                     if phrase in lower:
                         # Stronger weight for highly specific taxpayer/debt words.
-                        score += 2 if phrase in ["top taxpayers", "top ten taxpayers", "largest taxpayers", "largest property owners", "direct and overlapping debt", "debt service schedule"] else 1
+                        score += 2 if phrase in [
+                            "top taxpayers",
+                            "top ten taxpayers",
+                            "largest taxpayers",
+                            "largest property owners",
+                            "direct and overlapping debt",
+                            "debt service schedule",
+                        ] else 1
                         hits.append(phrase)
+
+                score += _score_page_for_label(label, lower, hits)
 
                 if score > 0:
                     context = _window_pages(pages, page_index, radius=window_radius)
@@ -258,6 +397,7 @@ def detect_candidate_pages(
                         "page_preview": page_text[:5000],
                     })
 
+        # P2: parsed PDF tables, when pdfplumber succeeds.
         for table in doc.get("tables", []) or []:
             table_text = _table_preview_text(table)
             lower = table_text.lower()
@@ -272,6 +412,7 @@ def detect_candidate_pages(
                     if phrase in lower:
                         score += 1
                         hits.append(phrase)
+                score += _score_page_for_label(label, lower, hits)
                 if score > 0:
                     candidates.append({
                         "document": doc_name,
@@ -284,7 +425,25 @@ def detect_candidate_pages(
                         "preview": table_text[:30000],
                     })
 
-    return sorted(candidates, key=lambda x: (x.get("score", 0), len(x.get("matched_terms", []))), reverse=True)
+    # Deduplicate roughly by document/type/page/chunk and rank highest-confidence pages first.
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for cand in sorted(
+        candidates,
+        key=lambda x: (
+            x.get("score", 0),
+            1 if x.get("chunk_type") == "toc_jump_page_window" else 0,
+            len(x.get("matched_terms", [])),
+        ),
+        reverse=True,
+    ):
+        key = (cand.get("document"), cand.get("candidate_type"), cand.get("page"), cand.get("chunk_type"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(cand)
+
+    return deduped
 
 
 def _clean_taxpayer_name(name: str) -> str:
@@ -295,17 +454,89 @@ def _clean_taxpayer_name(name: str) -> str:
     return name.strip()
 
 
+def _looks_like_non_owner_row(name: str, line: str) -> bool:
+    lower_name = _clean_taxpayer_name(name).lower()
+    lower_line = line.lower()
+    bad_starts = [
+        "page",
+        "subtotal",
+        "total",
+        "all others",
+        "owner parcels",
+        "parcels",
+        "property parcels",
+        "preliminary",
+        "fiscal year",
+        "current maximum",
+        "series 2015",
+        "other overlapping",
+        "aggregate outstanding",
+        "value-to-lien",
+        "value to lien",
+        "source",
+        "table ",
+    ]
+    if any(lower_name.startswith(x) or lower_line.startswith(x) for x in bad_starts):
+        return True
+    if lower_name in ["owner", "taxpayer", "property owner", "name"]:
+        return True
+    # Header fragments usually have many column words but no company/owner pattern.
+    header_words = ["parcels", "assessed", "value", "special", "tax", "fiscal", "year", "debt", "ratio"]
+    if sum(w in lower_line for w in header_words) >= 5 and not any(h.strip() in lower_line for h in TAXPAYER_ROW_HINTS):
+        return True
+    return False
+
+
+def _merge_wrapped_owner_lines(lines: List[str]) -> List[str]:
+    """
+    Merge common PDF-extraction wrapped rows, e.g.
+        'Richmond 7 0 7 ... 0.66'
+        'American Homes'
+    into
+        'Richmond American Homes 7 0 7 ... 0.66'
+    """
+    merged: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        next_line = lines[i + 1] if i + 1 < len(lines) else ""
+        nums = re.findall(r"[-+]?\d+(?:\.\d+)?", line)
+        next_nums = re.findall(r"[-+]?\d+(?:\.\d+)?", next_line)
+        # If the current row begins with a short name fragment and next line is words only,
+        # insert the continuation before the first numeric column.
+        if nums and next_line and not next_nums:
+            first_num = nums[0]
+            prefix = line.split(first_num, 1)[0].strip()
+            if 1 <= len(prefix.split()) <= 2 and re.search(r"[A-Za-z]", next_line):
+                continuation = next_line.strip()
+                if len(continuation.split()) <= 5:
+                    line = f"{prefix} {continuation} {line.split(first_num, 1)[1].strip()}"
+                    i += 1
+        merged.append(line)
+        i += 1
+    return merged
+
+
 def reconstruct_taxpayer_table_from_text(text: Any) -> pd.DataFrame:
     """
     Reconstruct taxpayer rows from OCR/plain text.
 
-    Conservative but more table-aware than line-only extraction:
-    - explicit percent rows: taxpayer name ... 12.34%
-    - table rows with company-like name and last numeric token <= 100 treated as levy/share percent
-    - avoids front-matter false positives where no taxpayer-like names exist.
+    Handles Clinton Keith-style tables where the desired field is the last
+    '% of Applied Special Tax' column and the table may use 'Largest Property Owners'
+    instead of 'Top Taxpayers'.
     """
     rows: List[Dict[str, Any]] = []
-    raw_lines = [ln.strip() for ln in safe_text(text).splitlines() if ln and ln.strip()]
+    raw_lines = [re.sub(r"\s+", " ", ln.strip()) for ln in safe_text(text).splitlines() if ln and ln.strip()]
+    raw_lines = _merge_wrapped_owner_lines(raw_lines)
+    full_lower = "\n".join(raw_lines).lower()
+    table_context = any(term in full_lower for term in [
+        "largest property owners",
+        "largest taxpayers",
+        "principal taxpayers",
+        "projected special tax",
+        "applied special tax",
+        "current maximum special tax",
+    ])
 
     for raw_line in raw_lines:
         line = re.sub(r"\s+", " ", raw_line).strip()
@@ -318,38 +549,45 @@ def reconstruct_taxpayer_table_from_text(text: Any) -> pd.DataFrame:
         pct: Optional[float] = None
         name: str = ""
 
-        # Case 1: explicit percent sign.
-        pct_matches = list(re.finditer(r"([-+]?\d+(?:\.\d+)?)\s*%", line))
-        if pct_matches:
-            m = pct_matches[-1]
-            pct = percent_to_float(m.group(1))
-            name = _clean_taxpayer_name(line[:m.start()])
+        nums = re.findall(r"[-+]?\d+(?:\.\d+)?", line)
+        has_name_hint = any(h in lower for h in TAXPAYER_ROW_HINTS)
 
-        # Case 2: no percent sign, but row appears to be a taxpayer row and ends with a small percent-like number.
+        # Case 1: located taxpayer/property-owner table. Use the first numeric token
+        # as the start of columns and the last numeric token as the levy/share percent.
+        # This avoids using the earlier assessed-value percentage as the taxpayer name.
+        if nums and (table_context or has_name_hint):
+            maybe_pct = percent_to_float(nums[-1])
+            if maybe_pct is not None and 0 <= maybe_pct <= 100:
+                first_num_match = re.search(r"[-+]?\d+(?:\.\d+)?", line)
+                candidate_name = line[: first_num_match.start()].strip() if first_num_match else ""
+                pct = maybe_pct
+                name = _clean_taxpayer_name(candidate_name)
+
+        # Case 2: non-table free text with an explicit percent sign.
         if pct is None:
-            has_name_hint = any(h in lower for h in TAXPAYER_ROW_HINTS)
-            nums = re.findall(r"[-+]?\d+(?:\.\d+)?", line)
-            if has_name_hint and nums:
-                maybe_pct = percent_to_float(nums[-1])
-                if maybe_pct is not None and 0 <= maybe_pct <= 100:
-                    pct = maybe_pct
-                    name = _clean_taxpayer_name(line.rsplit(nums[-1], 1)[0])
+            pct_matches = list(re.finditer(r"([-+]?\d+(?:\.\d+)?)\s*%", line))
+            if pct_matches:
+                m = pct_matches[-1]
+                pct = percent_to_float(m.group(1))
+                name = _clean_taxpayer_name(line[:m.start()])
 
         if pct is None or pct < 0 or pct > 100:
             continue
         if len(name) < 3:
             continue
-        # Need at least one letter and not just table headers.
         if not re.search(r"[A-Za-z]", name):
             continue
-        if name.lower() in ["total", "subtotal", "taxpayer", "property owner", "owner"]:
+        if _looks_like_non_owner_row(name, line):
             continue
 
         rows.append({"taxpayer_name": name, "levy_percent": float(pct)})
 
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.drop_duplicates(subset=["taxpayer_name", "levy_percent"]).head(25).reset_index(drop=True)
+        df = df.drop_duplicates(subset=["taxpayer_name", "levy_percent"])
+        # Remove rows that are clearly rollups if they slipped through.
+        df = df[~df["taxpayer_name"].str.lower().str.match(r"^(subtotal|total|all others)", na=False)]
+        df = df.head(25).reset_index(drop=True)
     return df
 
 
