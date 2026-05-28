@@ -36,6 +36,7 @@ from modules.reliability_layer import (
 from modules.table_extraction_engine import (
     detect_candidate_pages,
     reconstruct_taxpayer_table_from_text,
+    ocr_taxpayer_candidate_pages,
     extract_vtl_inputs_from_text,
     extract_mltm_cashflow_from_text,
     confidence_score,
@@ -4761,97 +4762,167 @@ with tab_calcs:
             st.warning(
                 "AI/table extraction is only a data-entry accelerator. Always double-check source documents, table headers, units, and dates before approving."
             )
-            if st.button("Run Table Extraction for Taxpayer Table", key="run_taxpayer_table_engine"):
+            st.caption(
+                "P1/P2/P3/P4 workflow: scan the full OS → locate taxpayer pages → try text/OCR reconstruction → approve into calculator and scorecard."
+            )
+
+            if st.button("Run Full-OS Taxpayer Page Finder", key="run_taxpayer_table_engine"):
                 parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
-                pages = detect_candidate_pages(parsed_docs_for_engine)
+                pages = detect_candidate_pages(
+                    parsed_docs_for_engine,
+                    window_radius=2,
+                    target_types=["top_taxpayers"],
+                )
                 taxpayer_candidates = [p for p in pages if p.get("candidate_type") == "top_taxpayers"]
+
                 if taxpayer_candidates:
                     best = taxpayer_candidates[0]
                     df_candidate = reconstruct_taxpayer_table_from_text(best.get("preview", ""))
+                    # If evidence is located but rows are not reconstructed, keep a Tier-2 candidate rather than saying data is absent.
+                    row_count = 0 if df_candidate is None else len(df_candidate)
+                    confidence = confidence_score(row_count, 10)
+                    if row_count == 0 and best.get("matched_terms"):
+                        confidence = max(confidence, 20)
                     st.session_state["taxpayer_table_candidate_engine"] = {
                         "source_document": best.get("document"),
+                        "candidate_page": best.get("page"),
                         "matched_terms": best.get("matched_terms", []),
                         "table": df_candidate,
-                        "confidence": confidence_score(len(df_candidate), 10),
-                        "status": confidence_status(confidence_score(len(df_candidate), 10)),
+                        "confidence": confidence,
+                        "status": confidence_status(confidence),
                         "preview": best.get("preview", ""),
+                        "raw_candidate": best,
                     }
                 else:
                     st.session_state["taxpayer_table_candidate_engine"] = None
-                    st.info("No strong taxpayer table candidate found.")
+                    st.error(
+                        "No taxpayer section was located in the full OS scan. Try a more specific OS, upload a taxpayer table, or use public source scout."
+                    )
 
             taxpayer_engine_candidate = st.session_state.get("taxpayer_table_candidate_engine")
             if taxpayer_engine_candidate:
                 st.write(f"**Source document:** {taxpayer_engine_candidate.get('source_document', '')}")
+                if taxpayer_engine_candidate.get("candidate_page"):
+                    st.write(f"**Candidate page:** {taxpayer_engine_candidate.get('candidate_page')}")
+                if taxpayer_engine_candidate.get("matched_terms"):
+                    st.write("**Matched terms:** " + ", ".join(taxpayer_engine_candidate.get("matched_terms", [])))
+
                 confidence = int(taxpayer_engine_candidate.get("confidence", 0) or 0)
                 status = taxpayer_engine_candidate.get("status", "")
                 st.write(f"**Confidence:** {confidence}% — `{status}`")
 
-                # Reliability badge: align table extraction with the platform-wide Tier 1 / Tier 2 / Tier 3 logic.
-                if confidence >= 85:
+                if confidence >= 80:
                     st.success("🟢 Tier 1 — Source Verified / strong table reconstruction. Still verify source dates, units, and headers before approval.")
                 elif confidence >= 20:
-                    st.warning("🟡 Tier 2 — Taxpayer section detected. Manual review/reconstruction required before approval.")
+                    st.warning("🟡 Tier 2 — Taxpayer section detected. Text reconstruction may be incomplete; manual review or OCR is recommended before approval.")
                 else:
-                    st.info("⚪ Tier 3 — No reliable taxpayer table evidence located. This does not mean the OS lacks taxpayer data, but the current parser could not locate a usable section.")
+                    st.info("⚪ Tier 3 — No reliable taxpayer evidence located. This means the current parser did not locate usable evidence; it does not prove the OS lacks taxpayer data.")
 
                 table_candidate = taxpayer_engine_candidate.get("table", pd.DataFrame())
                 if table_candidate is None or table_candidate.empty:
                     st.warning(
                         """
-⚠ Taxpayer table was not fully reconstructed.
+⚠ Taxpayer section was located, but structured rows were not fully reconstructed.
 
-The system detected a possible taxpayer section in the document, but could not reliably rebuild structured taxpayer rows.
+This usually means one of the following:
 
-Recommended next steps:
+• The table is image-based / scanned
+• The table spans multiple pages
+• The PDF text layer breaks columns apart
+• The table uses non-standard headers
 
-• OCR Mode → re-process scanned pages
-• Vision Mode → analyze table images directly
-• Upload CSV/XLSX → analyst-provided taxpayer table with column mapping
-• Evidence Preview → manually verify extracted content
+Next steps:
 
-This does **not** necessarily mean the Official Statement lacks taxpayer information. It may indicate a PDF parsing, OCR, or table reconstruction limitation.
+1. Run OCR Mode on the located page window.
+2. Open Evidence Preview and manually verify the page.
+3. Upload CSV/XLSX and map columns if OCR still fails.
+4. Use Tier-2/Tier-3 fallback assumptions only if analyst policy allows it.
+
+This does **not** necessarily mean the Official Statement lacks taxpayer information.
                         """
                     )
                 else:
                     st.dataframe(table_candidate, use_container_width=True, hide_index=True)
 
-                with st.expander("Evidence Preview"):
-                    st.text(str(taxpayer_engine_candidate.get("preview", ""))[:3000])
+                with st.expander("Evidence Preview", expanded=False):
+                    st.text(str(taxpayer_engine_candidate.get("preview", ""))[:8000])
 
                 st.markdown("### Recovery Options")
                 rec1, rec2, rec3, rec4 = st.columns(4)
                 with rec1:
                     if st.button("🔍 OCR Mode", key="taxpayer_recovery_ocr_mode"):
-                        st.info("OCR Mode placeholder: use this when the table is image-based or scanned. Upload/map fallback is available below for now.")
+                        parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
+                        ocr_result = ocr_taxpayer_candidate_pages(
+                            parsed_docs_for_engine,
+                            taxpayer_engine_candidate.get("raw_candidate", taxpayer_engine_candidate),
+                        )
+                        if ocr_result.get("ok"):
+                            ocr_df = ocr_result.get("table", pd.DataFrame())
+                            row_count = 0 if ocr_df is None else len(ocr_df)
+                            confidence = confidence_score(row_count, 10)
+                            if row_count == 0:
+                                confidence = max(confidence, 20)
+                            st.session_state["taxpayer_table_candidate_engine"] = {
+                                **taxpayer_engine_candidate,
+                                "table": ocr_df,
+                                "confidence": confidence,
+                                "status": confidence_status(confidence),
+                                "preview": ocr_result.get("text", ""),
+                                "ocr_pages": ocr_result.get("pages", []),
+                                "ocr_used": True,
+                            }
+                            if row_count > 0:
+                                st.success(f"OCR reconstructed {row_count} taxpayer rows. Review before approving.")
+                            else:
+                                st.warning("OCR ran, but no clean taxpayer rows were reconstructed. Open Evidence Preview or use upload/mapping fallback.")
+                            rerun_after_approve()
+                        else:
+                            st.warning(ocr_result.get("error", "OCR Mode could not run."))
                 with rec2:
                     if st.button("👁 Vision Mode", key="taxpayer_recovery_vision_mode"):
-                        st.info("Vision Mode placeholder: use this when PDF text extraction fails but the table is visible as an image.")
+                        st.info("Vision Mode requires a multimodal API integration. For now, use OCR Mode or upload/map a taxpayer table.")
                 with rec3:
                     if st.button("📄 Upload CSV/XLSX", key="taxpayer_recovery_upload_mode"):
                         st.info("Use the Upload / Column Mapping fallback section below to load taxpayer rows manually with less typing.")
                 with rec4:
                     if st.button("📖 Open Evidence", key="taxpayer_recovery_open_evidence"):
-                        st.info("Open the Evidence Preview expander above and verify the table manually against the source PDF.")
+                        st.info("Open the Evidence Preview expander above and verify the located page window manually against the source PDF.")
 
                 if st.button("Approve and Load Taxpayer Table", key="approve_taxpayer_table_engine"):
                     if table_candidate is not None and not table_candidate.empty:
                         sync_taxpayer_table_to_editor(table_candidate.copy(), source=taxpayer_engine_candidate.get("source_document"))
-                        st.success("Taxpayer table loaded into calculator. Review before calculating.")
+                        try:
+                            concentration = calculate_taxpayer_concentration(table_candidate.copy())
+                            safe_add_approved_input(
+                                "top10_taxpayers_percent_of_total_levy",
+                                concentration.get("top10_taxpayers_percent_of_total_levy"),
+                                status="AI Extracted" if confidence < 80 else "Auto Pulled",
+                                source_method="AI Table Extraction Engine",
+                                source_document=taxpayer_engine_candidate.get("source_document"),
+                                confidence=min(max(confidence / 100, 0.2), 1.0),
+                                notes="Approved taxpayer table reconstructed from OS page finder/OCR workflow.",
+                            )
+                            safe_add_approved_input(
+                                "largest_taxpayer_percent_of_total_levy",
+                                concentration.get("largest_taxpayer_percent_of_total_levy"),
+                                status="AI Extracted" if confidence < 80 else "Auto Pulled",
+                                source_method="AI Table Extraction Engine",
+                                source_document=taxpayer_engine_candidate.get("source_document"),
+                                confidence=min(max(confidence / 100, 0.2), 1.0),
+                                notes="Approved taxpayer table reconstructed from OS page finder/OCR workflow.",
+                            )
+                        except Exception as exc:
+                            st.warning(f"Loaded table, but aggregate scorecard sync failed: {exc}")
+                        st.success("Taxpayer table loaded into calculator and aggregate values pushed to scorecard. Review before final scoring.")
                         rerun_after_approve()
                     else:
                         st.info(
                             """
 No approved taxpayer rows are currently available.
 
-Possible reasons:
+Current status: taxpayer evidence may be located, but the system has not reconstructed rows.
 
-• Table exists but reconstruction failed
-• PDF is image-based
-• Table spans multiple pages
-• Confidence is below approval threshold
-
-Open Evidence Preview or use the upload / mapping fallback before approving.
+Recommended next step: run OCR Mode or use the upload/mapping fallback below.
                             """
                         )
 
