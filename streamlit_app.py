@@ -2592,44 +2592,158 @@ def merge_approved_inputs(new_inputs: dict, status="Auto Pulled", source_method=
 
 
 def candidate_row_from_auto_result(item):
-    target = item.get("target_data") or item.get("Target Data")
+    """Map rows from Auto Context Results back into scorecard fields.
+
+    Important: Auto Context Results is the raw/source layer. This function is
+    the merge/orchestration layer that turns successful pulled rows into
+    approved scorecard inputs, and reviewable rows into candidate cards.
+    """
+    target = item.get("target_data") or item.get("Target Data") or ""
+    target_lower = str(target).lower()
+
     value = (
         item.get("median_household_ebi_percent_of_us")
         or item.get("value")
         or item.get("Extracted / Calculated Value")
+        or item.get("extracted_calculated_value")
+        or item.get("calculated_value")
     )
+
+    mapping = [
+        ("median household", "median_household_ebi_percent_of_us", "Median Household EBI (% of U.S.)"),
+        ("unemployment", "unemployment_rate_difference_vs_us", "Unemployment Rate Difference vs U.S. (%)"),
+        ("population growth", "population_growth_difference_vs_us", "Population Growth Difference vs U.S. (%)"),
+        ("msa participation", "msa_participation", "MSA Participation"),
+        ("real estate market volatility", "real_estate_market_volatility", "Real Estate Market Volatility"),
+        ("housing market trend", "real_estate_market_volatility", "Real Estate Market Volatility"),
+        ("top 10 taxpayers", "top10_taxpayers_percent_of_total_levy", "Top 10 Taxpayers as % of Total Levy"),
+        ("largest taxpayer", "largest_taxpayer_percent_of_total_levy", "Largest Taxpayer as % of Total Levy"),
+        ("district size", "district_size_parcels", "District Size (Parcels)"),
+        ("conveyance", "conveyance_to_homeowners", "Conveyance to Homeowners"),
+        ("value-to-lien", "est_value_to_lien", "Est. Value-to-Lien"),
+        ("value to lien", "est_value_to_lien", "Est. Value-to-Lien"),
+        ("mltm", "maximum_loss_to_maturity_percent", "Maximum Loss-to-Maturity (MLTM) %"),
+        ("maximum loss", "maximum_loss_to_maturity_percent", "Maximum Loss-to-Maturity (MLTM) %"),
+    ]
 
     scorecard_key = None
     scorecard_field = target
+    for needle, key, field in mapping:
+        if needle in target_lower:
+            scorecard_key = key
+            scorecard_field = field
+            break
 
+    # Backward compatibility for the original Census bundle.
     if item.get("median_household_ebi_percent_of_us") is not None:
         scorecard_key = "median_household_ebi_percent_of_us"
         scorecard_field = "Median Household EBI (% of U.S.)"
+        value = item.get("median_household_ebi_percent_of_us")
 
-    if not scorecard_key:
+    if not scorecard_key or not has_candidate_value(value):
         return None
+
+    raw_status = str(item.get("status") or item.get("Status") or "Needs Review").strip().lower()
+    status = "Auto Pulled" if raw_status in ["success", "auto pulled", "auto_pulled"] else "Needs Review"
+
+    confidence = item.get("confidence") or item.get("Confidence")
+    if confidence is None:
+        confidence = 1.0 if status == "Auto Pulled" else 0.70
 
     return {
         "scorecard_field": scorecard_field,
         "scorecard_key": scorecard_key,
         "value": value,
-        "status": "Auto Pulled",
-        "source_method": item.get("data_source", "Auto Data Connector"),
-        "source_document": None,
-        "source_url": item.get("source_url"),
-        "confidence": 1.0,
+        "status": status,
+        "source_method": item.get("data_source") or item.get("Data Source") or "Auto Context Engine",
+        "source_document": item.get("series_label") or item.get("Series / Label") or "",
+        "source_url": item.get("source_url") or item.get("Source URL") or "",
+        "confidence": confidence,
         "notes": item.get("notes", ""),
-        "source_excerpt": "",
+        "source_excerpt": item.get("notes", ""),
     }
 
 
-def sync_candidates_from_sources():
+def merge_candidate_rows(existing_rows, new_rows):
+    """Merge candidates without letting a later sync delete UI-created candidates."""
+    merged = []
+    seen = set()
+
+    def row_key(row):
+        return (
+            row.get("scorecard_key"),
+            row.get("source_method"),
+            str(row.get("value")),
+        )
+
+    # New rows should win because they reflect the latest pull.
+    for row in (new_rows or []) + (existing_rows or []):
+        if not row or not has_candidate_value(row.get("value")):
+            continue
+        key = row_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+
+    return merged
+
+
+def sync_auto_context_results_to_scorecard():
+    """Orchestration layer: Auto Context Results -> approved inputs / review candidates.
+
+    - status success / auto_pulled becomes approved input for objective fields.
+    - needs_review remains a candidate for Reliability Review.
+    - empty values are ignored.
+    """
     candidate_rows = []
+
+    auto_approve_statuses = {"auto pulled", "success", "auto_pulled"}
 
     for item in st.session_state.get("auto_data_results", []) or []:
         row = candidate_row_from_auto_result(item)
-        if row:
+        if not row:
+            continue
+
+        raw_status = str(item.get("status") or item.get("Status") or row.get("status") or "").strip().lower()
+
+        if raw_status in auto_approve_statuses and row.get("status") == "Auto Pulled":
+            safe_add_approved_input(
+                scorecard_key=row["scorecard_key"],
+                value=row["value"],
+                status="Auto Pulled",
+                source_method=row.get("source_method") or "Auto Context Engine",
+                source_document=row.get("source_document"),
+                confidence=row.get("confidence", 1.0),
+                notes=row.get("notes", ""),
+            )
+        else:
+            row["status"] = "Needs Review"
             candidate_rows.append(row)
+
+    existing = st.session_state.get("candidate_extractions", []) or []
+    st.session_state["candidate_extractions"] = merge_candidate_rows(existing, candidate_rows)
+    return st.session_state["candidate_extractions"]
+
+
+def sync_candidates_from_sources():
+    """Collect candidates from auto context + document AI without deleting UI-created candidates."""
+    new_candidate_rows = []
+
+    for item in st.session_state.get("auto_data_results", []) or []:
+        row = candidate_row_from_auto_result(item)
+        if row and row.get("status") != "Auto Pulled":
+            new_candidate_rows.append(row)
+        elif row and row.get("status") == "Auto Pulled":
+            safe_add_approved_input(
+                scorecard_key=row["scorecard_key"],
+                value=row["value"],
+                status="Auto Pulled",
+                source_method=row.get("source_method") or "Auto Context Engine",
+                source_document=row.get("source_document"),
+                confidence=row.get("confidence", 1.0),
+                notes=row.get("notes", ""),
+            )
 
     doc_result = st.session_state.get("last_document_ai_result")
 
@@ -2644,10 +2758,8 @@ def sync_candidates_from_sources():
             source_document = item.get("source_document") or item.get("document") or "Uploaded document"
             source_excerpt = item.get("source_excerpt") or item.get("excerpt") or item.get("evidence") or ""
 
-            # Do not create empty Needs Review cards.
-            # If AI did not actually extract a usable value, the field should stay Missing.
             if scorecard_key and has_candidate_value(value):
-                candidate_rows.append(
+                new_candidate_rows.append(
                     {
                         "scorecard_field": scorecard_field,
                         "scorecard_key": scorecard_key,
@@ -2674,11 +2786,15 @@ def sync_candidates_from_sources():
                         }
                     )
 
-    st.session_state["candidate_extractions"] = candidate_rows
-    return candidate_rows
+    existing = st.session_state.get("candidate_extractions", []) or []
+    st.session_state["candidate_extractions"] = merge_candidate_rows(existing, new_candidate_rows)
+    return st.session_state["candidate_extractions"]
 
 
 def build_data_reliability_matrix():
+    # Keep Scorecard/Reliability cards synchronized with Auto Context Results.
+    sync_auto_context_results_to_scorecard()
+
     approved_inputs = st.session_state.get("approved_inputs", {}) or {}
     approved_meta = st.session_state.get("approved_input_metadata", {}) or {}
     candidates = st.session_state.get("candidate_extractions", []) or []
