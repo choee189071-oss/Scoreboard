@@ -3775,10 +3775,31 @@ def render_hybrid_section_workflow(
         ai_error = result.get("ai_error")
         candidate_pages = result.get("candidate_pages", []) or []
 
-        summary_cols = st.columns(4)
+        # Split missing fields into required vs optional so the UI does not look
+        # like a failed extraction when only a non-scorecard/context field is absent.
+        section_fields = {getattr(f, "key", None): f for f in section.get("fields", []) or []}
+
+        def _is_required_missing(item):
+            field = section_fields.get(item.get("field_key"))
+            # In this workspace, fields with a scorecard_key are required for
+            # scorecard/calculator sync. Fields without one are helpful context.
+            return bool(getattr(field, "scorecard_key", None))
+
+        missing_required = [m for m in missing if _is_required_missing(m)]
+        missing_optional = [m for m in missing if not _is_required_missing(m)]
+
+        if len(missing_required) == 0 and len(candidates) > 0:
+            resolver_status = "✅ Scorecard Ready"
+        elif len(candidates) > 0:
+            resolver_status = "⚠️ Needs Required Fields"
+        else:
+            resolver_status = "❌ No Candidates Yet"
+
+        summary_cols = st.columns(5)
         summary_cols[0].metric("Candidates Found", len(candidates))
-        summary_cols[1].metric("Still Missing", len(missing))
-        summary_cols[2].metric("Candidate Pages", len(candidate_pages))
+        summary_cols[1].metric("Resolver Status", resolver_status)
+        summary_cols[2].metric("Required Missing", len(missing_required))
+        summary_cols[3].metric("Optional Missing", len(missing_optional))
         ai_extracted = bool(result.get("ai_candidates"))
         ai_attempted = bool((result.get("scan_debug") or {}).get("ai_requested"))
         if ai_extracted:
@@ -3787,7 +3808,9 @@ def render_hybrid_section_workflow(
             ai_label = "Tried — no values"
         else:
             ai_label = "No"
-        summary_cols[3].metric("AI Fallback", ai_label)
+        summary_cols[4].metric("AI Fallback", ai_label)
+
+        st.caption(f"Candidate Pages: {len(candidate_pages)} evidence windows found")
 
         scan_debug = result.get("scan_debug") or {}
         with st.expander("Debug: document scan coverage", expanded=False):
@@ -3837,11 +3860,22 @@ def render_hybrid_section_workflow(
                         st.success("Approved and synced where applicable. Scorecard widgets update after rerun.")
                         rerun_after_approve()
 
-        if missing:
+        if missing_required or missing_optional:
             st.markdown("#### Missing After Hybrid Scan")
-            missing_df = pd.DataFrame(missing)
-            st.dataframe(missing_df, use_container_width=True, hide_index=True)
+
+            if missing_required:
+                st.error("Required fields are still missing. These affect scorecard/calculator readiness.")
+                required_df = pd.DataFrame(missing_required)
+                st.dataframe(required_df, use_container_width=True, hide_index=True)
+
+            if missing_optional:
+                st.info("Optional/context fields are missing, but the section may still be scorecard-ready.")
+                optional_df = pd.DataFrame(missing_optional)
+                st.dataframe(optional_df, use_container_width=True, hide_index=True)
+
             st.caption("For missing fields: try a more specific OS/appendix, upload a mapped table, enter manually, or use explicitly labelled fallback assumptions.")
+        elif candidates:
+            st.success("All required fields for this resolver have candidates. Review and approve the values below before syncing to calculators/scorecard.")
 
 
 # =============================================================================
