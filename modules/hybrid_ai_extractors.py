@@ -186,7 +186,12 @@ HYBRID_SECTIONS: Dict[str, Dict[str, Any]] = {
                     r"there\s+are\s+([0-9][0-9,]*)\s+parcels\s+of\s+developed\s+property",
                 ),
                 keywords=("taxable parcels", "developed property", "approved property", "undeveloped property"),
-                guidance="Prefer total taxable parcels unless scorecard specifically requests developed parcels only.",
+                guidance=(
+                    "Prefer total taxable parcels or total residential/special-tax units used for assessment scale. "
+                    "Do NOT treat assessor parcels, APNs, ownership parcels, building sites, development lots, "
+                    "or mapped tax parcels as scorecard district size unless the OS explicitly says they are the taxable parcels/units assessed. "
+                    "If the text says only assessor parcels/APNs/building sites, return null or a low-confidence candidate requiring analyst review."
+                ),
             ),
             HybridField(
                 key="conveyance_to_homeowners",
@@ -274,27 +279,27 @@ HYBRID_SECTIONS: Dict[str, Dict[str, Any]] = {
                 guidance="Use exact reserve amount and date. Do not confuse with costs of issuance or improvement fund.",
             ),
             HybridField(
+                key="maximum_loss_to_maturity_percent",
+                label="Maximum Loss-to-Maturity (MLTM) %",
+                scorecard_key="maximum_loss_to_maturity_percent",
+                value_type="percent",
+                preferred_source="Calculated from approved cashflow schedule",
+                regex_patterns=(
+                    r"maximum\s+loss[-\s]*to[-\s]*maturity[^%]{0,220}([0-9]+(?:\.\d+)?)\s*%",
+                    r"MLTM[^%]{0,220}([0-9]+(?:\.\d+)?)\s*%",
+                ),
+                keywords=("debt service schedule", "annual debt service", "special tax", "reserve fund", "mltm"),
+                guidance="Best practice: calculate from approved schedule and reserve, not from an isolated AI estimate.",
+            ),
+            HybridField(
                 key="mltm_cashflow_table",
-                label="MLTM Cashflow Input Table",
+                label="MLTM Cashflow Table",
                 scorecard_key=None,
                 value_type="table",
                 preferred_source="Debt Service Schedule + special tax levy / revenue table",
                 regex_patterns=(),
-                keywords=("debt service schedule", "period ending", "principal", "interest", "total debt service", "special tax levy", "special tax revenues"),
-                guidance="Calculator input: requires year, special tax levy/revenue, annual debt service, and reserve assumptions. Missing this should prompt calculator/table upload, not direct AI scoring.",
-            ),
-            HybridField(
-                key="maximum_loss_to_maturity_percent",
-                label="Maximum Loss-to-Maturity (MLTM) %",
-                # This is a DERIVED OUTPUT from the MLTM calculator, not an OS extraction requirement.
-                # Keep scorecard_key=None here so the hybrid extractor does not mark the section
-                # as missing just because MLTM has not been calculated yet.
-                scorecard_key=None,
-                value_type="percent",
-                preferred_source="Derived output from approved MLTM calculator",
-                regex_patterns=(),
-                keywords=("maximum loss-to-maturity", "maximum loss to maturity", "mltm", "stress test"),
-                guidance="Derived output. Do not require AI to extract this from the OS; calculate it after the analyst approves the cashflow schedule/reserve inputs.",
+                keywords=("debt service schedule", "period ending", "principal", "interest", "total", "special tax levy"),
+                guidance="Requires year, special tax levy/revenue, and annual debt service columns. Analyst must review before calculation.",
             ),
         ],
     },
@@ -1059,14 +1064,14 @@ def regex_extract_fields(parsed_docs: List[Dict[str, Any]], section_id: str) -> 
                         "scorecard_key": "district_size_parcels",
                         "value": int(value),
                         "value_type": "number",
-                        "confidence": 0.45 if value < 50 and ("assessor" in lower or "building site" in lower or "apn" in lower) else 0.84,
+                        "confidence": 0.84,
                         "method": "Regex Narrative Scan",
                         "tier": "Tier 1",
                         "source_document": page.get("document"),
                         "page": page.get("page"),
                         "evidence": text[:1600],
                         "preferred_source": "OS district description / taxable parcels disclosure",
-                        "guidance": "Narrative parcel count extracted from OS. Verify taxable vs developed parcel definition; small APN/building-site counts should not be treated as district scale without analyst confirmation.",
+                        "guidance": "Narrative parcel count extracted from OS. Verify taxable vs developed parcel definition.",
                     })
                     break
 
@@ -1194,7 +1199,7 @@ If a field is not found, return value=null, confidence=0, page=null, and notes e
 Prefer deal-specific values over general county values.
 For assessed value, prefer "assessed value of all taxable property within the CFD" over developed-property-only value.
 For taxpayer concentration, do not confuse assessed-value share with levy share unless the source clearly says levy/special tax share.
-For district_size_parcels, be very conservative: do NOT use assessor parcels, APNs, ownership parcels, or building sites as the scorecard parcel count unless the text explicitly says they are taxable parcels/units used for the special tax assessment. If the text only says building sites or assessor parcels, return value=null with low confidence and explain the ambiguity.
+For District Size / Parcels, prefer total taxable parcels or total residential/special-tax units that represent assessment scale. Do NOT use assessor parcels, APNs, ownership parcels, building sites, development lots, or tax-map parcels unless the text explicitly states those are the taxable parcels/units used for the special tax assessment. If uncertain, return value=null, confidence=0, and explain the ambiguity in notes.
 For MLTM, prefer a calculated schedule or explicit MLTM; do not make up a stress value.
 
 Fields:
@@ -1247,24 +1252,6 @@ Text window:
         return {"ok": True, "data": parsed, "raw_response_id": data.get("id")}
     except Exception as exc:
         return {"ok": False, "error": f"OpenAI extraction exception: {exc}"}
-
-
-def _adjust_candidate_for_credit_context(field: HybridField, value: Any, confidence: float, evidence: str, notes: str) -> Tuple[Any, float, str]:
-    """Post-process extracted candidates for common muni-credit ambiguity traps."""
-    if field.key == "district_size_parcels":
-        ev = _safe_text(evidence).lower()
-        try:
-            numeric_value = float(value)
-        except Exception:
-            numeric_value = None
-        ambiguous_terms = ["building site", "building sites", "assessor", "assessor's parcel", "assessor’s parcel", "apn", "ownership parcel", "fee title owner"]
-        if numeric_value is not None and numeric_value < 50 and any(t in ev for t in ambiguous_terms):
-            confidence = min(float(confidence or 0), 0.45)
-            notes = _normalize_space(
-                (notes or "")
-                + " Potential ambiguity: value may reflect assessor/APN parcels, ownership parcels, or building sites rather than true taxable/homeowner parcel count for scorecard scale. Analyst should verify before approval."
-            )
-    return value, confidence, notes
 
 
 def run_hybrid_section_extraction(
@@ -1329,12 +1316,21 @@ def run_hybrid_section_extraction(
                     value = _coerce_value(item.get("value"), f.value_type)
                     if value is None or value == "":
                         continue
-                    evidence = item.get("evidence") or ""
-                    notes = item.get("notes") or ""
                     confidence = float(item.get("confidence") or 0.55)
-                    value, confidence, notes = _adjust_candidate_for_credit_context(f, value, confidence, evidence, notes)
-                    if value is None or value == "":
-                        continue
+                    evidence_text = _safe_text(item.get("evidence") or "") + " " + _safe_text(item.get("notes") or "") + " " + _safe_text(item.get("source_label") or "")
+                    if f.key == "district_size_parcels":
+                        ambiguous_terms = (
+                            "assessor parcel", "assessor's parcel", "assessor’s parcel", "apn",
+                            "building site", "building sites", "development lot", "ownership parcel",
+                            "fee title", "tax map", "mapped parcel"
+                        )
+                        positive_terms = (
+                            "taxable parcels", "taxable parcel", "special tax units", "residential units",
+                            "levied on", "subject to the special tax", "taxable units"
+                        )
+                        ev_lower = evidence_text.lower()
+                        if any(term in ev_lower for term in ambiguous_terms) and not any(term in ev_lower for term in positive_terms):
+                            confidence = min(confidence, 0.45)
                     ai_candidates.append({
                         "field_key": f.key,
                         "label": f.label,
@@ -1346,10 +1342,10 @@ def run_hybrid_section_extraction(
                         "tier": "Tier 2",
                         "source_document": item.get("source_label") or "Uploaded OS / source window",
                         "page": item.get("page"),
-                        "evidence": evidence,
+                        "evidence": item.get("evidence") or "",
                         "preferred_source": f.preferred_source,
                         "guidance": f.guidance,
-                        "notes": notes,
+                        "notes": item.get("notes") or "",
                         "response_id": ai_result.get("raw_response_id"),
                     })
             else:
