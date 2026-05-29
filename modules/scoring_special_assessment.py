@@ -582,15 +582,19 @@ def calculate_financial_profile_assessment(
     #
     # Direction remains: 1 = strongest, 5 = weakest.
     matrix = {
-        "<=5%":   {">=40%": 1.0, "35%-40%": 1.0, "30%-35%": 1.0, "25%-30%": 1.5, "20%-25%": 2.0, "15%-20%": 2.5, "10%-15%": 3.0, "5%-10%": 3.5, "<=5%": 4.5},
-        "5%-15%":  {">=40%": 1.5, "35%-40%": 1.5, "30%-35%": 1.5, "25%-30%": 2.0, "20%-25%": 2.5, "15%-20%": 3.0, "10%-15%": 3.5, "5%-10%": 3.5, "<=5%": 4.5},
-        "15%-25%": {">=40%": 2.0, "35%-40%": 2.0, "30%-35%": 2.5, "25%-30%": 3.0, "20%-25%": 3.5, "15%-20%": 3.5, "10%-15%": 3.5, "5%-10%": 4.0, "<=5%": 4.5},
-        "25%-40%": {">=40%": 2.5, "35%-40%": 3.0, "30%-35%": 3.0, "25%-30%": 3.5, "20%-25%": 4.0, "15%-20%": 4.0, "10%-15%": 4.5, "5%-10%": 4.5, "<=5%": 5.0},
+        # Rows = Top-10 taxpayer concentration bucket.
+        # Columns = MLTM bucket. For this scorecard, LOWER MLTM is stronger
+        # because it means the structure has less loss-to-maturity exposure.
+        # Direction remains: 1 = strongest, 5 = weakest.
+        "<=5%":   {"<=5%": 1.0, "5%-10%": 1.0, "10%-15%": 1.5, "15%-20%": 2.0, "20%-25%": 2.5, "25%-30%": 3.0, "30%-35%": 3.5, "35%-40%": 4.0, ">=40%": 4.5},
+        "5%-15%":  {"<=5%": 1.0, "5%-10%": 1.5, "10%-15%": 2.0, "15%-20%": 2.5, "20%-25%": 3.0, "25%-30%": 3.5, "30%-35%": 4.0, "35%-40%": 4.5, ">=40%": 5.0},
+        "15%-25%": {"<=5%": 1.5, "5%-10%": 2.0, "10%-15%": 2.5, "15%-20%": 3.0, "20%-25%": 3.5, "25%-30%": 4.0, "30%-35%": 4.5, "35%-40%": 4.5, ">=40%": 5.0},
+        "25%-40%": {"<=5%": 2.0, "5%-10%": 2.5, "10%-15%": 3.0, "15%-20%": 3.5, "20%-25%": 4.0, "25%-30%": 4.5, "30%-35%": 4.5, "35%-40%": 5.0, ">=40%": 5.0},
         # Highly concentrated districts still receive a penalty, but strong
         # MLTM/loss-absorption capacity should keep the Financial Profile from
         # automatically falling to the weakest category. This avoids double-counting
         # concentration already captured in District Characteristics.
-        ">=40%":  {">=40%": 2.5, "35%-40%": 2.5, "30%-35%": 3.0, "25%-30%": 3.5, "20%-25%": 4.0, "15%-20%": 4.0, "10%-15%": 4.5, "5%-10%": 4.5, "<=5%": 5.0},
+        ">=40%":  {"<=5%": 2.5, "5%-10%": 3.0, "10%-15%": 3.5, "15%-20%": 4.0, "20%-25%": 4.0, "25%-30%": 4.5, "30%-35%": 4.5, "35%-40%": 5.0, ">=40%": 5.0},
     }
 
     numeric_assessment = matrix[top10_bucket][mltm_bucket]
@@ -601,7 +605,8 @@ def calculate_financial_profile_assessment(
         "maximum_loss_to_maturity_bucket": mltm_bucket,
         "financial_profile_assessment": numeric_assessment,
         "financial_profile_assessment_category": assessment_to_category(numeric_assessment),
-        "financial_profile_matrix_note": "Rebalanced prototype matrix: Top-10 concentration is counted in District Characteristics; Financial Profile gives more weight to MLTM/loss-absorption and avoids automatic worst-case treatment for high concentration.",
+        "financial_profile_matrix_note": "Rebalanced prototype matrix: lower MLTM is stronger; Top-10 concentration is counted in District Characteristics, so Financial Profile avoids automatic worst-case treatment for high concentration.",
+        "financial_profile_matrix_lookup": f"top10_bucket={top10_bucket}; mltm_bucket={mltm_bucket}; score={numeric_assessment}",
         "missing_financial_inputs": [],
     }
 
