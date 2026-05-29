@@ -5432,11 +5432,26 @@ def write_scorecard_manual_value(scorecard_key, value, source_method="Hard Score
     }
 
     value_text = _scorecard_value_to_widget_text(value, spec.get("type", "number"))
-    st.session_state[f"scorecard_input_{scorecard_key}"] = value_text
-    st.session_state[f"scorecard_input_{scorecard_key}_dirty"] = True
-    st.session_state[f"scorecard_select_{scorecard_key}"] = value
-    st.session_state[f"scorecard_select_{scorecard_key}_dirty"] = True
-    st.session_state[f"hard_manual_{scorecard_key}"] = value_text if spec.get("type") in ["number", "integer"] else value
+
+    # Do NOT write back into hard_manual_* here.
+    # hard_manual_* is the key of a widget inside st.form above. Streamlit raises
+    # StreamlitAPIException if a widget key is modified after that widget has been
+    # instantiated in the same run. The submitted value is already available from
+    # the form, and the durable source of truth is approved_inputs.
+    #
+    # We only try to sync the regular scorecard widgets for the next rerun. If
+    # one of those widgets has already been created in this run, silently skip the
+    # sync; approved_inputs still wins at calculation time.
+    for widget_key, widget_value in {
+        f"scorecard_input_{scorecard_key}": value_text,
+        f"scorecard_input_{scorecard_key}_dirty": True,
+        f"scorecard_select_{scorecard_key}": value,
+        f"scorecard_select_{scorecard_key}_dirty": True,
+    }.items():
+        try:
+            st.session_state[widget_key] = widget_value
+        except Exception:
+            pass
 
 
 def sync_scorecard_inputs_from_visible_widgets(scorecard_inputs):
