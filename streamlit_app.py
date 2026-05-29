@@ -2083,45 +2083,21 @@ def approve_total_assessed_value(value, source_method, source_document="", confi
     )
 
 def render_assessed_value_upload_parser(key_prefix="main"):
-    st.subheader("Assessed Value Resolver")
+    """Compact assessed-value fallback tools.
+
+    The Hybrid Source Resolver above is now the only document-AI workflow for
+    assessed value. This helper only shows non-duplicative fallback paths:
+    1) upload/map an assessor or parcel file, or
+    2) manually approve a source-backed assessed value.
+    """
     st.caption(
-        "Safe mode: try OS/Appendix extraction first, then assessor/parcel upload parsing, then manual override. "
-        "Nothing becomes source data until analyst approval."
+        "Fallback tools: use these only if the Hybrid Source Resolver above cannot produce a usable assessed-value candidate. "
+        "Approved values sync to Auto Context, the VTL calculator, and the scorecard audit trail."
     )
 
-    av_tab1, av_tab2, av_tab3 = st.tabs(["OS / Appendix AI Extraction", "Assessor Upload Parser", "Manual Override"])
+    av_tab1, av_tab2 = st.tabs(["Upload / Map Assessor File", "Manual Override"])
 
     with av_tab1:
-        parsed_docs = st.session_state.get("parsed_documents", []) or []
-        if not parsed_docs:
-            st.info("Upload an OS / Appendix PDF in Deal Workspace first, then this tab can search for assessed value evidence.")
-        else:
-            st.write(f"Parsed documents available: {len(parsed_docs)}")
-            if st.button("Scan Uploaded Documents for Assessed Value", key=f"{key_prefix}_scan_docs_for_assessed_value"):
-                st.session_state["assessed_value_doc_candidates"] = extract_assessed_value_candidates_from_documents(parsed_docs)
-
-            candidates = st.session_state.get("assessed_value_doc_candidates", []) or []
-            if not candidates:
-                st.caption("No document candidates scanned yet, or no strong assessed-value pattern was found.")
-            else:
-                for i, c in enumerate(candidates):
-                    with st.container(border=True):
-                        st.metric("Candidate Assessed Value", f"${c['value']:,.0f}")
-                        st.write(f"**Document:** {c['source_document']}")
-                        st.write(f"**Confidence:** {c['confidence']:.0%}")
-                        with st.expander("Evidence excerpt"):
-                            st.write(c["excerpt"])
-                        if st.button("Approve This Document Candidate", key=f"{key_prefix}_approve_doc_assessed_value_{i}"):
-                            approve_total_assessed_value(
-                                c["value"],
-                                source_method="OS / Appendix AI-Assisted Extraction",
-                                source_document=c["source_document"],
-                                confidence=c["confidence"],
-                                notes=f"Approved from document evidence. Excerpt: {c['excerpt'][:500]}",
-                            )
-                            st.success("Assessed value approved and Auto Context row updated.")
-
-    with av_tab2:
         av_file = st.file_uploader(
             "Upload assessor, parcel, or assessed-value file",
             type=["csv", "xlsx", "xls"],
@@ -2177,16 +2153,17 @@ def render_assessed_value_upload_parser(key_prefix="main"):
                             confidence=confidence,
                             notes=f"Total assessed value summed from column '{value_col}' across {valid_rows:,} numeric rows. Confidence {confidence:.0%}.",
                         )
-                        st.success("Total assessed value approved and Auto Context row updated.")
+                        st.success("Total assessed value approved and synced to Auto Context / VTL prefill.")
                 with candidate_col:
                     if st.button("Use AV to Update Value-to-Lien Calculator Input", key=f"{key_prefix}_candidate_total_av"):
-                        st.session_state["suggested_assessed_value"] = float(total_av)
+                        sync_vtl_prefill_to_widgets({"assessed_value": float(total_av)}, source_note=av_file.name)
                         st.success("Saved as suggested assessed value for the Value-to-Lien calculator.")
+                        rerun_after_approve()
 
             except Exception as e:
                 st.error(f"Could not parse assessed value file: {e}")
 
-    with av_tab3:
+    with av_tab2:
         manual_av = st.text_input("Manual total assessed value", placeholder="Example: 3454244692", key=f"{key_prefix}_manual_total_assessed_value")
         manual_source = st.text_input("Manual source note", placeholder="Example: OS p. A-12 / County assessor roll", key=f"{key_prefix}_manual_total_assessed_value_source")
         if st.button("Approve Manual Assessed Value", key=f"{key_prefix}_approve_manual_total_av"):
@@ -2201,8 +2178,7 @@ def render_assessed_value_upload_parser(key_prefix="main"):
                     confidence=1.0,
                     notes=f"Manual override. Source note: {manual_source}",
                 )
-                st.success("Manual assessed value approved and Auto Context row updated.")
-
+                st.success("Manual assessed value approved and synced.")
 
 def normalize_market_name(value):
     """Normalize MSA/county labels for fuzzy matching across public housing datasets."""
@@ -3666,11 +3642,16 @@ def _hybrid_approve_candidate(candidate):
     if field_key in {"all_taxable_assessed_value", "assessed_value"} and value is not None:
         try:
             st.session_state["suggested_assessed_value"] = float(value)
-            vtl_prefill = st.session_state.get("vtl_prefill", {}) or {}
-            vtl_prefill["assessed_value"] = float(value)
-            st.session_state["vtl_prefill"] = vtl_prefill
+            sync_vtl_prefill_to_widgets({"assessed_value": float(value)}, source_note=f"Hybrid Resolver: {source_document}")
         except Exception:
-            pass
+            # sync_vtl_prefill_to_widgets is defined later in the file; if this ever
+            # runs in an unusual import context, preserve the older prefill behavior.
+            vtl_prefill = st.session_state.get("vtl_prefill", {}) or {}
+            try:
+                vtl_prefill["assessed_value"] = float(value)
+                st.session_state["vtl_prefill"] = vtl_prefill
+            except Exception:
+                pass
 
         # Also update Auto Context table row so the Assessed Value tab reflects approval.
         try:
@@ -3692,26 +3673,35 @@ def _hybrid_approve_candidate(candidate):
             pass
 
     if field_key == "direct_debt" and value is not None:
-        vtl_prefill = st.session_state.get("vtl_prefill", {}) or {}
         try:
-            vtl_prefill["direct_debt"] = float(value)
-            st.session_state["vtl_prefill"] = vtl_prefill
+            sync_vtl_prefill_to_widgets({"direct_debt": float(value)}, source_note=f"Hybrid Resolver: {source_document}")
         except Exception:
-            pass
+            vtl_prefill = st.session_state.get("vtl_prefill", {}) or {}
+            try:
+                vtl_prefill["direct_debt"] = float(value)
+                st.session_state["vtl_prefill"] = vtl_prefill
+            except Exception:
+                pass
 
     if field_key == "overlapping_debt" and value is not None:
-        vtl_prefill = st.session_state.get("vtl_prefill", {}) or {}
         try:
-            vtl_prefill["overlapping_debt"] = float(value)
-            st.session_state["vtl_prefill"] = vtl_prefill
+            sync_vtl_prefill_to_widgets({"overlapping_debt": float(value)}, source_note=f"Hybrid Resolver: {source_document}")
         except Exception:
-            pass
+            vtl_prefill = st.session_state.get("vtl_prefill", {}) or {}
+            try:
+                vtl_prefill["overlapping_debt"] = float(value)
+                st.session_state["vtl_prefill"] = vtl_prefill
+            except Exception:
+                pass
 
     if field_key == "initial_reserve_fund" and value is not None:
         try:
-            st.session_state["mltm_initial_reserve_fund"] = float(value)
+            sync_mltm_schedule_to_editor(reserve_fund=float(value), source=f"Hybrid Resolver: {source_document}")
         except Exception:
-            pass
+            try:
+                st.session_state["mltm_initial_reserve_fund"] = float(value)
+            except Exception:
+                pass
 
     # Audit metadata for fields without scorecard keys.
     if not scorecard_key:
@@ -5991,6 +5981,7 @@ with tab_calcs:
 
     with unified_tab_assessed:
         st.subheader("Assessed Value / Tax Base Resolver")
+        st.caption("Step 1: run/approve Hybrid candidates. Step 2: use upload/manual fallback only if needed. Approved AV syncs into VTL.")
         render_hybrid_section_workflow(
             "assessed_tax_base",
             deal_setup,
@@ -6020,6 +6011,7 @@ with tab_calcs:
 
     with calc_tab1:
         st.subheader("Taxpayer Concentration Builder")
+        st.caption("Step 1: use Hybrid Resolver for OS evidence. Step 2: upload/map a table only if you need row-level concentration calculation.")
         render_hybrid_section_workflow(
             "taxbase_concentration",
             deal_setup,
@@ -6028,206 +6020,11 @@ with tab_calcs:
             key_prefix="taxbase_concentration_hybrid",
             expanded=True,
         )
-        render_ai_fill_warning()
 
-        with st.expander("AI Table Extraction Engine", expanded=False):
-            st.warning(
-                "AI/table extraction is only a data-entry accelerator. Always double-check source documents, table headers, units, and dates before approving."
-            )
-            st.caption(
-                "P1/P2/P3/P4 workflow: scan the full OS → locate taxpayer pages → try text/OCR reconstruction → approve into calculator and scorecard."
-            )
+        st.caption("Document AI is handled by the Hybrid Source Resolver above. Use the upload/manual builder below only when a structured table is needed for calculation.")
 
-            if st.button("Run Full-OS Taxpayer Page Finder", key="run_taxpayer_table_engine"):
-                parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
-                pages = detect_candidate_pages(
-                    parsed_docs_for_engine,
-                    window_radius=2,
-                    target_types=["top_taxpayers"],
-                )
-                taxpayer_candidates = [p for p in pages if p.get("candidate_type") == "top_taxpayers"]
-
-                if taxpayer_candidates:
-                    best = taxpayer_candidates[0]
-                    # Reconstruct from the single best page first. The wider ±page preview is kept for evidence review,
-                    # but using it for parsing can accidentally pull in neighboring non-taxpayer tables.
-                    df_candidate = reconstruct_taxpayer_table_from_text(best.get("page_preview", "") or best.get("preview", ""))
-                    if df_candidate is None or df_candidate.empty:
-                        df_candidate = reconstruct_taxpayer_table_from_text(best.get("preview", ""))
-                    # If evidence is located but rows are not reconstructed, keep a Tier-2 candidate rather than saying data is absent.
-                    row_count = 0 if df_candidate is None else len(df_candidate)
-                    confidence = confidence_score(row_count, 10)
-                    if row_count == 0 and best.get("matched_terms"):
-                        confidence = max(confidence, 20)
-                    st.session_state["taxpayer_table_candidate_engine"] = {
-                        "source_document": best.get("document"),
-                        "candidate_page": best.get("page"),
-                        "matched_terms": best.get("matched_terms", []),
-                        "table": df_candidate,
-                        "confidence": confidence,
-                        "status": confidence_status(confidence),
-                        "preview": best.get("preview", ""),
-                        "raw_candidate": best,
-                    }
-                else:
-                    st.session_state["taxpayer_table_candidate_engine"] = None
-                    st.error(
-                        "No taxpayer section was located in the full OS scan. Try a more specific OS, upload a taxpayer table, or use public source scout."
-                    )
-
-            taxpayer_engine_candidate = st.session_state.get("taxpayer_table_candidate_engine")
-            if taxpayer_engine_candidate:
-                st.write(f"**Source document:** {taxpayer_engine_candidate.get('source_document', '')}")
-                if taxpayer_engine_candidate.get("candidate_page"):
-                    st.write(f"**Candidate page:** {taxpayer_engine_candidate.get('candidate_page')}")
-                if taxpayer_engine_candidate.get("matched_terms"):
-                    st.write("**Matched terms:** " + ", ".join(taxpayer_engine_candidate.get("matched_terms", [])))
-
-                confidence = int(taxpayer_engine_candidate.get("confidence", 0) or 0)
-                status = taxpayer_engine_candidate.get("status", "")
-                st.write(f"**Confidence:** {confidence}% — `{status}`")
-
-                if confidence >= 80:
-                    st.success("🟢 Tier 1 — Source Verified / strong table reconstruction. Still verify source dates, units, and headers before approval.")
-                elif confidence >= 20:
-                    st.warning("🟡 Tier 2 — Taxpayer section detected. Text reconstruction may be incomplete; manual review or OCR is recommended before approval.")
-                else:
-                    st.info("⚪ Tier 3 — No reliable taxpayer evidence located. This means the current parser did not locate usable evidence; it does not prove the OS lacks taxpayer data.")
-
-                table_candidate = taxpayer_engine_candidate.get("table", pd.DataFrame())
-                if table_candidate is None or table_candidate.empty:
-                    st.warning(
-                        """
-⚠ Taxpayer section was located, but structured rows were not fully reconstructed.
-
-This usually means one of the following:
-
-• The table is image-based / scanned
-• The table spans multiple pages
-• The PDF text layer breaks columns apart
-• The table uses non-standard headers
-
-Next steps:
-
-1. Run OCR Mode on the located page window.
-2. Open Evidence Preview and manually verify the page.
-3. Upload CSV/XLSX and map columns if OCR still fails.
-4. Use Tier-2/Tier-3 fallback assumptions only if analyst policy allows it.
-
-This does **not** necessarily mean the Official Statement lacks taxpayer information.
-                        """
-                    )
-                else:
-                    st.dataframe(table_candidate, use_container_width=True, hide_index=True)
-
-                with st.expander("Evidence Preview", expanded=False):
-                    st.text(str(taxpayer_engine_candidate.get("preview", ""))[:8000])
-
-                st.markdown("### Recovery Options")
-                rec1, rec2, rec3, rec4 = st.columns(4)
-                with rec1:
-                    if st.button("🔍 OCR Mode", key="taxpayer_recovery_ocr_mode"):
-                        parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
-                        ocr_result = ocr_taxpayer_candidate_pages(
-                            parsed_docs_for_engine,
-                            taxpayer_engine_candidate.get("raw_candidate", taxpayer_engine_candidate),
-                        )
-                        if ocr_result.get("ok"):
-                            ocr_df = ocr_result.get("table", pd.DataFrame())
-                            row_count = 0 if ocr_df is None else len(ocr_df)
-                            confidence = confidence_score(row_count, 10)
-                            if row_count == 0:
-                                confidence = max(confidence, 20)
-                            st.session_state["taxpayer_table_candidate_engine"] = {
-                                **taxpayer_engine_candidate,
-                                "table": ocr_df,
-                                "confidence": confidence,
-                                "status": confidence_status(confidence),
-                                "preview": ocr_result.get("text", ""),
-                                "ocr_pages": ocr_result.get("pages", []),
-                                "ocr_used": True,
-                            }
-                            if row_count > 0:
-                                st.success(f"OCR reconstructed {row_count} taxpayer rows. Review before approving.")
-                            else:
-                                st.warning("OCR ran, but no clean taxpayer rows were reconstructed. Open Evidence Preview or use upload/mapping fallback.")
-                            rerun_after_approve()
-                        else:
-                            st.warning(ocr_result.get("error", "OCR Mode could not run."))
-                with rec2:
-                    if st.button("👁 Vision Mode", key="taxpayer_recovery_vision_mode"):
-                        st.info("Vision Mode requires a multimodal API integration. For now, use OCR Mode or upload/map a taxpayer table.")
-                with rec3:
-                    if st.button("📄 Upload CSV/XLSX", key="taxpayer_recovery_upload_mode"):
-                        st.info("Use the Upload / Column Mapping fallback section below to load taxpayer rows manually with less typing.")
-                with rec4:
-                    if st.button("📖 Open Evidence", key="taxpayer_recovery_open_evidence"):
-                        st.info("Open the Evidence Preview expander above and verify the located page window manually against the source PDF.")
-
-                if st.button("Approve and Load Taxpayer Table", key="approve_taxpayer_table_engine"):
-                    if table_candidate is not None and not table_candidate.empty:
-                        sync_taxpayer_table_to_editor(table_candidate.copy(), source=taxpayer_engine_candidate.get("source_document"))
-                        try:
-                            concentration = calculate_taxpayer_concentration(table_candidate.copy())
-                            safe_add_approved_input(
-                                "top10_taxpayers_percent_of_total_levy",
-                                concentration.get("top10_taxpayers_percent_of_total_levy"),
-                                status="AI Extracted" if confidence < 80 else "Auto Pulled",
-                                source_method="AI Table Extraction Engine",
-                                source_document=taxpayer_engine_candidate.get("source_document"),
-                                confidence=min(max(confidence / 100, 0.2), 1.0),
-                                notes="Approved taxpayer table reconstructed from OS page finder/OCR workflow.",
-                            )
-                            safe_add_approved_input(
-                                "largest_taxpayer_percent_of_total_levy",
-                                concentration.get("largest_taxpayer_percent_of_total_levy"),
-                                status="AI Extracted" if confidence < 80 else "Auto Pulled",
-                                source_method="AI Table Extraction Engine",
-                                source_document=taxpayer_engine_candidate.get("source_document"),
-                                confidence=min(max(confidence / 100, 0.2), 1.0),
-                                notes="Approved taxpayer table reconstructed from OS page finder/OCR workflow.",
-                            )
-                        except Exception as exc:
-                            st.warning(f"Loaded table, but aggregate scorecard sync failed: {exc}")
-                        st.success("Taxpayer table loaded into calculator and aggregate values pushed to scorecard. Review before final scoring.")
-                        rerun_after_approve()
-                    else:
-                        st.info(
-                            """
-No approved taxpayer rows are currently available.
-
-Current status: taxpayer evidence may be located, but the system has not reconstructed rows.
-
-Recommended next step: run OCR Mode or use the upload/mapping fallback below.
-                            """
-                        )
-
-        parsed_docs = st.session_state.get("parsed_documents", []) or []
-        with st.expander("AI Fill from Uploaded Documents", expanded=False):
-            st.caption("Looks for a Top Taxpayers / Special Tax Levy table in uploaded OS or Appendix documents, then lets you approve it into the calculator.")
-            if not parsed_docs:
-                st.info("Upload an OS / Appendix PDF in Deal Workspace first.")
-            else:
-                if st.button("Scan Documents for Taxpayer Table", key="ai_scan_taxpayer_table"):
-                    st.session_state["taxpayer_ai_candidates"] = scan_taxpayer_table_candidates(parsed_docs)
-
-                candidates = st.session_state.get("taxpayer_ai_candidates", []) or []
-                if not candidates:
-                    st.caption("No taxpayer-table candidate scanned yet, or no strong table was found.")
-                else:
-                    for i, cand in enumerate(candidates):
-                        with st.container(border=True):
-                            st.write(f"**Source:** {cand['source_document']} — {cand['table_name']}")
-                            st.write(f"**Confidence:** {cand['confidence']:.0%}")
-                            st.caption(cand.get("notes", ""))
-                            st.dataframe(cand["data"], use_container_width=True, hide_index=True)
-                            if st.button("Approve and Load This Taxpayer Table", key=f"approve_taxpayer_ai_table_{i}"):
-                                sync_taxpayer_table_to_editor(cand["data"].copy(), source=cand["source_document"])
-                                st.success("Loaded into Taxpayer Concentration Builder. Please review, edit if needed, then calculate.")
-                                rerun_after_approve()
-
-            st.markdown("---")
-            st.subheader("Fallback: Upload / Map Taxpayer Table")
+        with st.expander("Upload / Map Taxpayer Table", expanded=False):
+            st.caption("Upload a CSV/XLSX taxpayer table, map owner and levy-share columns, then approve it into the concentration builder.")
             render_no_candidate_guidance("a taxpayer concentration table")
             taxpayer_upload = st.file_uploader(
                 "Upload taxpayer table directly (CSV/XLSX/XLS)",
@@ -6265,54 +6062,6 @@ Recommended next step: run OCR Mode or use the upload/mapping fallback below.
                     st.success("Uploaded table loaded into Taxpayer Concentration Builder. Review/edit below before calculating.")
                     rerun_after_approve()
 
-            taxpayer_public_cand = render_public_source_scout_common(
-                calculator_name="Taxpayer Concentration",
-                targets=[
-                    "Top taxpayer / property owner table",
-                    "Taxpayer special tax levy percent or share of total levy",
-                    "Top 10 taxpayers as percent of total levy",
-                    "Largest taxpayer as percent of total levy",
-                ],
-                key_prefix="taxpayer_calc",
-            )
-            taxpayer_public_df = _candidate_table_df(taxpayer_public_cand, "taxpayer_table")
-            if not taxpayer_public_df.empty:
-                if "taxpayer_name" in taxpayer_public_df.columns and "levy_percent" in taxpayer_public_df.columns:
-                    taxpayer_public_df = taxpayer_public_df[["taxpayer_name", "levy_percent"]].copy()
-                    taxpayer_public_df["levy_percent"] = numeric_series_from_column(taxpayer_public_df["levy_percent"])
-                    taxpayer_public_df = taxpayer_public_df.dropna(subset=["taxpayer_name", "levy_percent"])
-                    st.caption("Preview of AI-sourced public taxpayer table")
-                    st.dataframe(taxpayer_public_df, use_container_width=True, hide_index=True)
-                    if st.button("Approve AI-Sourced Taxpayer Table", key="approve_taxpayer_public_source", disabled=not source_gate_allows_approval(taxpayer_public_cand)):
-                        if not source_gate_allows_approval(taxpayer_public_cand):
-                            st.error("Approval blocked by Source Confidence Gate. Use a matched official source or upload/map the table.")
-                            st.stop()
-                        sync_taxpayer_table_to_editor(
-                            taxpayer_public_df.copy(),
-                            source=taxpayer_public_cand.get("source_url") or taxpayer_public_cand.get("source_title") or "AI Public Source Scout",
-                        )
-                        st.success("AI-sourced taxpayer table loaded. Review/edit below before calculating.")
-                        rerun_after_approve()
-                else:
-                    st.warning("AI found a taxpayer candidate, but the table columns were not standardized. Use the upload/mapping fallback or copy values manually.")
-            elif taxpayer_public_cand and taxpayer_public_cand.get("ok"):
-                vals = _candidate_values_dict(taxpayer_public_cand)
-                top10 = vals.get("top10_taxpayers_percent_of_total_levy")
-                largest = vals.get("largest_taxpayer_percent_of_total_levy")
-                if top10 is not None or largest is not None:
-                    st.info("AI found aggregate taxpayer concentration values but not a full table. You may approve them directly into the scorecard after verifying the source.")
-                    ctop, clargest = st.columns(2)
-                    ctop.metric("Top 10 Taxpayers %", "" if top10 is None else top10)
-                    clargest.metric("Largest Taxpayer %", "" if largest is None else largest)
-                    if st.button("Approve Aggregate Taxpayer Values", key="approve_taxpayer_public_aggregates", disabled=not source_gate_allows_approval(taxpayer_public_cand)):
-                        if not source_gate_allows_approval(taxpayer_public_cand):
-                            st.error("Approval blocked by Source Confidence Gate. Use a matched official source or upload/map the table.")
-                            st.stop()
-                        if top10 is not None:
-                            safe_add_approved_input("top10_taxpayers_percent_of_total_levy", parse_numeric_input(top10), status="AI Extracted", source_method="AI Public Source Scout", source_document=taxpayer_public_cand.get("source_url"), confidence=taxpayer_public_cand.get("confidence", 0.55), notes="AI-sourced aggregate value; double-check source before use.")
-                        if largest is not None:
-                            safe_add_approved_input("largest_taxpayer_percent_of_total_levy", parse_numeric_input(largest), status="AI Extracted", source_method="AI Public Source Scout", source_document=taxpayer_public_cand.get("source_url"), confidence=taxpayer_public_cand.get("confidence", 0.55), notes="AI-sourced aggregate value; double-check source before use.")
-                        st.success("Aggregate taxpayer values approved into master scorecard inputs.")
 
         render_tiered_missing_data_fallback_center(
             fields=[
@@ -6371,6 +6120,7 @@ Recommended next step: run OCR Mode or use the upload/mapping fallback below.
 
     with calc_tab2:
         st.subheader("Value-to-Lien Calculator")
+        st.caption("Step 1: approve Hybrid AV/debt candidates. Step 2: verify/edit inputs and calculate VTL.")
         render_hybrid_section_workflow(
             "leverage_vtl",
             deal_setup,
@@ -6379,89 +6129,15 @@ Recommended next step: run OCR Mode or use the upload/mapping fallback below.
             key_prefix="leverage_vtl_hybrid",
             expanded=True,
         )
-        render_ai_fill_warning()
         render_tiered_missing_data_fallback_center(
             fields=["est_value_to_lien"],
             key_prefix="leverage_tiered_fallback",
         )
 
-        with st.expander("AI Table Extraction Engine", expanded=False):
-            st.warning(
-                "AI/table extraction may misread PDF tables. Verify source, units, and whether debt figures are direct, overlapping, or total."
-            )
-            if st.button("Run Table Extraction for VTL Inputs", key="run_vtl_table_engine"):
-                parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
-                pages = detect_candidate_pages(parsed_docs_for_engine)
-                vtl_pages = [p for p in pages if p.get("candidate_type") in ["value_to_lien", "overlapping_debt"]]
-                combined_text = "\n\n".join([p.get("preview", "") for p in (vtl_pages or pages)])
-                extracted = extract_vtl_inputs_from_text(combined_text)
-                found_count = sum(v is not None for v in extracted.values())
-                st.session_state["vtl_table_candidate_engine"] = {
-                    **extracted,
-                    "confidence": confidence_score(found_count, 3),
-                    "status": confidence_status(confidence_score(found_count, 3)),
-                    "preview": combined_text[:4000],
-                }
+        st.caption("Document AI is handled by the Hybrid Source Resolver above. Approved AV/debt candidates sync into this calculator; use direct inputs below if needed.")
 
-            vtl_engine_candidate = st.session_state.get("vtl_table_candidate_engine")
-            if vtl_engine_candidate:
-                c1, c2, c3, c4 = st.columns(4)
-                av = vtl_engine_candidate.get("assessed_value")
-                dd = vtl_engine_candidate.get("direct_debt")
-                od = vtl_engine_candidate.get("overlapping_debt")
-                c1.metric("Assessed Value", "" if av is None else f"${float(av):,.0f}")
-                c2.metric("Direct Debt", "" if dd is None else f"${float(dd):,.0f}")
-                c3.metric("Overlapping Debt", "" if od is None else f"${float(od):,.0f}")
-                c4.metric("Confidence", f"{vtl_engine_candidate.get('confidence', 0)}%")
-                st.caption(f"Extraction status: `{vtl_engine_candidate.get('status', '')}`")
-                with st.expander("Evidence Preview"):
-                    st.text(vtl_engine_candidate.get("preview", ""))
-                if st.button("Approve and Pre-Fill VTL Inputs", key="approve_vtl_table_engine"):
-                    existing = st.session_state.get("vtl_prefill", {}) or {}
-                    for k in ["assessed_value", "direct_debt", "overlapping_debt"]:
-                        if vtl_engine_candidate.get(k) is not None:
-                            existing[k] = float(vtl_engine_candidate[k])
-                    if existing:
-                        sync_vtl_prefill_to_widgets(existing, source_note="AI Table Extraction Engine")
-                        st.success("VTL inputs pre-filled. Review before calculating.")
-                        rerun_after_approve()
-                    else:
-                        st.error("No usable VTL values were extracted.")
-
-        parsed_docs = st.session_state.get("parsed_documents", []) or []
-        with st.expander("AI Fill from Uploaded Documents", expanded=False):
-            st.caption("Searches uploaded documents for assessed value, direct debt, and overlapping debt. Approving only pre-fills the calculator; you can still edit everything.")
-            if not parsed_docs:
-                st.info("Upload an OS / Appendix PDF or assessor file first.")
-            else:
-                if st.button("Scan Documents for VTL Inputs", key="ai_scan_vtl_inputs"):
-                    st.session_state["vtl_ai_candidate"] = scan_vtl_inputs_from_documents(parsed_docs)
-
-                cand = st.session_state.get("vtl_ai_candidate")
-                if cand:
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Assessed Value", "" if cand.get("assessed_value") is None else f"${cand['assessed_value']:,.0f}")
-                    c2.metric("Direct Debt", "" if cand.get("direct_debt") is None else f"${cand['direct_debt']:,.0f}")
-                    c3.metric("Overlapping Debt", "" if cand.get("overlapping_debt") is None else f"${cand['overlapping_debt']:,.0f}")
-                    c4.metric("Confidence", f"{cand.get('confidence', 0):.0%}")
-                    if cand.get("evidence"):
-                        with st.expander("Evidence snippets"):
-                            for e in cand["evidence"]:
-                                st.write(f"**{e['field']}**")
-                                st.code(e["excerpt"])
-                    if st.button("Approve and Pre-Fill VTL Inputs", key="approve_vtl_ai_inputs"):
-                        existing = st.session_state.get("vtl_prefill", {}) or {}
-                        for k in ["assessed_value", "direct_debt", "overlapping_debt"]:
-                            if cand.get(k) is not None:
-                                existing[k] = float(cand[k])
-                        sync_vtl_prefill_to_widgets(existing, source_note=cand.get("source_document"))
-                        st.success("Loaded into Value-to-Lien calculator. Review/edit before calculating.")
-                        rerun_after_approve()
-                else:
-                    render_no_candidate_guidance("VTL inputs")
-
-            st.markdown("---")
-            st.subheader("Fallback: Direct VTL Input with Source Note")
+        with st.expander("Manual / Direct VTL Inputs", expanded=False):
+            st.caption("Use direct source-backed values when Hybrid extraction cannot confidently map the AV / debt table.")
             st.caption("Use this when AI cannot reliably read the OS table, or when you already have values from an assessor export / OS appendix.")
             vtl_f1, vtl_f2, vtl_f3 = st.columns(3)
             with vtl_f1:
@@ -6488,36 +6164,6 @@ Recommended next step: run OCR Mode or use the upload/mapping fallback below.
                 else:
                     st.warning("No valid numeric VTL values were entered.")
 
-            vtl_public_cand = render_public_source_scout_common(
-                calculator_name="Value-to-Lien",
-                targets=[
-                    "Assessed value",
-                    "Direct debt",
-                    "Overlapping debt",
-                    "Value-to-lien table or direct and overlapping debt table",
-                ],
-                key_prefix="vtl_calc",
-            )
-            if vtl_public_cand and vtl_public_cand.get("ok"):
-                vals = _candidate_values_dict(vtl_public_cand)
-                pv1, pv2, pv3 = st.columns(3)
-                pv1.metric("Assessed Value", "" if vals.get("assessed_value") is None else f"${parse_numeric_input(vals.get('assessed_value')):,.0f}")
-                pv2.metric("Direct Debt", "" if vals.get("direct_debt") is None else f"${parse_numeric_input(vals.get('direct_debt')):,.0f}")
-                pv3.metric("Overlapping Debt", "" if vals.get("overlapping_debt") is None else f"${parse_numeric_input(vals.get('overlapping_debt')):,.0f}")
-                if st.button("Approve AI-Sourced VTL Inputs", key="approve_vtl_public_source", disabled=not source_gate_allows_approval(vtl_public_cand)):
-                    if not source_gate_allows_approval(vtl_public_cand):
-                        st.error("Approval blocked by Source Confidence Gate. Use a matched official source or upload/map the table.")
-                        st.stop()
-                    existing = st.session_state.get("vtl_prefill", {}) or {}
-                    for src_key, dest_key in [("assessed_value", "assessed_value"), ("direct_debt", "direct_debt"), ("overlapping_debt", "overlapping_debt")]:
-                        if vals.get(src_key) is not None:
-                            existing[dest_key] = float(parse_numeric_input(vals.get(src_key)))
-                    if existing:
-                        sync_vtl_prefill_to_widgets(existing, source_note=vtl_public_cand.get("source_url") or vtl_public_cand.get("source_title"))
-                        st.success("AI-sourced VTL inputs loaded. Review/edit below before calculating.")
-                        rerun_after_approve()
-                    else:
-                        st.warning("AI did not return usable numeric VTL inputs.")
 
         vtl_prefill = st.session_state.get("vtl_prefill", {}) or {}
         if st.session_state.get("suggested_assessed_value") is not None:
@@ -6567,6 +6213,7 @@ Recommended next step: run OCR Mode or use the upload/mapping fallback below.
 
     with calc_tab3:
         st.subheader("Maximum Loss-to-Maturity Stress Test")
+        st.caption("Step 1: approve reserve/schedule evidence from Hybrid. Step 2: upload/map cashflow if needed and calculate MLTM.")
         render_hybrid_section_workflow(
             "cashflow_mltm",
             deal_setup,
@@ -6575,79 +6222,15 @@ Recommended next step: run OCR Mode or use the upload/mapping fallback below.
             key_prefix="cashflow_mltm_hybrid",
             expanded=True,
         )
-        render_ai_fill_warning()
         render_tiered_missing_data_fallback_center(
             fields=["maximum_loss_to_maturity_percent"],
             key_prefix="mltm_tiered_fallback",
         )
 
-        with st.expander("AI Table Extraction Engine", expanded=False):
-            st.warning(
-                "AI/table extraction may misread debt-service schedules. Verify years, levy/revenue columns, debt-service columns, and units."
-            )
-            if st.button("Run Table Extraction for MLTM Cashflow", key="run_mltm_table_engine"):
-                parsed_docs_for_engine = st.session_state.get("parsed_documents", [])
-                pages = detect_candidate_pages(parsed_docs_for_engine)
-                mltm_pages = [p for p in pages if p.get("candidate_type") in ["debt_service", "reserve_fund"]]
-                combined_text = "\n\n".join([p.get("preview", "") for p in mltm_pages])
-                df_candidate = extract_mltm_cashflow_from_text(combined_text)
-                st.session_state["mltm_cashflow_candidate_engine"] = {
-                    "table": df_candidate,
-                    "confidence": confidence_score(len(df_candidate), 10),
-                    "status": confidence_status(confidence_score(len(df_candidate), 10)),
-                    "preview": combined_text[:5000],
-                }
+        st.caption("Document AI is handled by the Hybrid Source Resolver above. Use upload/mapping below to create the cashflow table used by the MLTM calculator.")
 
-            mltm_engine_candidate = st.session_state.get("mltm_cashflow_candidate_engine")
-            if mltm_engine_candidate:
-                st.write(f"**Confidence:** {mltm_engine_candidate.get('confidence', 0)}% — `{mltm_engine_candidate.get('status', '')}`")
-                mltm_table = mltm_engine_candidate.get("table", pd.DataFrame())
-                if mltm_table is None or mltm_table.empty:
-                    st.warning("A possible debt-service section was found, but no clean year / levy / debt-service rows were reconstructed. Use upload/mapping fallback or verify the evidence manually.")
-                else:
-                    st.dataframe(mltm_table, use_container_width=True, hide_index=True)
-                with st.expander("Evidence Preview"):
-                    st.text(mltm_engine_candidate.get("preview", ""))
-                if st.button("Approve and Load MLTM Cashflow", key="approve_mltm_table_engine"):
-                    if mltm_table is not None and not mltm_table.empty:
-                        sync_mltm_schedule_to_editor(mltm_table.copy(), source="AI Table Extraction Engine")
-                        st.success("MLTM cashflow loaded into calculator. Review before calculating.")
-                        rerun_after_approve()
-                    else:
-                        st.error("No usable MLTM cashflow rows to load.")
-
-        parsed_docs = st.session_state.get("parsed_documents", []) or []
-        with st.expander("AI Fill from Uploaded Documents", expanded=False):
-            st.caption("Looks for a cashflow / debt-service schedule with year, special tax levy or revenue, and annual debt service columns.")
-            if not parsed_docs:
-                st.info("Upload a debt service schedule, OS appendix table, Excel, or CSV first.")
-            else:
-                if st.button("Scan Documents for MLTM Cashflow", key="ai_scan_mltm_cashflow"):
-                    st.session_state["mltm_ai_candidates"] = scan_mltm_cashflow_candidates(parsed_docs)
-
-                candidates = st.session_state.get("mltm_ai_candidates", []) or []
-                if not candidates:
-                    st.caption("No MLTM cashflow candidate scanned yet, or no strong schedule table was found.")
-                else:
-                    for i, cand in enumerate(candidates):
-                        with st.container(border=True):
-                            st.write(f"**Source:** {cand['source_document']} — {cand['table_name']}")
-                            st.write(f"**Confidence:** {cand['confidence']:.0%}")
-                            st.caption(cand.get("notes", ""))
-                            if cand.get("reserve_fund"):
-                                st.metric("Reserve Fund Candidate", f"${cand['reserve_fund']:,.0f}")
-                            st.dataframe(cand["data"], use_container_width=True, hide_index=True)
-                            if st.button("Approve and Load This MLTM Schedule", key=f"approve_mltm_ai_schedule_{i}"):
-                                sync_mltm_schedule_to_editor(
-                                    cand["data"].copy(),
-                                    reserve_fund=cand.get("reserve_fund"),
-                                    source=cand["source_document"],
-                                )
-                                st.success("Loaded into MLTM Stress Test. Review/edit before calculating.")
-                                rerun_after_approve()
-
-            st.markdown("---")
-            st.subheader("Fallback: Upload / Map MLTM Cashflow Schedule")
+        with st.expander("Upload / Map MLTM Cashflow Schedule", expanded=False):
+            st.caption("Upload a CSV/XLSX debt-service or special-tax schedule, map year / levy / debt-service columns, then calculate MLTM below.")
             render_no_candidate_guidance("an MLTM cashflow or debt-service schedule")
             mltm_upload = st.file_uploader(
                 "Upload cashflow / debt service schedule directly (CSV/XLSX/XLS)",
@@ -6698,59 +6281,6 @@ Recommended next step: run OCR Mode or use the upload/mapping fallback below.
                     st.success("Uploaded schedule loaded into MLTM Stress Test. Review/edit below before calculating.")
                     rerun_after_approve()
 
-            mltm_public_cand = render_public_source_scout_common(
-                calculator_name="MLTM Stress Test",
-                targets=[
-                    "Annual special tax levy or pledged revenue by year",
-                    "Annual debt service by year",
-                    "Initial reserve fund",
-                    "Debt service schedule or cashflow table",
-                ],
-                key_prefix="mltm_calc",
-            )
-            mltm_public_df = _candidate_table_df(mltm_public_cand, "mltm_cashflow")
-            if not mltm_public_df.empty:
-                needed = ["year", "special_tax_levy", "annual_debt_service"]
-                if all(c in mltm_public_df.columns for c in needed):
-                    mltm_public_df = mltm_public_df[needed].copy()
-                    mltm_public_df["year"] = numeric_series_from_column(mltm_public_df["year"]).astype("Int64")
-                    mltm_public_df["special_tax_levy"] = numeric_series_from_column(mltm_public_df["special_tax_levy"])
-                    mltm_public_df["annual_debt_service"] = numeric_series_from_column(mltm_public_df["annual_debt_service"])
-                    mltm_public_df = mltm_public_df.dropna(subset=needed)
-                    st.caption("Preview of AI-sourced public MLTM cashflow schedule")
-                    st.dataframe(mltm_public_df, use_container_width=True, hide_index=True)
-                    if st.button("Approve AI-Sourced MLTM Schedule", key="approve_mltm_public_source", disabled=not source_gate_allows_approval(mltm_public_cand)):
-                        if not source_gate_allows_approval(mltm_public_cand):
-                            st.error("Approval blocked by Source Confidence Gate. Use a matched official source or upload/map the schedule.")
-                            st.stop()
-                        vals = _candidate_values_dict(mltm_public_cand)
-                        reserve_val = None
-                        if vals.get("initial_reserve_fund") is not None:
-                            reserve_val = float(parse_numeric_input(vals.get("initial_reserve_fund")))
-                        sync_mltm_schedule_to_editor(
-                            mltm_public_df.copy(),
-                            reserve_fund=reserve_val,
-                            source=mltm_public_cand.get("source_url") or mltm_public_cand.get("source_title") or "AI Public Source Scout",
-                        )
-                        st.success("AI-sourced MLTM schedule loaded. Review/edit below before calculating.")
-                        rerun_after_approve()
-                else:
-                    st.warning("AI found an MLTM candidate, but the table columns were not standardized. Use the upload/mapping fallback or copy values manually.")
-            elif mltm_public_cand and mltm_public_cand.get("ok"):
-                vals = _candidate_values_dict(mltm_public_cand)
-                if vals.get("initial_reserve_fund") is not None:
-                    st.info("AI found an initial reserve fund but not a full cashflow schedule. You can approve the reserve fund, then upload/map the cashflow schedule separately.")
-                    st.metric("Initial Reserve Fund Candidate", f"${parse_numeric_input(vals.get('initial_reserve_fund')):,.0f}")
-                    if st.button("Approve AI-Sourced Reserve Fund", key="approve_mltm_public_reserve", disabled=not source_gate_allows_approval(mltm_public_cand)):
-                        if not source_gate_allows_approval(mltm_public_cand):
-                            st.error("Approval blocked by Source Confidence Gate. Use a matched official source or upload/map the schedule.")
-                            st.stop()
-                        sync_mltm_schedule_to_editor(
-                            reserve_fund=float(parse_numeric_input(vals.get("initial_reserve_fund"))),
-                            source=mltm_public_cand.get("source_url") or mltm_public_cand.get("source_title") or "AI Public Source Scout",
-                        )
-                        st.success("Reserve fund loaded. Review/edit below before calculating.")
-                        rerun_after_approve()
 
         # ---------------------------------------------------------------------
         # MLTM calculation workspace
