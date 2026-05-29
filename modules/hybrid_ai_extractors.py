@@ -80,20 +80,18 @@ HYBRID_SECTIONS: Dict[str, Dict[str, Any]] = {
         "subtitle": "AI-first OS extraction; regex is backup/debug only.",
         "fields": [
             HybridField(
-                key="all_taxable_assessed_value",
-                label="All Taxable Property Assessed Value",
+                key="appraised_value_for_vtl",
+                label="Appraised / Market Value for VTL",
                 scorecard_key="total_assessed_value",
                 value_type="money",
-                preferred_source="Official Statement / Assessor assessed value table",
+                preferred_source="Official Statement value-to-lien / value-to-burden table; Appraisal Report aggregate market value",
                 regex_patterns=(
-                    r"assessed\s+value\s+of\s+all\s+(?:the\s+)?taxable\s+property[^\$]{0,260}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
-                    r"all\s+(?:the\s+)?taxable\s+property[^\$]{0,260}assessed\s+value[^\$]{0,260}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
-                    r"total\s+(?:taxable\s+)?assessed\s+value[^\$]{0,260}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
-                    r"taxable\s+assessed\s+value[^\$]{0,260}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
-                    r"assessed\s+valuation[^\$]{0,260}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"(?:aggregate\s+)?(?:minimum\s+)?market\s+value[^$]{0,320}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"appraised\s+value[^$]{0,320}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"total[^\n]{0,180}?\$\s*([0-9][0-9,]*(?:\.\d+)?)\s+\$\s*[0-9][0-9,]*(?:\.\d+)?\s+\$\s*[0-9][0-9,]*(?:\.\d+)?\s+\$\s*[0-9][0-9,]*(?:\.\d+)?\s+[0-9]+(?:\.\d+)?\s*:?1",
                 ),
-                keywords=("assessed value", "taxable property", "value-to-lien", "assessed valuation"),
-                guidance="Prefer all taxable property within the CFD over developed-property-only value.",
+                keywords=("appraised value", "market value", "aggregate minimum market value", "value-to-burden", "value-to-lien", "total land secured debt"),
+                guidance="For CFD/special-tax deals, use appraised or aggregate market value for VTL when assessed value is not disclosed. Do not use debt/tax-liability rows as value.",
             ),
             HybridField(
                 key="developed_property_assessed_value",
@@ -205,17 +203,18 @@ HYBRID_SECTIONS: Dict[str, Dict[str, Any]] = {
         "subtitle": "AI-first extraction of AV/debt/VTL; regex is backup/debug only.",
         "fields": [
             HybridField(
-                key="assessed_value",
-                label="Assessed Value",
+                key="appraised_value_for_vtl",
+                label="Appraised / Market Value for VTL",
                 scorecard_key="total_assessed_value",
                 value_type="money",
-                preferred_source="OS / Assessor total taxable AV disclosure",
+                preferred_source="OS Value-to-Burden / Appraisal Report aggregate market value",
                 regex_patterns=(
-                    r"assessed\s+value\s+of\s+all\s+(?:the\s+)?taxable\s+property[^\$]{0,260}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
-                    r"total\s+(?:taxable\s+)?assessed\s+value[^\$]{0,260}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"(?:aggregate\s+)?(?:minimum\s+)?market\s+value[^$]{0,320}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"appraised\s+value[^$]{0,320}\$\s*([0-9][0-9,]*(?:\.\d+)?)",
+                    r"total[^\n]{0,180}?\$\s*([0-9][0-9,]*(?:\.\d+)?)\s+\$\s*[0-9][0-9,]*(?:\.\d+)?\s+\$\s*[0-9][0-9,]*(?:\.\d+)?\s+\$\s*[0-9][0-9,]*(?:\.\d+)?\s+[0-9]+(?:\.\d+)?\s*:?1",
                 ),
-                keywords=("assessed value", "taxable property", "value-to-lien"),
-                guidance="Prefer all taxable AV.",
+                keywords=("appraised value", "market value", "aggregate minimum market value", "value-to-burden", "value to burden", "value-to-lien", "total land secured debt"),
+                guidance="For special tax / CFD deals, if assessed value is not disclosed but appraised value or aggregate market value is disclosed for value-to-lien/value-to-burden analysis, return that as appraised_value_for_vtl. Never use debt/tax-liability rows as value.",
             ),
             HybridField(
                 key="direct_debt",
@@ -678,7 +677,7 @@ def _looks_like_taxbase_concentration_fields(fields: Iterable[HybridField]) -> b
 
 def _looks_like_leverage_fields(fields: Iterable[HybridField]) -> bool:
     keys = {getattr(f, "key", "") for f in fields}
-    return bool({"assessed_value", "direct_debt", "overlapping_debt", "est_value_to_lien"} & keys)
+    return bool({"appraised_value_for_vtl", "assessed_value", "direct_debt", "overlapping_debt", "est_value_to_lien"} & keys)
 
 
 def _looks_like_cashflow_fields(fields: Iterable[HybridField]) -> bool:
@@ -733,8 +732,16 @@ def find_candidate_pages_for_fields(parsed_docs: List[Dict[str, Any]], fields: I
         all_keywords.extend([
             "value-to-burden ratio",
             "value to burden ratio",
-            "assessed value to burden ratios",
+            "value-to-lien",
             "value to lien",
+            "appraised value",
+            "market value",
+            "aggregate minimum market value",
+            "value-to-burden ratio based on appraised value",
+            "total land secured debt",
+            "overlapping land secured debt",
+            "special tax bonds",
+            "direct and overlapping governmental obligations",
             "direct and overlapping bonded debt",
             "outstanding direct and overlapping bonded debt",
         ])
@@ -783,6 +790,27 @@ def find_candidate_pages_for_fields(parsed_docs: List[Dict[str, Any]], fields: I
                 if "table of contents" in lower and "percentage of total special tax levy" not in lower:
                     score -= 8
 
+            if is_leverage:
+                if "value-to-burden ratio based on appraised value" in lower:
+                    score += 35
+                if "appraised value" in lower and "special tax bonds" in lower and "overlapping" in lower:
+                    score += 30
+                if "total land secured debt" in lower and "value-to-burden" in lower:
+                    score += 25
+                if "aggregate minimum market value" in lower or "market value of the developed property" in lower:
+                    score += 18
+                # Avoid debt-only/tax-liability pages unless they also contain value-to-burden/value table context.
+                if "total property tax liability" in lower and "appraised value" not in lower:
+                    score -= 20
+
+            if is_cashflow:
+                if "debt service schedule" in lower and "principal" in lower and "interest" in lower and "total" in lower:
+                    score += 25
+                if "date" in lower and "principal" in lower and "interest" in lower:
+                    score += 15
+                if "sources of funds" in lower and "reserve fund" in lower:
+                    score += 15
+
             hits.append({**p, "matched_terms": matched[:12], "page_score": score})
 
     # TOC helper: only search TOC headings relevant to the current section.
@@ -797,16 +825,21 @@ def find_candidate_pages_for_fields(parsed_docs: List[Dict[str, Any]], fields: I
     elif is_leverage:
         toc_targets = [
             "value-to-burden ratio",
+            "value-to-lien ratios",
+            "appraised property value",
+            "appraised values",
             "direct and overlapping governmental obligations",
             "estimated assessed value-to-lien ratios",
             "assessed value",
         ]
     elif is_cashflow:
         toc_targets = [
+            "debt service schedule",
             "scheduled debt service",
             "projected debt service coverage",
             "reserve fund",
             "sources and uses of funds",
+            "2025 reserve fund",
         ]
     else:
         toc_targets = [k for k in all_keywords if len(k) >= 8][:12]
@@ -828,7 +861,7 @@ def find_candidate_pages_for_fields(parsed_docs: List[Dict[str, Any]], fields: I
                 for offset in range(0, 14):
                     actual = reported_page + offset
                     for match_page in [q for q in pages if int(q.get("page", 0)) == actual]:
-                        base_score = 18 if is_taxbase else 10
+                        base_score = 18 if is_taxbase else (16 if is_leverage or is_cashflow else 10)
                         hits.append({**match_page, "matched_terms": [f"TOC: {target} → {reported_page}"], "page_score": base_score})
 
     # Deduplicate document/page, keep highest score and matched terms.
@@ -1193,7 +1226,7 @@ Extract ONLY values that are explicitly supported by the provided text. Do not i
 If a field is not found, return value=null, confidence=0, page=null, and notes explaining what is missing.
 Never return 0 unless the source explicitly states the value is zero. Missing is null, not 0.
 Prefer deal-specific values over general county values.
-For assessed value / appraised value: distinguish assessed value, appraised market value, direct debt, overlapping debt, tax liability, and total land-secured indebtedness. Do NOT use debt tables, property-tax-liability tables, or overlapping-debt rows as assessed value.
+For appraised_value_for_vtl / assessed value: for special tax / CFD deals, if assessed value is not disclosed but appraised value, aggregate market value, or value-to-burden table value is disclosed for value-to-lien/value-to-burden analysis, return that value as appraised_value_for_vtl. Distinguish value, direct debt, overlapping debt, tax liability, and total land-secured indebtedness. Do NOT use debt tables, property-tax-liability tables, overlapping-debt rows, or $0 debt rows as value.
 For taxpayer concentration, do not confuse assessed-value share with levy/special tax share unless the source clearly says levy/special tax share.
 For district size: prefer taxable units/residential lots/parcels securing the bonds. Do NOT use assessor/APN parcels or building sites unless the text explicitly says those are the taxable units securing the special tax.
 For MLTM, prefer a calculated schedule or explicit MLTM; do not make up a stress value.
@@ -1202,7 +1235,7 @@ Fields:
 {field_instructions}
 
 Text window:
-{candidate_text[:22000]}
+{candidate_text[:32000]}
 """.strip()
 
     schema = _json_schema_for_fields(fields)
@@ -1273,8 +1306,13 @@ def _is_usable_candidate(candidate: Dict[str, Any], field_lookup: Dict[str, Hybr
         evidence = _safe_text(candidate.get("evidence", "")).lower()
         # Almost every false positive we saw became 0 with high confidence.
         # Only keep zero if the evidence explicitly says the field is zero.
-        if numeric == 0 and not re.search(r"(?:\$\s*0(?:\.00)?|\b0(?:\.0+)?\s*%)", evidence):
-            return False
+        if numeric == 0:
+            # For extraction targets, zero is almost always a debt-table/tax-liability artifact,
+            # not a valid AV/VTL/MLTM candidate. Require manual entry if truly zero.
+            if field_key in {"appraised_value_for_vtl", "all_taxable_assessed_value", "assessed_value", "direct_debt", "overlapping_debt", "est_value_to_lien", "initial_reserve_fund", "maximum_loss_to_maturity_percent"}:
+                return False
+            if not re.search(r"(?:\$\s*0(?:\.00)?|\b0(?:\.0+)?\s*%)", evidence):
+                return False
 
     return True
 
@@ -1284,7 +1322,8 @@ def _build_ai_candidate_text(
     pages: List[Dict[str, Any]],
     candidate_pages: List[Dict[str, Any]],
     full_text: str,
-    max_chars: int = 22000,
+    section_id: str = "",
+    max_chars: int = 32000,
 ) -> str:
     """Build a compact text packet for AI-first extraction.
 
@@ -1292,17 +1331,40 @@ def _build_ai_candidate_text(
     but fall back to the front of full text when no page helper is available.
     """
     chunks: List[str] = []
+    seen = set()
+
+    def add_window(doc, page_num, radius=1, max_window_chars=5500):
+        try:
+            page_num = int(page_num)
+        except Exception:
+            return
+        key = (str(doc), page_num, radius)
+        if key in seen:
+            return
+        seen.add(key)
+        window = _evidence_window(pages, doc, page_num, radius=radius, max_chars=max_window_chars)
+        if window.strip():
+            chunks.append(window.strip())
+
     if candidate_pages:
-        for hit in candidate_pages[:8]:
-            window = _evidence_window(
-                pages,
-                hit.get("document"),
-                int(hit.get("page", 1)),
-                radius=1,
-                max_chars=5000,
-            )
-            if window.strip():
-                chunks.append(window.strip())
+        for hit in candidate_pages[:10]:
+            add_window(hit.get("document"), hit.get("page", 1), radius=1)
+
+    # AI-first should not be trapped by a weak regex/page finder. Add section-specific
+    # keyword windows from the full page set so tables like Hesperia Table 4B are seen.
+    section_terms = {
+        "assessed_tax_base": ["appraised value", "aggregate minimum market value", "market value", "value-to-burden", "value-to-lien"],
+        "leverage_vtl": ["value-to-burden", "value-to-lien", "appraised value", "aggregate minimum market value", "total land secured debt", "overlapping land secured debt"],
+        "cashflow_mltm": ["debt service schedule", "date principal interest total", "reserve fund", "sources of funds"],
+        "taxbase_concentration": ["special tax levy", "percentage of total special tax levy", "conveyed to individual homeowners", "developed area"],
+    }.get(section_id, [])
+    for p in pages:
+        lower = _safe_text(p.get("text", "")).lower()
+        if any(term in lower for term in section_terms):
+            add_window(p.get("document"), p.get("page", 1), radius=1)
+            if sum(len(c) for c in chunks) > max_chars * 0.9:
+                break
+
     if not chunks and full_text.strip():
         chunks.append(full_text[:max_chars])
 
@@ -1345,7 +1407,8 @@ def run_hybrid_section_extraction(
             pages=pages,
             candidate_pages=candidate_pages,
             full_text=full_text,
-            max_chars=22000,
+            section_id=section_id,
+            max_chars=32000,
         )
         if not candidate_text.strip():
             ai_error = "No parsed text was available for AI extraction. Re-upload a text-readable/OCR PDF."
