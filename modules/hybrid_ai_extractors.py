@@ -4,8 +4,8 @@ Hybrid AI extraction layer for the Municipal Credit Deal Workspace.
 Purpose
 -------
 For every credit-analysis section, use the same safe data-acquisition pattern:
-1) full-document regex scan first (cheap, deterministic, auditable),
-2) if regex is missing/weak, use OpenAI Responses API for structured JSON extraction,
+1) OpenAI Responses API structured JSON extraction first when an API key is available,
+2) use regex only as a conservative backup/debug layer,
 3) return reviewable candidates only,
 4) let Streamlit/analyst approval decide what enters calculators/scorecards.
 
@@ -77,7 +77,7 @@ HYBRID_SECTIONS: Dict[str, Dict[str, Any]] = {
     },
     "assessed_tax_base": {
         "title": "Assessed Value / Tax Base",
-        "subtitle": "Regex scans full OS first; AI fallback extracts JSON from candidate page windows.",
+        "subtitle": "AI-first OS extraction; regex is backup/debug only.",
         "fields": [
             HybridField(
                 key="all_taxable_assessed_value",
@@ -149,7 +149,7 @@ HYBRID_SECTIONS: Dict[str, Dict[str, Any]] = {
     },
     "taxbase_concentration": {
         "title": "Tax Base & Concentration",
-        "subtitle": "TOC/page finder + regex table clues first; API fallback reconstructs taxpayer fields as JSON.",
+        "subtitle": "AI-first table extraction; page finder/regex are backup/debug only.",
         "fields": [
             HybridField(
                 key="top10_taxpayers_percent_of_total_levy",
@@ -186,12 +186,7 @@ HYBRID_SECTIONS: Dict[str, Dict[str, Any]] = {
                     r"there\s+are\s+([0-9][0-9,]*)\s+parcels\s+of\s+developed\s+property",
                 ),
                 keywords=("taxable parcels", "developed property", "approved property", "undeveloped property"),
-                guidance=(
-                    "Prefer total taxable parcels or total residential/special-tax units used for assessment scale. "
-                    "Do NOT treat assessor parcels, APNs, ownership parcels, building sites, development lots, "
-                    "or mapped tax parcels as scorecard district size unless the OS explicitly says they are the taxable parcels/units assessed. "
-                    "If the text says only assessor parcels/APNs/building sites, return null or a low-confidence candidate requiring analyst review."
-                ),
+                guidance="Prefer total taxable parcels unless scorecard specifically requests developed parcels only.",
             ),
             HybridField(
                 key="conveyance_to_homeowners",
@@ -207,7 +202,7 @@ HYBRID_SECTIONS: Dict[str, Dict[str, Any]] = {
     },
     "leverage_vtl": {
         "title": "Leverage & Value-to-Lien",
-        "subtitle": "Extract AV/debt/VTL from OS; API fallback returns numeric JSON and evidence snippets.",
+        "subtitle": "AI-first extraction of AV/debt/VTL; regex is backup/debug only.",
         "fields": [
             HybridField(
                 key="assessed_value",
@@ -262,7 +257,7 @@ HYBRID_SECTIONS: Dict[str, Dict[str, Any]] = {
     },
     "cashflow_mltm": {
         "title": "Cashflow & MLTM Stress",
-        "subtitle": "Extract debt-service schedule/reserve fund first; API fallback returns schedule JSON for review.",
+        "subtitle": "AI-first extraction of reserve/debt-service schedule; regex is backup/debug only.",
         "fields": [
             HybridField(
                 key="initial_reserve_fund",
@@ -1196,17 +1191,18 @@ Section: {HYBRID_SECTIONS.get(section_id, {}).get('title', section_id)}
 
 Extract ONLY values that are explicitly supported by the provided text. Do not invent values.
 If a field is not found, return value=null, confidence=0, page=null, and notes explaining what is missing.
+Never return 0 unless the source explicitly states the value is zero. Missing is null, not 0.
 Prefer deal-specific values over general county values.
-For assessed value, prefer "assessed value of all taxable property within the CFD" over developed-property-only value.
-For taxpayer concentration, do not confuse assessed-value share with levy share unless the source clearly says levy/special tax share.
-For District Size / Parcels, prefer total taxable parcels or total residential/special-tax units that represent assessment scale. Do NOT use assessor parcels, APNs, ownership parcels, building sites, development lots, or tax-map parcels unless the text explicitly states those are the taxable parcels/units used for the special tax assessment. If uncertain, return value=null, confidence=0, and explain the ambiguity in notes.
+For assessed value / appraised value: distinguish assessed value, appraised market value, direct debt, overlapping debt, tax liability, and total land-secured indebtedness. Do NOT use debt tables, property-tax-liability tables, or overlapping-debt rows as assessed value.
+For taxpayer concentration, do not confuse assessed-value share with levy/special tax share unless the source clearly says levy/special tax share.
+For district size: prefer taxable units/residential lots/parcels securing the bonds. Do NOT use assessor/APN parcels or building sites unless the text explicitly says those are the taxable units securing the special tax.
 For MLTM, prefer a calculated schedule or explicit MLTM; do not make up a stress value.
 
 Fields:
 {field_instructions}
 
 Text window:
-{candidate_text[:30000]}
+{candidate_text[:22000]}
 """.strip()
 
     schema = _json_schema_for_fields(fields)
@@ -1227,14 +1223,14 @@ Text window:
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     try:
-        response = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=60)
+        response = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=120)
         if response.status_code >= 400:
             # Fallback to plain prompt JSON in case account/model does not support strict schema.
             fallback_payload = {
                 "model": model,
                 "input": prompt + "\n\nReturn JSON only.",
             }
-            response = requests.post("https://api.openai.com/v1/responses", headers=headers, json=fallback_payload, timeout=60)
+            response = requests.post("https://api.openai.com/v1/responses", headers=headers, json=fallback_payload, timeout=120)
         if response.status_code >= 400:
             return {"ok": False, "error": f"OpenAI Responses API failed: {response.status_code} {response.text[:500]}"}
         data = response.json()
@@ -1254,6 +1250,66 @@ Text window:
         return {"ok": False, "error": f"OpenAI extraction exception: {exc}"}
 
 
+def _is_usable_candidate(candidate: Dict[str, Any], field_lookup: Dict[str, HybridField]) -> bool:
+    """Reject obvious false positives before the UI review queue.
+
+    Key principle: a page hit is not a field extraction. Missing numeric values must
+    remain missing/null; do not show $0 or 0% as a high-confidence candidate unless
+    the source explicitly states zero.
+    """
+    field_key = candidate.get("field_key")
+    field = field_lookup.get(field_key)
+    value = candidate.get("value")
+
+    if value is None or value == "":
+        return False
+
+    if field and field.value_type in {"money", "percent", "number"}:
+        try:
+            numeric = float(value)
+        except Exception:
+            return False
+
+        evidence = _safe_text(candidate.get("evidence", "")).lower()
+        # Almost every false positive we saw became 0 with high confidence.
+        # Only keep zero if the evidence explicitly says the field is zero.
+        if numeric == 0 and not re.search(r"(?:\$\s*0(?:\.00)?|\b0(?:\.0+)?\s*%)", evidence):
+            return False
+
+    return True
+
+
+def _build_ai_candidate_text(
+    *,
+    pages: List[Dict[str, Any]],
+    candidate_pages: List[Dict[str, Any]],
+    full_text: str,
+    max_chars: int = 22000,
+) -> str:
+    """Build a compact text packet for AI-first extraction.
+
+    We prefer relevant page windows to keep the API call fast and avoid timeout,
+    but fall back to the front of full text when no page helper is available.
+    """
+    chunks: List[str] = []
+    if candidate_pages:
+        for hit in candidate_pages[:8]:
+            window = _evidence_window(
+                pages,
+                hit.get("document"),
+                int(hit.get("page", 1)),
+                radius=1,
+                max_chars=5000,
+            )
+            if window.strip():
+                chunks.append(window.strip())
+    if not chunks and full_text.strip():
+        chunks.append(full_text[:max_chars])
+
+    candidate_text = "\n\n".join(chunks)
+    return candidate_text[:max_chars]
+
+
 def run_hybrid_section_extraction(
     *,
     section_id: str,
@@ -1264,45 +1320,39 @@ def run_hybrid_section_extraction(
     state: str = "",
     county_name: str = "",
     force_ai: bool = False,
+    ai_first: bool = True,
 ) -> Dict[str, Any]:
     section = HYBRID_SECTIONS.get(section_id)
     if not section:
         return {"ok": False, "error": f"Unknown hybrid section: {section_id}"}
 
     fields: List[HybridField] = section["fields"]
+    field_lookup = {f.key: f for f in fields}
     pages = _pages_from_docs(parsed_docs)
     full_text = flatten_parsed_docs_to_full_text(parsed_docs)
 
-    # 1) Regex always scans full parsed OS text. It must NOT depend on candidate_pages.
-    regex_candidates = regex_extract_fields(parsed_docs, section_id)
-    found_keys = {c["field_key"] for c in regex_candidates if c.get("value") not in [None, ""]}
-    missing_fields = [f for f in fields if f.key not in found_keys]
-
-    # 2) Candidate pages are evidence helpers only, not a gate.
+    # Candidate pages are evidence helpers only, not extraction gates.
     candidate_pages = find_candidate_pages_for_fields(parsed_docs, fields, max_pages=10)
 
-    # 3) AI fallback. If candidate pages exist, send tight page windows; otherwise send first full-text chunk.
+    # AI-FIRST extraction: when an API key is available, ask AI for all fields first.
+    # Regex is now only a backup/debug layer or a fill-in for fields AI left null.
     ai_candidates: List[Dict[str, Any]] = []
     ai_error = None
-    ai_requested = bool(force_ai or (missing_fields and api_key))
-    if ai_requested:
-        if not api_key:
-            ai_error = "OpenAI API key was not provided, so AI JSON fallback could not run."
-        else:
-            if candidate_pages:
-                chunks: List[str] = []
-                for hit in candidate_pages[:5]:
-                    chunks.append(_evidence_window(pages, hit.get("document"), int(hit.get("page", 1)), radius=1, max_chars=6500))
-                candidate_text = "\n\n".join([c for c in chunks if c.strip()])
-                if not candidate_text.strip():
-                    candidate_text = full_text[:30000]
-            else:
-                # Important fallback: no page candidates does NOT mean no data.
-                candidate_text = full_text[:30000]
+    ai_requested = bool(api_key and (ai_first or force_ai))
 
+    if ai_requested:
+        candidate_text = _build_ai_candidate_text(
+            pages=pages,
+            candidate_pages=candidate_pages,
+            full_text=full_text,
+            max_chars=22000,
+        )
+        if not candidate_text.strip():
+            ai_error = "No parsed text was available for AI extraction. Re-upload a text-readable/OCR PDF."
+        else:
             ai_result = ai_extract_fields_from_text(
                 section_id=section_id,
-                fields=missing_fields if not force_ai else fields,
+                fields=fields,
                 candidate_text=candidate_text,
                 api_key=api_key or "",
                 model=model,
@@ -1311,35 +1361,21 @@ def run_hybrid_section_extraction(
                 county_name=county_name,
             )
             if ai_result.get("ok"):
-                for f in (missing_fields if not force_ai else fields):
-                    item = (ai_result.get("data") or {}).get(f.key) or {}
+                data = ai_result.get("data") or {}
+                for f in fields:
+                    item = data.get(f.key) or {}
                     value = _coerce_value(item.get("value"), f.value_type)
                     if value is None or value == "":
                         continue
-                    confidence = float(item.get("confidence") or 0.55)
-                    evidence_text = _safe_text(item.get("evidence") or "") + " " + _safe_text(item.get("notes") or "") + " " + _safe_text(item.get("source_label") or "")
-                    if f.key == "district_size_parcels":
-                        ambiguous_terms = (
-                            "assessor parcel", "assessor's parcel", "assessor’s parcel", "apn",
-                            "building site", "building sites", "development lot", "ownership parcel",
-                            "fee title", "tax map", "mapped parcel"
-                        )
-                        positive_terms = (
-                            "taxable parcels", "taxable parcel", "special tax units", "residential units",
-                            "levied on", "subject to the special tax", "taxable units"
-                        )
-                        ev_lower = evidence_text.lower()
-                        if any(term in ev_lower for term in ambiguous_terms) and not any(term in ev_lower for term in positive_terms):
-                            confidence = min(confidence, 0.45)
-                    ai_candidates.append({
+                    candidate = {
                         "field_key": f.key,
                         "label": f.label,
                         "scorecard_key": f.scorecard_key,
                         "value": value,
                         "value_type": f.value_type,
-                        "confidence": confidence,
+                        "confidence": float(item.get("confidence") or 0.55),
                         "method": "OpenAI Responses API Structured Extraction",
-                        "tier": "Tier 2",
+                        "tier": "AI First",
                         "source_document": item.get("source_label") or "Uploaded OS / source window",
                         "page": item.get("page"),
                         "evidence": item.get("evidence") or "",
@@ -1347,14 +1383,27 @@ def run_hybrid_section_extraction(
                         "guidance": f.guidance,
                         "notes": item.get("notes") or "",
                         "response_id": ai_result.get("raw_response_id"),
-                    })
+                    }
+                    if _is_usable_candidate(candidate, field_lookup):
+                        ai_candidates.append(candidate)
             else:
                 ai_error = ai_result.get("error")
 
-    # Merge regex first, then AI for missing only unless forced.
-    candidates_by_key: Dict[str, Dict[str, Any]] = {c["field_key"]: c for c in regex_candidates}
+    # Regex backup/debug. Always run it for transparency, but do not let it beat AI.
+    regex_candidates_raw = regex_extract_fields(parsed_docs, section_id)
+    regex_candidates = [c for c in regex_candidates_raw if _is_usable_candidate(c, field_lookup)]
+
+    # If no API key exists, regex becomes the only source. If AI ran, regex only fills missing keys.
+    candidates_by_key: Dict[str, Dict[str, Any]] = {}
     for c in ai_candidates:
-        if force_ai or c["field_key"] not in candidates_by_key:
+        candidates_by_key[c["field_key"]] = c
+    for c in regex_candidates:
+        if c["field_key"] not in candidates_by_key:
+            # Lower regex confidence slightly when used as backup, so reviewers know it is secondary.
+            if ai_requested:
+                c = dict(c)
+                c["method"] = f"Regex Backup / Debug ({c.get('method', 'Regex')})"
+                c["confidence"] = min(float(c.get("confidence", 0) or 0), 0.70)
             candidates_by_key[c["field_key"]] = c
 
     final_candidates = list(candidates_by_key.values())
@@ -1372,6 +1421,9 @@ def run_hybrid_section_extraction(
         api_key_available=bool(api_key),
         ai_candidates=ai_candidates,
     )
+    scan_debug["ai_first"] = bool(ai_first)
+    scan_debug["regex_raw_candidates"] = len(regex_candidates_raw)
+    scan_debug["regex_usable_candidates"] = len(regex_candidates)
 
     return {
         "ok": True,
