@@ -2071,14 +2071,14 @@ def approve_total_assessed_value(value, source_method, source_document="", confi
         {
             "data_source": "County Open Data / Assessor" if "Upload" in source_method or "Manual" in source_method else "OS / Appendix PDF",
             "series_label": source_document,
-            "target_data": "Assessed value",
+            "target_data": "Appraised / Market Value for VTL",
             "status": "success",
             "date_or_year": datetime.now().date().isoformat(),
             "value": f"${float(value):,.0f}",
             "source_url": "",
             "notes": notes,
         },
-        target_contains="Assessed value",
+        target_contains="Appraised / Market Value",
         unique_key="assessed_value_resolved",
     )
 
@@ -3663,7 +3663,7 @@ def _hybrid_approve_candidate(candidate):
         )
 
     # Calculator / resolver sync hooks.
-    if field_key in {"all_taxable_assessed_value", "assessed_value"} and value is not None:
+    if field_key in {"appraised_value_for_vtl", "all_taxable_assessed_value", "assessed_value"} and value is not None:
         try:
             st.session_state["suggested_assessed_value"] = float(value)
             vtl_prefill = st.session_state.get("vtl_prefill", {}) or {}
@@ -3678,15 +3678,15 @@ def _hybrid_approve_candidate(candidate):
                 {
                     "data_source": "OS / Appendix PDF" if "Regex" in method or "OpenAI" in method else "Hybrid Resolver",
                     "series_label": source_document,
-                    "target_data": "Assessed value",
+                    "target_data": "Appraised / Market Value for VTL",
                     "status": "success" if status == "Source Verified" else "needs_review",
                     "date_or_year": datetime.now().date().isoformat(),
                     "value": _hybrid_format_value(value, "money"),
                     "source_url": "",
                     "notes": notes,
                 },
-                target_contains="Assessed value",
-                unique_key=f"hybrid_assessed_value_{field_key}",
+                target_contains="Appraised / Market Value",
+                unique_key=f"hybrid_appraised_value_for_vtl_{field_key}",
             )
         except Exception:
             pass
@@ -6410,7 +6410,7 @@ Recommended next step: run OCR Mode or use the upload/mapping fallback below.
                 av = vtl_engine_candidate.get("assessed_value")
                 dd = vtl_engine_candidate.get("direct_debt")
                 od = vtl_engine_candidate.get("overlapping_debt")
-                c1.metric("Assessed Value", "" if av is None else f"${float(av):,.0f}")
+                c1.metric("Appraised / Market Value", "" if av is None else f"${float(av):,.0f}")
                 c2.metric("Direct Debt", "" if dd is None else f"${float(dd):,.0f}")
                 c3.metric("Overlapping Debt", "" if od is None else f"${float(od):,.0f}")
                 c4.metric("Confidence", f"{vtl_engine_candidate.get('confidence', 0)}%")
@@ -6441,7 +6441,7 @@ Recommended next step: run OCR Mode or use the upload/mapping fallback below.
                 cand = st.session_state.get("vtl_ai_candidate")
                 if cand:
                     c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Assessed Value", "" if cand.get("assessed_value") is None else f"${cand['assessed_value']:,.0f}")
+                    c1.metric("Appraised / Market Value", "" if cand.get("assessed_value") is None else f"${cand['assessed_value']:,.0f}")
                     c2.metric("Direct Debt", "" if cand.get("direct_debt") is None else f"${cand['direct_debt']:,.0f}")
                     c3.metric("Overlapping Debt", "" if cand.get("overlapping_debt") is None else f"${cand['overlapping_debt']:,.0f}")
                     c4.metric("Confidence", f"{cand.get('confidence', 0):.0%}")
@@ -6466,7 +6466,7 @@ Recommended next step: run OCR Mode or use the upload/mapping fallback below.
             st.caption("Use this when AI cannot reliably read the OS table, or when you already have values from an assessor export / OS appendix.")
             vtl_f1, vtl_f2, vtl_f3 = st.columns(3)
             with vtl_f1:
-                direct_assessed_value = st.text_input("Assessed Value candidate", value="", key="direct_vtl_assessed_value")
+                direct_assessed_value = st.text_input("Appraised / Market Value candidate", value="", key="direct_vtl_assessed_value")
             with vtl_f2:
                 direct_direct_debt = st.text_input("Direct Debt candidate", value="", key="direct_vtl_direct_debt")
             with vtl_f3:
